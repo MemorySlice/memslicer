@@ -7,7 +7,7 @@ name = "memslicer"
 version = "0.1.0"
 description = "Frida-based MSL memory dump tool"
 requires-python = ">= 3.10"
-license = "MIT"
+license = "Apache License 2.0"
 dependencies = [
     "frida-tools>=12.0",
     "blake3>=0.4",
