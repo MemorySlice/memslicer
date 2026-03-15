@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memslicer"
+version = "0.1.0"
+description = "Frida-based MSL memory dump tool"
+requires-python = ">= 3.10"
+license = "MIT"
+dependencies = [
+    "frida-tools>=12.0",
+    "blake3>=0.4",
+    "click>=8.0",
+    "zstandard>=0.20",
+    "lz4>=4.0",
+]
+
+[project.scripts]
+memslicer = "memslicer.cli:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.hatch.build]
+packages = ["src/memslicer"]

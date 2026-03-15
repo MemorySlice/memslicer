@@ -1,0 +1,145 @@
+name: Update Changelog
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  update-changelog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    # Skip commits made by this workflow to prevent infinite loops
+    if: "!contains(github.event.head_commit.message, 'docs: update CHANGELOG.md for v')"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if version changed
+        id: version_check
+        run: |
+          if git diff HEAD~1 -- pyproject.toml | grep -q '^+version\s*='; then
+            echo "version_changed=true" >> "$GITHUB_OUTPUT"
+            NEW_VERSION=$(grep '^version\s*=' pyproject.toml | head -1 | sed 's/.*=\s*["\x27]\([^"\x27]*\)["\x27].*/\1/')
+            echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find previous tag and collect commits
+        if: steps.version_check.outputs.version_changed == 'true'
+        id: commits
+        run: |
+          NEW_VERSION="${{ steps.version_check.outputs.new_version }}"
+          PREV_TAG=$(git tag --list 'v*' --sort=-version:refname | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found — collecting all commits."
+            COMMIT_LOG=$(git log --pretty=format:"%s" HEAD)
+          else
+            echo "Previous tag: ${PREV_TAG}"
+            COMMIT_LOG=$(git log --pretty=format:"%s" "${PREV_TAG}..HEAD")
+          fi
+
+          # Write commit log to a temp file to avoid quoting issues
+          echo "$COMMIT_LOG" > /tmp/commit_log.txt
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog entry
+        if: steps.version_check.outputs.version_changed == 'true'
+        run: |
+          NEW_VERSION="${{ steps.version_check.outputs.new_version }}"
+          TODAY=$(date +%Y-%m-%d)
+          CHANGELOG_ENTRY="## [${NEW_VERSION}] - ${TODAY}"
+
+          declare -A GROUPS
+          GROUPS[feat]=""
+          GROUPS[fix]=""
+          GROUPS[refactor]=""
+          GROUPS[docs]=""
+          GROUPS[test]=""
+          GROUPS[chore]=""
+          GROUPS[perf]=""
+          GROUPS[ci]=""
+          GROUPS[build]=""
+          GROUPS[style]=""
+          GROUPS[other]=""
+
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            # Skip the automated changelog commit itself
+            echo "$msg" | grep -q '^docs: update CHANGELOG.md for v' && continue
+
+            TYPE=$(echo "$msg" | sed -n 's/^\([a-z]*\)[:(].*/\1/p')
+            case "$TYPE" in
+              feat|fix|refactor|docs|test|chore|perf|ci|build|style)
+                GROUPS[$TYPE]+="- ${msg}"$'\n'
+                ;;
+              *)
+                GROUPS[other]+="- ${msg}"$'\n'
+                ;;
+            esac
+          done < /tmp/commit_log.txt
+
+          # Build the full entry block
+          {
+            echo "${CHANGELOG_ENTRY}"
+            echo ""
+
+            declare -A LABELS
+            LABELS[feat]="Features"
+            LABELS[fix]="Bug Fixes"
+            LABELS[refactor]="Refactoring"
+            LABELS[docs]="Documentation"
+            LABELS[test]="Tests"
+            LABELS[chore]="Chores"
+            LABELS[perf]="Performance"
+            LABELS[ci]="CI"
+            LABELS[build]="Build"
+            LABELS[style]="Style"
+            LABELS[other]="Changes"
+
+            for TYPE in feat fix refactor docs test chore perf ci build style other; do
+              if [ -n "${GROUPS[$TYPE]}" ]; then
+                echo "### ${LABELS[$TYPE]}"
+                echo ""
+                printf "%s" "${GROUPS[$TYPE]}"
+                echo ""
+              fi
+            done
+          } > /tmp/new_entry.txt
+
+          # Prepend new entry to existing CHANGELOG.md (after the header lines)
+          if [ -f CHANGELOG.md ]; then
+            # Extract header (lines before the first ## entry or all lines if none)
+            HEADER_LINES=$(grep -n '^## ' CHANGELOG.md | head -1 | cut -d: -f1)
+            if [ -z "$HEADER_LINES" ]; then
+              # No existing version entries — append after existing content
+              cat CHANGELOG.md /tmp/new_entry.txt > /tmp/changelog_new.txt
+            else
+              INSERT_LINE=$((HEADER_LINES - 1))
+              head -n "${INSERT_LINE}" CHANGELOG.md > /tmp/changelog_new.txt
+              echo "" >> /tmp/changelog_new.txt
+              cat /tmp/new_entry.txt >> /tmp/changelog_new.txt
+              tail -n +"${HEADER_LINES}" CHANGELOG.md >> /tmp/changelog_new.txt
+            fi
+          else
+            cat /tmp/new_entry.txt > /tmp/changelog_new.txt
+          fi
+
+          mv /tmp/changelog_new.txt CHANGELOG.md
+
+      - name: Commit updated CHANGELOG.md
+        if: steps.version_check.outputs.version_changed == 'true'
+        run: |
+          NEW_VERSION="${{ steps.version_check.outputs.new_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet || git commit -m "docs: update CHANGELOG.md for v${NEW_VERSION}"
+          git push
