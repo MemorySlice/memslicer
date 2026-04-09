@@ -18,6 +18,56 @@ from memslicer.acquirer.platform_detect import (
 from memslicer.msl.constants import ArchType, OSType
 
 
+def _ensure_lldb_importable() -> None:
+    """Try to add LLDB Python bindings to sys.path on macOS.
+
+    Xcode bundles LLDB Python bindings but they are not on the default
+    Python path.  This helper queries ``xcode-select`` to locate them.
+    """
+    try:
+        import lldb  # noqa: F401
+        return  # Already importable — nothing to do.
+    except ImportError:
+        pass
+
+    import platform as _plat
+    if _plat.system() != "Darwin":
+        return  # Auto-detection only applies to macOS.
+
+    import subprocess
+    import sys
+
+    try:
+        result = subprocess.run(
+            ["xcode-select", "--print-path"],
+            capture_output=True, text=True, timeout=5,
+        )
+        xcode_path = result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return
+
+    if not xcode_path:
+        return
+
+    # Xcode bundles LLDB Python bindings at this location.
+    candidates = [
+        os.path.join(
+            xcode_path,
+            "SharedFrameworks", "LLDB.framework",
+            "Resources", "Python",
+        ),
+        os.path.join(
+            xcode_path, "..", "SharedFrameworks",
+            "LLDB.framework", "Resources", "Python",
+        ),
+    ]
+    for candidate in candidates:
+        candidate = os.path.normpath(candidate)
+        if os.path.isdir(candidate) and candidate not in sys.path:
+            sys.path.insert(0, candidate)
+            return
+
+
 def _default_page_size(arch: ArchType, os_type: OSType) -> int:
     """Return a sensible default page size for the given platform."""
     if arch == ArchType.ARM64 and os_type in (OSType.macOS, OSType.iOS):
@@ -68,17 +118,66 @@ class LLDBBridge:
         """Whether this bridge is connected to a remote target."""
         return self._remote is not None
 
+    # -- Pre-flight checks ---------------------------------------------------
+
+    def _check_macos_sip(self) -> None:
+        """Warn about SIP restrictions on macOS."""
+        import platform as _plat
+        if _plat.system() != "Darwin":
+            return
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["csrutil", "status"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "enabled" in result.stdout.lower():
+                self._log.warning(
+                    "macOS System Integrity Protection (SIP) is enabled. "
+                    "Attaching to Apple-signed or hardened-runtime processes "
+                    "will fail. Only debug builds with "
+                    "com.apple.security.get-task-allow entitlement can be "
+                    "debugged. Disable SIP or use the Frida backend for "
+                    "broader process access."
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+
+    def _check_ptrace_scope(self) -> None:
+        """Warn about ptrace restrictions on Linux."""
+        scope_path = "/proc/sys/kernel/yama/ptrace_scope"
+        try:
+            with open(scope_path) as fh:
+                scope = int(fh.read().strip())
+        except (FileNotFoundError, OSError, ValueError):
+            return  # Not Linux or Yama not enabled
+        if scope >= 2:
+            self._log.warning(
+                "Yama ptrace_scope is %d — process attachment may be "
+                "blocked. Run as root or set ptrace_scope to 0: "
+                "echo 0 | sudo tee %s",
+                scope, scope_path,
+            )
+        elif scope == 1:
+            self._log.info(
+                "Yama ptrace_scope is 1 (default) — only child processes "
+                "can be traced. Run as root to trace arbitrary processes."
+            )
+
     # -- DebuggerBridge interface -------------------------------------------
 
     def connect(self) -> None:
         """Create an LLDB debugger instance and attach to the target."""
+        _ensure_lldb_importable()
         try:
             import lldb as _lldb  # noqa: F811
         except ImportError as exc:
             raise ImportError(
                 "The 'lldb' Python module is not available. "
                 "Ensure LLDB is installed and its Python bindings are on "
-                "sys.path (e.g. via PYTHONPATH or the Xcode toolchain)."
+                "sys.path (e.g. via PYTHONPATH or the Xcode toolchain). "
+                "On macOS, install Xcode Command Line Tools: "
+                "xcode-select --install"
             ) from exc
 
         self._lldb = _lldb
@@ -86,6 +185,9 @@ class LLDBBridge:
         debugger = _lldb.SBDebugger.Create()
         debugger.SetAsync(False)
         self._debugger = debugger
+
+        self._check_macos_sip()
+        self._check_ptrace_scope()
 
         # Set up remote platform if specified.
         if self._remote:
@@ -103,6 +205,13 @@ class LLDBBridge:
                 "Connected to remote platform '%s' at %s",
                 platform_name, connect_url,
             )
+            if platform_name == "remote-ios":
+                self._log.warning(
+                    "iOS remote debugging via LLDB requires a running "
+                    "debugserver on the target device (jailbreak required). "
+                    "Consider using the Frida backend (-b frida -U) for "
+                    "more reliable iOS memory acquisition."
+                )
 
         lldb_target = debugger.CreateTarget("")
         if not lldb_target.IsValid():
@@ -140,6 +249,16 @@ class LLDBBridge:
         self._platform_info = PlatformInfo(
             arch=arch, os=os_type, pid=pid, page_size=page_size,
         )
+
+        if os_type == OSType.Android:
+            self._log.warning(
+                "Android memory acquisition via LLDB is limited. "
+                "SELinux policies may block process attachment and "
+                "/proc access. ART managed heap data will be opaque. "
+                "Consider using the Frida backend (-b frida -U) for "
+                "more complete Android memory acquisition."
+            )
+
         self._log.debug(
             "LLDB attached: triple=%s pid=%d page_size=%d",
             triple, pid, page_size,
@@ -151,6 +270,13 @@ class LLDBBridge:
             raise RuntimeError("LLDBBridge.connect() must be called first")
         return self._platform_info
 
+    # Skip size when GetMemoryRegionInfo fails (1 MB).
+    _REGION_SKIP: int = 0x100000
+    # Give up after this many consecutive failures (64 MB gap).
+    _MAX_CONSECUTIVE_SKIP: int = 64
+    # Minimum LLDB region count before /proc/maps cross-check on Linux.
+    _MIN_LLDB_REGION_COUNT: int = 5
+
     def enumerate_ranges(self) -> list[MemoryRange]:
         """Walk the process address space and collect all memory regions."""
         _lldb = self._lldb
@@ -158,11 +284,29 @@ class LLDBBridge:
         ranges: list[MemoryRange] = []
 
         addr: int = 0
+        consecutive_failures: int = 0
         region = _lldb.SBMemoryRegionInfo()
         while True:
             err = process.GetMemoryRegionInfo(addr, region)
             if err.Fail():
-                break
+                consecutive_failures += 1
+                if consecutive_failures > self._MAX_CONSECUTIVE_SKIP:
+                    self._log.debug(
+                        "Stopping region scan after %d consecutive failures "
+                        "at 0x%x",
+                        consecutive_failures, addr,
+                    )
+                    break
+                self._log.debug(
+                    "GetMemoryRegionInfo failed at 0x%x, skipping ahead by "
+                    "0x%x (%s)",
+                    addr, self._REGION_SKIP, err.GetCString(),
+                )
+                addr += self._REGION_SKIP
+                continue
+
+            # Successful query — reset the failure counter.
+            consecutive_failures = 0
 
             base = region.GetRegionBase()
             end = region.GetRegionEnd()
@@ -182,14 +326,23 @@ class LLDBBridge:
                 break
             addr = end
 
-        # On Linux, fall back to /proc/maps when LLDB returns no regions.
+        # On Linux, fall back to /proc/maps when LLDB returns too few
+        # regions -- this catches both zero results and suspiciously
+        # incomplete enumerations (e.g. sparse 64-bit address spaces).
         if (
-            not ranges
+            len(ranges) < self._MIN_LLDB_REGION_COUNT
             and self._platform_info
             and self._platform_info.os in (OSType.Linux, OSType.Android)
             and self._remote is None
         ):
-            ranges = self._enumerate_from_proc_maps()
+            proc_ranges = self._enumerate_from_proc_maps()
+            if len(proc_ranges) > len(ranges):
+                self._log.debug(
+                    "LLDB returned only %d regions; using %d regions from "
+                    "/proc/maps instead",
+                    len(ranges), len(proc_ranges),
+                )
+                ranges = proc_ranges
 
         self._log.debug("Enumerated %d memory regions via LLDB", len(ranges))
         return ranges
@@ -255,6 +408,12 @@ class LLDBBridge:
             ``"host:port"``             -> ``("remote-linux", "connect://host:port")``
             ``"ios://host:port"``       -> ``("remote-ios", "connect://host:port")``
             ``"android://host:port"``   -> ``("remote-linux", "connect://host:port")``
+
+        Note:
+            The ``ios://`` scheme maps to LLDB's ``remote-ios`` platform which
+            requires a manually launched ``debugserver`` on the target device
+            (typically jailbroken).  No usbmuxd / lockdownd integration is
+            provided by this bridge.
         """
         if remote.startswith("ios://"):
             addr = remote[len("ios://"):]

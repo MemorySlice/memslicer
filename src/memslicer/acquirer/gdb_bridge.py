@@ -34,8 +34,9 @@ class GDBBridge:
     Parameters
     ----------
     target:
-        Process ID (``int``) to attach to.  Process names are **not**
-        supported by the GDB backend -- pass a PID.
+        Process ID (``int``) or process name (``str``) to attach to.
+        When a string is given, it is resolved to a PID via ``/proc``
+        or ``pidof``.
     remote:
         Optional ``host:port`` for ``-target-select remote``.
     gdb_path:
@@ -54,12 +55,10 @@ class GDBBridge:
         logger: logging.Logger | None = None,
         mi_timeout: float = 30.0,
     ) -> None:
-        if not isinstance(target, int):
-            raise TypeError(
-                "GDB backend requires a numeric PID. "
-                f"Received {type(target).__name__}: {target!r}"
-            )
-        self._pid: int = target
+        if isinstance(target, int):
+            self._pid: int = target
+        else:
+            self._pid: int = self._resolve_pid(str(target), logger or _LOG)
         self._remote = remote
         self._gdb_path = gdb_path
         self._log = logger or _LOG
@@ -68,6 +67,51 @@ class GDBBridge:
         self._line_queue: queue.Queue[str | None] = queue.Queue()
         self._reader_thread: threading.Thread | None = None
         self._shutting_down = False
+
+    @staticmethod
+    def _resolve_pid(name: str, logger: logging.Logger) -> int:
+        """Resolve a process name to a PID via /proc or pidof."""
+        # Try /proc first (Linux)
+        proc_path = "/proc"
+        if os.path.isdir(proc_path):
+            for entry in os.listdir(proc_path):
+                if not entry.isdigit():
+                    continue
+                try:
+                    cmdline_path = os.path.join(proc_path, entry, "comm")
+                    with open(cmdline_path) as fh:
+                        comm = fh.read().strip()
+                    if comm == name:
+                        pid = int(entry)
+                        logger.info("Resolved process '%s' to PID %d", name, pid)
+                        return pid
+                except (OSError, ValueError):
+                    continue
+
+        # Fallback: try pidof command
+        pidof_bin = shutil.which("pidof")
+        if pidof_bin:
+            try:
+                result = subprocess.run(
+                    [pidof_bin, name],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    pids = result.stdout.strip().split()
+                    if pids:
+                        pid = int(pids[0])
+                        logger.info(
+                            "Resolved process '%s' to PID %d via pidof",
+                            name, pid,
+                        )
+                        return pid
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                pass
+
+        raise ValueError(
+            f"Could not resolve process name '{name}' to a PID. "
+            "Ensure the process is running or pass a numeric PID."
+        )
 
     @property
     def is_remote(self) -> bool:
@@ -133,6 +177,29 @@ class GDBBridge:
             raise RuntimeError(f"GDB/MI error: {detail}")
         return result
 
+    # -- Pre-flight checks ---------------------------------------------------
+
+    def _check_ptrace_scope(self) -> None:
+        """Warn about ptrace restrictions on Linux."""
+        scope_path = "/proc/sys/kernel/yama/ptrace_scope"
+        try:
+            with open(scope_path) as fh:
+                scope = int(fh.read().strip())
+        except (FileNotFoundError, OSError, ValueError):
+            return  # Not Linux or Yama not enabled
+        if scope >= 2:
+            self._log.warning(
+                "Yama ptrace_scope is %d — process attachment may be "
+                "blocked. Run as root or set ptrace_scope to 0: "
+                "echo 0 | sudo tee %s",
+                scope, scope_path,
+            )
+        elif scope == 1:
+            self._log.info(
+                "Yama ptrace_scope is 1 (default) — only child processes "
+                "can be traced. Run as root to trace arbitrary processes."
+            )
+
     # -- DebuggerBridge protocol --------------------------------------------
 
     def connect(self) -> None:
@@ -143,6 +210,8 @@ class GDBBridge:
                 f"GDB not found at '{self._gdb_path}'. "
                 "Install GDB or pass a valid path via gdb_path."
             )
+
+        self._check_ptrace_scope()
 
         self._proc = subprocess.Popen(
             [gdb_bin, "--interpreter=mi3", "-q"],
@@ -188,6 +257,16 @@ class GDBBridge:
                 os_type = OSType.Linux
 
         page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+        if os_type == OSType.Android:
+            self._log.warning(
+                "Android memory acquisition via GDB is limited. "
+                "SELinux policies may block process attachment and "
+                "/proc access. ART managed heap data will be opaque. "
+                "Consider using the Frida backend (-b frida -U) for "
+                "more complete Android memory acquisition."
+            )
+
         return PlatformInfo(arch=arch, os=os_type, pid=self._pid, page_size=page_size)
 
     def enumerate_ranges(self) -> list[MemoryRange]:

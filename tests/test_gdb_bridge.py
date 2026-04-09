@@ -21,10 +21,68 @@ from memslicer.msl.constants import ArchType
 class TestGDBBridgeInit:
     """Tests for GDBBridge.__init__()."""
 
-    def test_target_must_be_int(self):
-        """Passing a string target raises TypeError."""
-        with pytest.raises(TypeError, match="numeric PID"):
-            GDBBridge(target="my_app")
+    def test_target_accepts_int(self):
+        """Passing an int target sets _pid directly."""
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+        assert bridge._pid == 1234
+
+    def test_target_resolves_name_via_proc(self):
+        """Passing a string target resolves to PID via /proc."""
+        with patch("os.path.isdir", return_value=True), \
+             patch("os.listdir", return_value=["1", "42", "abc", "100"]), \
+             patch("builtins.open", mock_open(read_data="my_app\n")):
+            bridge = GDBBridge(target="my_app", logger=MagicMock())
+        # Should resolve to the first matching PID
+        assert bridge._pid == 1
+
+    def test_target_resolves_name_via_pidof(self):
+        """Falls back to pidof when /proc doesn't find the process."""
+        with patch("os.path.isdir", return_value=False), \
+             patch("shutil.which", return_value="/usr/bin/pidof"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="42\n")
+            bridge = GDBBridge(target="my_app", logger=MagicMock())
+        assert bridge._pid == 42
+
+    def test_target_name_not_found_raises(self):
+        """ValueError raised when process name cannot be resolved."""
+        with patch("os.path.isdir", return_value=False), \
+             patch("shutil.which", return_value=None):
+            with pytest.raises(ValueError, match="Could not resolve"):
+                GDBBridge(target="nonexistent_app", logger=MagicMock())
+
+
+# ---------------------------------------------------------------------------
+# Tests -- _check_ptrace_scope
+# ---------------------------------------------------------------------------
+
+class TestGDBBridgePtraceCheck:
+    """Tests for _check_ptrace_scope pre-flight check."""
+
+    def test_ptrace_scope_warning_on_high_scope(self):
+        """Warning logged when ptrace_scope >= 2."""
+        logger = MagicMock()
+        bridge = GDBBridge(target=1234, logger=logger)
+        with patch("builtins.open", mock_open(read_data="2\n")):
+            bridge._check_ptrace_scope()
+        logger.warning.assert_called_once()
+        assert "ptrace_scope" in logger.warning.call_args[0][0]
+
+    def test_ptrace_scope_info_on_default(self):
+        """Info logged when ptrace_scope is 1 (default)."""
+        logger = MagicMock()
+        bridge = GDBBridge(target=1234, logger=logger)
+        with patch("builtins.open", mock_open(read_data="1\n")):
+            bridge._check_ptrace_scope()
+        logger.info.assert_called()
+
+    def test_ptrace_scope_silent_when_not_linux(self):
+        """No warnings when /proc/sys/kernel/yama/ptrace_scope doesn't exist."""
+        logger = MagicMock()
+        bridge = GDBBridge(target=1234, logger=logger)
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            bridge._check_ptrace_scope()
+        logger.warning.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

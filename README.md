@@ -2,24 +2,26 @@
 
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.0-green)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.2.1-green)](pyproject.toml)
 
-A Frida-based memory acquisition tool that captures process memory snapshots into the MSL (Memory Slice) binary format. Designed for forensic analysis, reverse engineering, and security research across Windows, Linux, macOS, Android, and iOS.
+A memory acquisition tool that captures process memory snapshots into the MSL (Memory Slice) binary format. Supports multiple debugger backends (Frida, GDB, LLDB) and targets across Windows, Linux, macOS, Android, and iOS. Designed for forensic analysis, reverse engineering, and security research.
 
 ---
 
 ## Features
 
-- Capture process memory by PID or process name
+- **Pluggable backends**: Frida (local, USB, remote), GDB (MI3 protocol), LLDB (Python API)
+- **Investigation mode**: Captures system-wide context — process tables, network connections, file handles, boot time, OS details
+- **AEAD encryption**: AES-256-GCM with Argon2id key derivation (default in investigation mode)
 - MSL binary format with region metadata, module info, and page-level granularity
 - Compression support: zstd, lz4, or none
-- BLAKE3 integrity checksums for all captured data
+- BLAKE3 integrity chain across all blocks
 - Region filtering by memory protection, address range, or path patterns
 - Page-level acquisition with quality assessment
 - RWX region detection for forensic analysis
 - Progress reporting with per-region and per-page statistics
 - Companion log file captures all debug output regardless of verbosity flag
-- Local, USB (iOS/Android), and remote Frida server support
+- Cross-platform OS information collection for forensic context
 
 ---
 
@@ -31,17 +33,20 @@ A Frida-based memory acquisition tool that captures process memory snapshots int
 pip install memslicer
 ```
 
-This will give you the `memslicer` command.
+This installs memslicer with all backends (Frida, GDB, LLDB).
 
 ### From Source
 
 ```bash
 git clone https://github.com/danielbaier/memslicer.git
 cd memslicer
-pip install .
+pip install -e .
 ```
 
-Requires Python >= 3.10 and a compatible version of the Frida agent on the target device.
+Requires Python >= 3.10. Backend-specific requirements:
+- **Frida**: A compatible Frida agent on the target device (for USB/remote targets)
+- **GDB**: `gdb` binary with MI3 support (installed separately)
+- **LLDB**: LLDB Python module on `PYTHONPATH` (typically via Xcode on macOS)
 
 ---
 
@@ -49,7 +54,7 @@ Requires Python >= 3.10 and a compatible version of the Frida agent on the targe
 
 ### Basic Examples
 
-Dump a process by name:
+Dump a process by name (Frida backend, default):
 
 ```bash
 memslicer chrome
@@ -67,16 +72,92 @@ Specify output file and compression:
 memslicer chrome -o chrome_dump.msl -c zstd
 ```
 
-Dump a process on a USB-connected Android or iOS device:
+### Linux
+
+Dump a local process using Frida (default backend):
+
+```bash
+memslicer 1234
+```
+
+Use GDB backend (no Frida dependency required):
+
+```bash
+memslicer 1234 -b gdb
+```
+
+Investigation mode with full system context (encrypted by default):
+
+```bash
+memslicer 1234 -I -v
+```
+
+This captures process tables, network connections, file handles, boot time, hostname, and OS details from `/proc` alongside the memory dump. The output is encrypted with AES-256-GCM; you will be prompted for a passphrase.
+
+Investigation mode without encryption:
+
+```bash
+memslicer 1234 -I --no-encrypt
+```
+
+### Android
+
+Dump a process on a USB-connected Android device (requires Frida server on device):
 
 ```bash
 memslicer com.example.app -U
 ```
 
-Connect to a remote Frida server:
+Override OS detection if auto-detection fails:
 
 ```bash
-memslicer chrome -R 192.168.1.10:27042
+memslicer com.example.app -U --os android
+```
+
+Investigation mode on Android (captures system properties, process table, network state):
+
+```bash
+memslicer com.example.app -U -I
+```
+
+Connect to a remote Frida server on Android (e.g., over Wi-Fi):
+
+```bash
+memslicer com.example.app -R 192.168.1.10:27042 --os android
+```
+
+Dump by PID on a USB Android device:
+
+```bash
+memslicer 12345 -U --os android -o app_dump.msl -c zstd
+```
+
+### macOS / iOS
+
+Use LLDB backend on macOS (no Frida needed):
+
+```bash
+memslicer 1234 -b lldb
+```
+
+Dump a process on a USB-connected iOS device (jailbroken, Frida):
+
+```bash
+memslicer SpringBoard -U --os ios -I
+```
+
+### Windows
+
+Dump a local process on Windows:
+
+```bash
+memslicer 1234 -b gdb
+```
+
+Or with Frida:
+
+```bash
+memslicer notepad.exe
 ```
 
 ### Common Workflows
@@ -85,6 +166,12 @@ memslicer chrome -R 192.168.1.10:27042
 
 ```bash
 memslicer 4892 -v -o evidence.msl -c zstd
+```
+
+**Investigation mode with encryption (default):**
+
+```bash
+memslicer 4892 -I -o investigation.msl
 ```
 
 **Capture only readable and writable regions:**
@@ -118,15 +205,20 @@ memslicer chrome --max-region-size 104857600 --read-timeout 30
 ```
 Usage: memslicer [OPTIONS] TARGET
 
-  Capture process memory into an MSL snapshot file.
+  Dump process memory to MSL format.
 
-  TARGET is either a PID (integer) or a process name (string).
+  TARGET is a PID (integer) or process name (string).
+
+  Supports 4 acquisition modes:
+    Analysis unencrypted (default), Analysis encrypted (-E),
+    Investigation encrypted (-I, default), Investigation unencrypted (-I --no-encrypt).
 
 Options:
+  -b, --backend [frida|gdb|lldb]  Debugger backend. [default: frida]
   -o, --output PATH               Output .msl file path.
   -c, --compress [none|zstd|lz4]  Compression algorithm. [default: none]
-  -U, --usb                       Connect to a USB device (iOS/Android).
-  -R, --remote HOST:PORT          Connect to a remote Frida server.
+  -U, --usb                       Connect to a USB device (Frida only).
+  -R, --remote HOST:PORT          Connect to a remote Frida server (Frida only).
   --os [windows|linux|macos|android|ios]
                                   Override automatic OS detection.
   --filter-prot TEXT              Filter regions by protection (e.g. 'rw-', 'r--').
@@ -134,7 +226,11 @@ Options:
   -v, --verbose                   Enable verbose/debug output.
   --read-timeout FLOAT            Per-read timeout in seconds. [default: 10]
   --include-unreadable            Include memory regions with no read permission.
-  --max-region-size INT           Skip regions larger than this size in bytes (0 = no limit).
+  --max-region-size INT           Skip regions larger than this size (0 = no limit).
+  -I, --investigation             Investigation mode: capture system-wide context.
+  -E, --encrypt                   Enable AEAD encryption (AES-256-GCM + Argon2id).
+  --no-encrypt                    Disable encryption (overrides -I default).
+  --passphrase TEXT               Encryption passphrase (prompted if not provided).
   --help                          Show this message and exit.
 ```
 
@@ -145,18 +241,26 @@ Options:
 MemSlicer writes memory snapshots to the MSL (Memory Slice) binary format. Each file contains:
 
 - A file header with format version, target metadata, and capture timestamp
-- Per-region records with base address, size, protection flags, module path, and page-level data
-- Module table listing all mapped modules identified during capture
-- Optional BLAKE3 checksums for integrity verification
+- Process identity block (ppid, session ID, start time, executable path, command line)
+- Module list with base addresses, sizes, and paths
+- Per-region records with base address, size, protection flags, and page-level data
+- BLAKE3 integrity chain across all blocks
 - Optional compressed data blocks (zstd or lz4)
+- Optional AEAD encryption (AES-256-GCM + Argon2id)
+
+When **investigation mode** (`-I`) is enabled, the MSL file additionally contains:
+- System context: boot time, hostname, domain, OS detail string
+- System-wide process table (all running processes)
+- Network connection table (TCP/UDP, IPv4/IPv6)
+- File handle table (open file descriptors for the target process)
 
 A companion `.log` file is written alongside every `.msl` file and contains the full debug output of the capture session, regardless of whether `-v` was passed.
 
 ### Example Output Summary
 
 ```
-MemSlicer - Dumping Chrome -> Chrome_1773528836.msl
-Compression: none | Device: local
+MemSlicer - Dumping chrome -> chrome_1773528836.msl
+Backend: frida | Compression: none | Device: local
 Progress: [##################################################] 100.00% Complete
   Regions : 2621/4199 (1578 filtered out)
             1578 no read permission (use --include-unreadable to include)
@@ -164,8 +268,8 @@ Progress: [##################################################] 100.00% Complete
   Bytes   : 51,200,000 / 52,428,800 readable (97.7%)
   Modules : 142
   Duration: 12.34s
-  File    : Chrome_1773528836.msl (48,234,567 bytes)
-  Log     : Chrome_1773528836.msl.log
+  File    : chrome_1773528836.msl (48,234,567 bytes)
+  Log     : chrome_1773528836.msl.log
   Quality : GOOD (page-level: 97.7%)
 ```
 
@@ -175,21 +279,37 @@ Progress: [##################################################] 100.00% Complete
 
 ```
 src/memslicer/
-  cli.py                    CLI entry point (click)
+  cli.py                         CLI entry point (click)
   acquirer/
-    frida_acquirer.py       Frida-based memory acquisition
-    region_filter.py        Region filtering logic
-    platform_detect.py      OS and device detection
+    engine.py                    Backend-agnostic acquisition engine
+    bridge.py                    DebuggerBridge protocol definition
+    frida_bridge.py              Frida backend
+    gdb_bridge.py                GDB/MI3 backend
+    lldb_bridge.py               LLDB Python API backend
+    frida_acquirer.py            Backward-compatible Frida wrapper
+    investigation.py             InvestigationCollector protocol
+    platform_detect.py           OS and architecture detection
+    region_filter.py             Region filtering logic
+    collectors/
+      __init__.py                Factory: create_collector()
+      linux.py                   Linux collector (/proc)
+      android.py                 Android collector (SELinux-aware + system properties)
+      darwin.py                  macOS collector (sysctl, ps, lsof)
+      ios.py                     iOS collector (sandbox-aware, SystemVersion.plist)
+      windows.py                 Windows collector (wmic, tasklist, netstat)
+      frida_remote.py            Remote collector via Frida JS RPC
+      fallback.py                NullCollector for unsupported platforms
+      constants.py               Shared constants (protocols, handle types)
   msl/
-    writer.py               MSL file writer
-    compression.py          Compression backends
-    constants.py            Format constants
-    integrity.py            BLAKE3 checksum handling
-    types.py                MSL data types
+    writer.py                    MSL file writer
+    encryption.py                AES-256-GCM + Argon2id encryption
+    constants.py                 Format constants and enumerations
+    integrity.py                 BLAKE3 integrity chain
+    types.py                     MSL data types
   utils/
-    protection.py           Memory protection parsing
-    padding.py              Alignment utilities
-    timestamps.py           Timestamp helpers
+    protection.py                Memory protection parsing
+    padding.py                   Alignment utilities
+    timestamps.py                Timestamp helpers
 ```
 
 ---
@@ -231,11 +351,13 @@ ruff format src/
 
 | Package        | Version  | Purpose                        |
 |----------------|----------|--------------------------------|
-| frida-tools    | >=12.0   | Frida Python bindings and CLI  |
-| blake3         | >=0.4    | Integrity checksums            |
+| frida-tools    | >=12.0   | Frida backend and agent        |
+| blake3         | >=0.4    | BLAKE3 integrity checksums     |
 | click          | >=8.0    | CLI framework                  |
 | zstandard      | >=0.20   | Zstd compression               |
 | lz4            | >=4.0    | LZ4 compression                |
+| cryptography   | >=42.0   | AES-256-GCM encryption         |
+| argon2-cffi    | >=23.1   | Argon2id key derivation         |
 
 ---
 

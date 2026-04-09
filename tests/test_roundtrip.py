@@ -90,7 +90,7 @@ def _parse_block_at(data: bytes, offset: int) -> dict:
     magic = data[offset:offset + 4]
     assert magic == BLOCK_MAGIC, f"Bad block magic at {offset}: {magic!r}"
 
-    block_type, flags, block_length, reserved = struct.unpack_from("<HHII", data, offset + 4)
+    block_type, flags, block_length, payload_version, reserved = struct.unpack_from("<HHIHH", data, offset + 4)
     block_uuid = data[offset + 16:offset + 32]
     parent_uuid = data[offset + 32:offset + 48]
     prev_hash = data[offset + 48:offset + 80]
@@ -113,8 +113,9 @@ def test_file_header(full_msl):
     assert full_msl[:8] == FILE_MAGIC
     assert full_msl[8] == 1  # little-endian
     assert full_msl[9] == 64  # header size
-    assert full_msl[10] == 1  # version major
-    assert full_msl[11] == 0  # version minor
+    # Version is uint16 LE: v1.0 = 0x0100 → LE bytes [0x00, 0x01]
+    version = struct.unpack_from("<H", full_msl, 10)[0]
+    assert version == 0x0100
 
     pid = struct.unpack_from("<I", full_msl, 52)[0]
     assert pid == 9999
@@ -231,7 +232,7 @@ def test_string_padding(full_msl):
     mod_payload = blocks[3]["payload"]
     # After BaseAddr(8) + ModuleSize(8) + PathLen(2) + VersionLen(2) + Reserved(4) = 24
     path_len = struct.unpack_from("<H", mod_payload, 16)[0]
+    assert path_len == 19  # 18 chars + null terminator, pre-padding
     path_data = mod_payload[24:24 + path_len]
     assert path_data[:18] == b"/usr/lib/libc.so.6"
-    assert b'\x00' in path_data  # null terminated
-    assert len(path_data) % 8 == 0  # padded to 8B
+    assert path_data[18:19] == b'\x00'  # null terminated

@@ -69,8 +69,9 @@ class TestMinimalMSL:
         writer.finalize()
 
         data = buf.getvalue()
-        assert data[10] == 1  # major
-        assert data[11] == 0  # minor
+        # Version is uint16 LE with major in high byte: v1.0 = 0x0100 → LE bytes [0x00, 0x01]
+        version = struct.unpack_from("<H", data, 10)[0]
+        assert version == 0x0100  # major=1, minor=0
 
     def test_eoc_block_starts_at_64(self, header):
         buf = io.BytesIO()
@@ -99,8 +100,8 @@ class TestMinimalMSL:
         header_bytes = data[:HEADER_SIZE]
         expected_prev_hash = blake3.blake3(header_bytes).digest()
 
-        # PrevHash is at offset 48 within block header (after magic4+type2+flags2+len4+reserved4+uuid16+parent16)
-        prev_hash_offset = HEADER_SIZE + 4 + 2 + 2 + 4 + 4 + 16 + 16
+        # PrevHash is at offset 48 within block header (after magic4+type2+flags2+len4+payloadver2+reserved2+uuid16+parent16)
+        prev_hash_offset = HEADER_SIZE + 4 + 2 + 2 + 4 + 2 + 2 + 16 + 16
         actual_prev_hash = data[prev_hash_offset:prev_hash_offset + 32]
         assert actual_prev_hash == expected_prev_hash
 
@@ -224,9 +225,9 @@ class TestModuleBlocks:
         block_type = struct.unpack_from("<H", data, HEADER_SIZE + 4)[0]
         assert block_type == BlockType.ModuleListIndex
 
-        # Flags should have HAS_CHILDREN (0x0001)
+        # Flags should have HAS_CHILDREN (0x0010, bit 4)
         flags = struct.unpack_from("<H", data, HEADER_SIZE + 6)[0]
-        assert flags & 0x0001
+        assert flags & 0x0010
 
 
 class TestIntegrityChain:
@@ -264,3 +265,74 @@ class TestIntegrityChain:
         block0_bytes = data[HEADER_SIZE:HEADER_SIZE + block0_len]
         prev_hash_1_offset = block1_start + 48
         assert data[prev_hash_1_offset:prev_hash_1_offset + 32] == blake3.blake3(block0_bytes).digest()
+
+
+class TestPageSizeLog2Validation:
+    """Test PageSizeLog2 validation in write_memory_region."""
+
+    def _make_region(self, page_size: int) -> MemoryRegion:
+        return MemoryRegion(
+            base_addr=0x1000,
+            region_size=page_size,
+            protection=1,
+            region_type=RegionType.Anon,
+            page_size=page_size,
+            timestamp_ns=now_ns(),
+            page_states=[PageState.CAPTURED],
+            page_data_chunks=[b'\x00' * page_size],
+        )
+
+    def test_non_power_of_two_rejected(self, header):
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        region = self._make_region(page_size=4096)
+        region.page_size = 3000  # not a power of 2
+        with pytest.raises(ValueError, match="power of 2"):
+            writer.write_memory_region(region)
+
+    def test_zero_page_size_rejected(self, header):
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        region = self._make_region(page_size=4096)
+        region.page_size = 0
+        with pytest.raises(ValueError, match="power of 2"):
+            writer.write_memory_region(region)
+
+    def test_negative_page_size_rejected(self, header):
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        region = self._make_region(page_size=4096)
+        region.page_size = -4096
+        with pytest.raises(ValueError, match="power of 2"):
+            writer.write_memory_region(region)
+
+    def test_page_size_too_small_rejected(self, header):
+        """page_size=512 -> log2=9, below minimum of 10."""
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        region = self._make_region(page_size=4096)
+        region.page_size = 512  # log2 = 9
+        region.region_size = 512
+        region.page_data_chunks = [b'\x00' * 512]
+        with pytest.raises(ValueError, match="outside valid range"):
+            writer.write_memory_region(region)
+
+    def test_valid_4k_page_accepted(self, header):
+        """page_size=4096 -> log2=12, within [10, 40]."""
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        region = self._make_region(page_size=4096)
+        writer.write_memory_region(region)
+        writer.finalize()
+        assert buf.tell() > HEADER_SIZE
+
+    def test_valid_64k_page_accepted(self, header):
+        """page_size=65536 -> log2=16, within [10, 40]."""
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        region = self._make_region(page_size=65536)
+        region.region_size = 65536
+        region.page_data_chunks = [b'\x00' * 65536]
+        writer.write_memory_region(region)
+        writer.finalize()
+        assert buf.tell() > HEADER_SIZE

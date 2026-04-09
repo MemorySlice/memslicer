@@ -25,6 +25,8 @@ def format_protection(bits: int) -> str:
 PROT_R = 1
 PROT_W = 2
 PROT_X = 4
+PROT_GUARD = 8    # bit 3
+PROT_COW = 16     # bit 4 (Copy-on-Write)
 PROT_RWX = PROT_R | PROT_W | PROT_X
 
 

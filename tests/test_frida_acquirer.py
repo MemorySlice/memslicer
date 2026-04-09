@@ -3,19 +3,30 @@ import io
 import logging
 import logging.handlers
 import struct
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
-import frida
 import pytest
+
+# Ensure 'frida' is available as a mock in sys.modules so that
+# FridaBridge.connect() can do ``import frida as _frida`` without
+# requiring the real Frida package.
+_frida_mock = MagicMock()
+# Provide a real exception subclass so ``except frida.InvalidOperationError``
+# works in tests that raise it.
+_frida_mock.InvalidOperationError = type(
+    "InvalidOperationError", (Exception,), {},
+)
+sys.modules.setdefault("frida", _frida_mock)
 
 from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BLOCK_HEADER_SIZE,
     BlockType,
 )
-from memslicer.acquirer.frida_acquirer import (
-    FridaAcquirer, _classify_region, _ensure_bytes, _volatility_key,
-)
+from memslicer.acquirer.frida_acquirer import FridaAcquirer
+from memslicer.acquirer.engine import classify_region, volatility_key
+from memslicer.acquirer.bridge import MemoryRange
 from memslicer.acquirer.base import AcquireResult
 from memslicer.utils.protection import parse_protection as _parse_protection
 from memslicer.msl.constants import RegionType
@@ -40,32 +51,31 @@ class TestParseProtection:
 
 class TestClassifyRegion:
     def test_none(self):
-        assert _classify_region(None) == RegionType.Anon
+        assert classify_region("") == RegionType.Anon
 
     def test_empty_path(self):
-        assert _classify_region({"path": ""}) == RegionType.Anon
+        assert classify_region("") == RegionType.Anon
 
     def test_heap(self):
-        assert _classify_region({"path": "[heap]"}) == RegionType.Heap
+        assert classify_region("[heap]") == RegionType.Heap
 
     def test_stack(self):
-        assert _classify_region({"path": "[stack]"}) == RegionType.Stack
+        assert classify_region("[stack]") == RegionType.Stack
 
     def test_shared_object(self):
-        assert _classify_region({"path": "/usr/lib/libc.so"}) == RegionType.Image
+        assert classify_region("/usr/lib/libc.so") == RegionType.Image
 
     def test_dylib(self):
-        assert _classify_region({"path": "/usr/lib/libSystem.dylib"}) == RegionType.Image
+        assert classify_region("/usr/lib/libSystem.dylib") == RegionType.Image
 
     def test_mapped_file(self):
-        assert _classify_region({"path": "/tmp/data.bin"}) == RegionType.MappedFile
+        assert classify_region("/tmp/data.bin") == RegionType.MappedFile
 
 
 class TestFridaAcquirerIntegration:
     """Test FridaAcquirer with fully mocked Frida."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_acquire_produces_valid_msl(self, mock_frida, tmp_path):
+    def test_acquire_produces_valid_msl(self, tmp_path):
         # Setup mock device and session
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -123,8 +133,7 @@ class TestFridaAcquirerIntegration:
         assert BlockType.ModuleEntry in blocks
         assert blocks[-1] == BlockType.EndOfCapture
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_progress_callback(self, mock_frida, tmp_path):
+    def test_progress_callback(self, tmp_path):
         mock_device = MagicMock()
         mock_session = MagicMock()
         mock_script = MagicMock()
@@ -156,8 +165,7 @@ class TestFridaAcquirerIntegration:
         assert len(progress_calls) >= 1
         assert progress_calls[-1][0] >= 1  # at least 1 region
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_abort_mid_acquisition(self, mock_frida, tmp_path):
+    def test_abort_mid_acquisition(self, tmp_path):
         """Test that aborting mid-acquisition produces a partial but valid MSL."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -207,8 +215,7 @@ class TestFridaAcquirerIntegration:
 class TestChunkedReading:
     """Test chunked reading for large regions."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_large_region_split_into_chunks(self, mock_frida, tmp_path):
+    def test_large_region_split_into_chunks(self, tmp_path):
         """Regions larger than max_chunk_size get split into chunks."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -246,8 +253,7 @@ class TestChunkedReading:
         # Should have been called 4 times (4 chunks of 64KB)
         assert api.read_memory.call_count == 4
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_partial_chunk_failures(self, mock_frida, tmp_path):
+    def test_partial_chunk_failures(self, tmp_path):
         """Some chunks succeed, some fail within a large region."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -298,25 +304,17 @@ class TestChunkedReading:
 class TestSignalHandling:
     """Test abort and session detach behavior."""
 
-    def test_request_abort_detaches_session(self):
-        """request_abort() should set abort event and detach session."""
+    def test_request_abort_sets_abort_flag(self):
+        """request_abort() should set the abort event."""
         mock_device = MagicMock()
         acquirer = FridaAcquirer(target=1234, device=mock_device)
 
-        mock_session = MagicMock()
-        acquirer._session = mock_session
-
         acquirer.request_abort()
 
-        assert acquirer._abort.is_set()
-        mock_session.detach.assert_called_once()
+        assert acquirer._engine._abort.is_set()
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_invalid_operation_error_treated_as_abort(self, mock_frida, tmp_path):
-        """frida.InvalidOperationError should be caught gracefully."""
-        # Expose the real exception class on the mock so except clause works
-        mock_frida.InvalidOperationError = frida.InvalidOperationError
-
+    def test_invalid_operation_error_treated_as_abort(self, tmp_path):
+        """frida.InvalidOperationError should be caught gracefully when abort is set."""
         mock_device = MagicMock()
         mock_session = MagicMock()
         mock_script = MagicMock()
@@ -332,12 +330,19 @@ class TestSignalHandling:
         api.get_pid.return_value = 1234
         api.validate_api.return_value = {"ptrType": "function", "readByteArrayType": "function", "pageSize": 4096}
 
-        # Simulate InvalidOperationError during enumerate_ranges
-        api.enumerate_ranges.side_effect = frida.InvalidOperationError("session detached")
         api.enumerate_modules.return_value = []
 
         output = tmp_path / "test.msl"
         acquirer = FridaAcquirer(target=1234, device=mock_device)
+
+        # Simulate InvalidOperationError during enumerate_ranges
+        # (happens when session is detached, e.g. via request_abort)
+        # Set abort as a side effect so it's set when the exception fires.
+        def abort_and_raise(*args, **kwargs):
+            acquirer._engine._abort.set()
+            raise _frida_mock.InvalidOperationError("session detached")
+
+        api.enumerate_ranges.side_effect = abort_and_raise
 
         # Should not raise
         result = acquirer.acquire(output)
@@ -347,8 +352,7 @@ class TestSignalHandling:
 class TestLogging:
     """Test verbose logging output."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_debug_logging_during_acquire(self, mock_frida, tmp_path):
+    def test_debug_logging_during_acquire(self, tmp_path):
         """Logger.debug should be called during acquisition."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -386,8 +390,7 @@ class TestLogging:
 class TestReadFailureHandling:
     """Test that read failures are handled gracefully."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_read_exception_caught(self, mock_frida, tmp_path):
+    def test_read_exception_caught(self, tmp_path):
         """Exceptions from read_memory should be caught, not propagated."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -419,8 +422,7 @@ class TestReadFailureHandling:
         assert result.regions_captured == 1
         assert result.bytes_captured == 0
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_all_reads_return_none(self, mock_frida, tmp_path):
+    def test_all_reads_return_none(self, tmp_path):
         """When all reads return None, regions are still tracked (page-by-page also fails)."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -463,7 +465,7 @@ class TestOnMessageDiagnostics:
         logger.addHandler(handler)
 
         acquirer = FridaAcquirer(target=1234, device=mock_device, logger=logger)
-        acquirer._on_message(
+        acquirer._engine._bridge._on_message(
             {
                 "type": "send",
                 "payload": {
@@ -490,7 +492,7 @@ class TestOnMessageDiagnostics:
         logger.addHandler(handler)
 
         acquirer = FridaAcquirer(target=1234, device=mock_device, logger=logger)
-        acquirer._on_message(
+        acquirer._engine._bridge._on_message(
             {"type": "error", "description": "ReferenceError: foo is not defined"},
             None,
         )
@@ -504,7 +506,7 @@ class TestOnMessageDiagnostics:
         mock_device = MagicMock()
         acquirer = FridaAcquirer(target=1234, device=mock_device)
         # Should not raise
-        acquirer._on_message({"type": "unknown", "payload": "stuff"}, None)
+        acquirer._engine._bridge._on_message({"type": "unknown", "payload": "stuff"}, None)
 
     def test_on_message_logs_stack_trace_at_debug(self):
         """read-error messages with a stack field log the JS stack at DEBUG level."""
@@ -515,7 +517,7 @@ class TestOnMessageDiagnostics:
         logger.addHandler(handler)
 
         acquirer = FridaAcquirer(target=1234, device=mock_device, logger=logger)
-        acquirer._on_message(
+        acquirer._engine._bridge._on_message(
             {
                 "type": "send",
                 "payload": {
@@ -532,8 +534,7 @@ class TestOnMessageDiagnostics:
         debug_records = [r for r in handler.buffer if r.levelno == logging.DEBUG]
         assert any("JS stack:" in r.getMessage() for r in debug_records)
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_script_on_message_registered(self, mock_frida, tmp_path):
+    def test_script_on_message_registered(self, tmp_path):
         """script.on('message', ...) is called during acquire."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -555,14 +556,13 @@ class TestOnMessageDiagnostics:
         acquirer = FridaAcquirer(target=1234, device=mock_device)
         acquirer.acquire(output)
 
-        mock_script.on.assert_called_once_with('message', acquirer._on_message)
+        mock_script.on.assert_called_once_with('message', acquirer._engine._bridge._on_message)
 
 
 class TestStartupTestRead:
     """Test startup test read (Change 2)."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_startup_read_success_logged(self, mock_frida, tmp_path):
+    def test_startup_read_success_logged(self, tmp_path):
         """Successful startup test read is logged at INFO."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -596,8 +596,7 @@ class TestStartupTestRead:
         info_msgs = [r.getMessage() for r in handler.buffer if r.levelno == logging.INFO]
         assert any("Startup test read OK" in m for m in info_msgs)
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_startup_read_failure_warned(self, mock_frida, tmp_path):
+    def test_startup_read_failure_warned(self, tmp_path):
         """Failed startup test read is logged at WARNING."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -631,8 +630,7 @@ class TestStartupTestRead:
         warn_msgs = [r.getMessage() for r in handler.buffer if r.levelno == logging.WARNING]
         assert any("Startup test read FAILED" in m for m in warn_msgs)
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_startup_read_skips_large_regions(self, mock_frida, tmp_path):
+    def test_startup_read_skips_large_regions(self, tmp_path):
         """Startup test read skips regions larger than 4 * page_size."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -671,8 +669,7 @@ class TestStartupTestRead:
 class TestPageByPageFallback:
     """Test page-by-page fallback read strategy (Change 3)."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_fallback_captures_partial_pages(self, mock_frida, tmp_path):
+    def test_fallback_captures_partial_pages(self, tmp_path):
         """When full read fails, page-by-page fallback captures individual pages."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -723,8 +720,7 @@ class TestPageByPageFallback:
         assert result.regions_captured == 1
         assert result.bytes_captured == 4096  # only 1 of 2 pages
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_fallback_in_chunked_path(self, mock_frida, tmp_path):
+    def test_fallback_in_chunked_path(self, tmp_path):
         """Page-by-page fallback also works when a chunk fails in the chunked path."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -783,8 +779,7 @@ class TestPageByPageFallback:
 class TestAddressNormalization:
     """Test address format normalization (Change 4)."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_int_address_normalized_to_hex(self, mock_frida, tmp_path):
+    def test_int_address_normalized_to_hex(self, tmp_path):
         """Integer addresses are converted to hex strings for Frida RPC."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -805,8 +800,12 @@ class TestAddressNormalization:
 
         acquirer = FridaAcquirer(target=1234, device=mock_device)
 
-        # Call _try_read with an int address — should normalize to hex
-        result = acquirer._try_read(api, 0x10000, 4096)
+        # read_memory now lives on FridaBridge; set up its internal _api
+        bridge = acquirer._engine._bridge
+        bridge._api = api
+
+        # Call read_memory with an int address — bridge normalizes to hex
+        result = bridge.read_memory(0x10000, 4096)
 
         # Verify read_memory was called with a hex string, not an int
         api.read_memory.assert_called_once_with("0x10000", 4096)
@@ -817,44 +816,43 @@ class TestVolatilityOrdering:
 
     def test_rw_anon_first(self):
         """rw- anonymous regions should sort before r-- mapped files."""
-        rw_anon = {"base": "0x20000", "size": 4096, "protection": "rw-", "file": None}
-        ro_mapped = {"base": "0x10000", "size": 4096, "protection": "r--", "file": {"path": "/lib/libc.so"}}
-        assert _volatility_key(rw_anon) < _volatility_key(ro_mapped)
+        rw_anon = MemoryRange(base=0x20000, size=4096, protection="rw-", file_path="")
+        ro_mapped = MemoryRange(base=0x10000, size=4096, protection="r--", file_path="/lib/libc.so")
+        assert volatility_key(rw_anon) < volatility_key(ro_mapped)
 
     def test_rwx_before_rx(self):
         """rwx regions should sort before r-x regions."""
-        rwx = {"base": "0x30000", "size": 4096, "protection": "rwx", "file": None}
-        rx = {"base": "0x10000", "size": 4096, "protection": "r-x", "file": {"path": "/lib/libc.so"}}
-        assert _volatility_key(rwx) < _volatility_key(rx)
+        rwx = MemoryRange(base=0x30000, size=4096, protection="rwx", file_path="")
+        rx = MemoryRange(base=0x10000, size=4096, protection="r-x", file_path="/lib/libc.so")
+        assert volatility_key(rwx) < volatility_key(rx)
 
     def test_rx_before_ro(self):
         """r-x regions should sort before r-- regions."""
-        rx = {"base": "0x10000", "size": 4096, "protection": "r-x", "file": {"path": "/lib/libc.so"}}
-        ro = {"base": "0x20000", "size": 4096, "protection": "r--", "file": {"path": "/tmp/data.bin"}}
-        assert _volatility_key(rx) < _volatility_key(ro)
+        rx = MemoryRange(base=0x10000, size=4096, protection="r-x", file_path="/lib/libc.so")
+        ro = MemoryRange(base=0x20000, size=4096, protection="r--", file_path="/tmp/data.bin")
+        assert volatility_key(rx) < volatility_key(ro)
 
     def test_same_tier_sorted_by_address(self):
         """Within the same volatility tier, sort by base address."""
-        r1 = {"base": "0x10000", "size": 4096, "protection": "rw-", "file": None}
-        r2 = {"base": "0x20000", "size": 4096, "protection": "rw-", "file": None}
-        assert _volatility_key(r1) < _volatility_key(r2)
+        r1 = MemoryRange(base=0x10000, size=4096, protection="rw-", file_path="")
+        r2 = MemoryRange(base=0x20000, size=4096, protection="rw-", file_path="")
+        assert volatility_key(r1) < volatility_key(r2)
 
     def test_heap_is_tier_zero(self):
         """Heap regions (rw-) should be tier 0."""
-        heap = {"base": "0x10000", "size": 4096, "protection": "rw-", "file": {"path": "[heap]"}}
-        assert _volatility_key(heap)[0] == 0
+        heap = MemoryRange(base=0x10000, size=4096, protection="rw-", file_path="[heap]")
+        assert volatility_key(heap)[0] == 0
 
     def test_stack_is_tier_zero(self):
         """Stack regions (rw-) should be tier 0."""
-        stack = {"base": "0x10000", "size": 4096, "protection": "rw-", "file": {"path": "[stack]"}}
-        assert _volatility_key(stack)[0] == 0
+        stack = MemoryRange(base=0x10000, size=4096, protection="rw-", file_path="[stack]")
+        assert volatility_key(stack)[0] == 0
 
 
 class TestRWXDetection:
     """Test RWX region detection and counting."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_rwx_warning_logged(self, mock_frida, tmp_path):
+    def test_rwx_warning_logged(self, tmp_path):
         """RWX regions should trigger a WARNING-level log."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -889,8 +887,7 @@ class TestRWXDetection:
         assert any("RWX region" in m for m in warn_msgs)
         assert result.rwx_regions == 1
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_no_rwx_when_not_present(self, mock_frida, tmp_path):
+    def test_no_rwx_when_not_present(self, tmp_path):
         """Non-RWX regions should not trigger warnings or count."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -922,8 +919,7 @@ class TestRWXDetection:
 class TestPageLevelMetrics:
     """Test that page-level and byte-level metrics are tracked in AcquireResult."""
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_successful_read_tracks_pages(self, mock_frida, tmp_path):
+    def test_successful_read_tracks_pages(self, tmp_path):
         """Successful region reads track pages_captured."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -954,8 +950,7 @@ class TestPageLevelMetrics:
         assert result.bytes_attempted == 8192
         assert result.bytes_captured == 8192
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_partial_failure_tracks_both(self, mock_frida, tmp_path):
+    def test_partial_failure_tracks_both(self, tmp_path):
         """Partial page failures track both captured and failed pages."""
         mock_device = MagicMock()
         mock_session = MagicMock()
@@ -997,8 +992,7 @@ class TestPageLevelMetrics:
         assert result.pages_failed == 1
         assert result.bytes_attempted == 8192
 
-    @patch("memslicer.acquirer.frida_acquirer.frida")
-    def test_skip_reasons_tracked(self, mock_frida, tmp_path):
+    def test_skip_reasons_tracked(self, tmp_path):
         """Skip reasons are tracked in the result."""
         mock_device = MagicMock()
         mock_session = MagicMock()

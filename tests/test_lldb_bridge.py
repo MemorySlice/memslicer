@@ -230,20 +230,17 @@ class TestLLDBBridgeEnumerateRangesLinux:
         assert ranges[1].base == 0x7F000000
         assert ranges[1].protection == "rw-"
 
-    def test_no_fallback_when_lldb_has_ranges(self):
-        """When LLDB returns valid ranges, /proc/maps is not read."""
+    def test_no_fallback_when_lldb_has_enough_ranges(self):
+        """When LLDB returns >= 5 regions, /proc/maps is not read."""
         bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
 
-        # Set platform to Linux.
         bridge._platform_info = PlatformInfo(
             arch=ArchType.x86_64, os=OSType.Linux, pid=9999, page_size=4096,
         )
         bridge._remote = None
 
-        # Configure mock region to return one valid region then stop.
+        # Configure mock to return 6 valid regions then fail.
         mock_region = MagicMock()
-        mock_region.GetRegionBase.return_value = 0x1000
-        mock_region.GetRegionEnd.return_value = 0x2000
         mock_region.IsMapped.return_value = True
         mock_region.IsReadable.return_value = True
         mock_region.IsWritable.return_value = False
@@ -251,19 +248,87 @@ class TestLLDBBridgeEnumerateRangesLinux:
         mock_region.GetName.return_value = "/lib/test.so"
         mock_lldb.SBMemoryRegionInfo.return_value = mock_region
 
-        # First call succeeds, second fails (end of regions).
         success_err = MagicMock()
         success_err.Fail.return_value = False
         fail_err = MagicMock()
         fail_err.Fail.return_value = True
-        mock_process.GetMemoryRegionInfo.side_effect = [success_err, fail_err]
+
+        # 6 regions: base 0x1000, 0x2000, ..., 0x6000, then end increases each time
+        bases = [0x1000 * (i + 1) for i in range(6)]
+        ends = [b + 0x1000 for b in bases]
+
+        call_count = [0]
+        def mock_get_region_info(addr, region):
+            if call_count[0] < 6:
+                region.GetRegionBase.return_value = bases[call_count[0]]
+                region.GetRegionEnd.return_value = ends[call_count[0]]
+                call_count[0] += 1
+                return success_err
+            return fail_err
+
+        mock_process.GetMemoryRegionInfo.side_effect = mock_get_region_info
 
         with patch("builtins.open") as mock_open:
             ranges = bridge.enumerate_ranges()
 
         mock_open.assert_not_called()
-        assert len(ranges) == 1
-        assert ranges[0].base == 0x1000
+        assert len(ranges) == 6
+
+    def test_fallback_when_lldb_has_few_ranges(self):
+        """When LLDB returns < 5 regions on Linux, /proc/maps cross-check is used."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        bridge._platform_info = PlatformInfo(
+            arch=ArchType.x86_64, os=OSType.Linux, pid=9999, page_size=4096,
+        )
+        bridge._remote = None
+
+        # LLDB returns 2 regions
+        mock_region = MagicMock()
+        mock_region.IsMapped.return_value = True
+        mock_region.IsReadable.return_value = True
+        mock_region.IsWritable.return_value = False
+        mock_region.IsExecutable.return_value = False
+        mock_region.GetName.return_value = ""
+        mock_lldb.SBMemoryRegionInfo.return_value = mock_region
+
+        success_err = MagicMock()
+        success_err.Fail.return_value = False
+        fail_err = MagicMock()
+        fail_err.Fail.return_value = True
+
+        call_count = [0]
+        bases = [0x1000, 0x2000]
+        ends = [0x2000, 0x3000]
+        def mock_get_region_info(addr, region):
+            if call_count[0] < 2:
+                region.GetRegionBase.return_value = bases[call_count[0]]
+                region.GetRegionEnd.return_value = ends[call_count[0]]
+                call_count[0] += 1
+                return success_err
+            return fail_err
+
+        mock_process.GetMemoryRegionInfo.side_effect = mock_get_region_info
+
+        # /proc/maps returns more (10 ranges)
+        sample_maps = "".join(
+            f"{0x1000*i:08x}-{0x1000*(i+1):08x} r-xp 00000000 08:01 {i} /lib/lib{i}.so\n"
+            for i in range(1, 11)
+        )
+
+        with patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", MagicMock(
+                 return_value=MagicMock(
+                     __enter__=lambda s: s,
+                     __exit__=MagicMock(return_value=False),
+                     __iter__=lambda s: iter(sample_maps.splitlines(True)),
+                     read=lambda: sample_maps,
+                 ),
+             )):
+            ranges = bridge.enumerate_ranges()
+
+        # Should use /proc/maps (10) since it has more than LLDB (2)
+        assert len(ranges) == 10
 
     def test_no_fallback_for_non_linux(self):
         """When OS is macOS, no /proc/maps fallback is attempted."""
@@ -568,3 +633,109 @@ class TestLLDBBridgeModuleSize:
         assert len(modules) == 1
         # Fallback: sum of byte sizes = 100 + 200 = 300
         assert modules[0].size == 300
+
+
+# ---------------------------------------------------------------------------
+# Tests -- region skip on failure
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgeRegionSkip:
+    """Tests for region enumeration skip-on-failure behavior."""
+
+    def test_skips_forward_on_failure(self):
+        """GetMemoryRegionInfo failure skips forward instead of stopping."""
+        bridge, mock_lldb, _dbg, _tgt, mock_process = _create_and_connect()
+
+        bridge._platform_info = PlatformInfo(
+            arch=ArchType.x86_64, os=OSType.macOS, pid=9999, page_size=4096,
+        )
+
+        mock_region = MagicMock()
+        mock_region.IsMapped.return_value = True
+        mock_region.IsReadable.return_value = True
+        mock_region.IsWritable.return_value = False
+        mock_region.IsExecutable.return_value = True
+        mock_region.GetName.return_value = ""
+        mock_lldb.SBMemoryRegionInfo.return_value = mock_region
+
+        success_err = MagicMock()
+        success_err.Fail.return_value = False
+        fail_err = MagicMock()
+        fail_err.Fail.return_value = True
+        fail_err.GetCString.return_value = "access denied"
+
+        # Sequence: success at 0, fail, success at skip addr, then stop
+        call_count = [0]
+        def mock_get_region(addr, region):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First region: 0x0 - 0x1000
+                region.GetRegionBase.return_value = 0x0
+                region.GetRegionEnd.return_value = 0x1000
+                return success_err
+            elif call_count[0] == 2:
+                # Fail at 0x1000
+                return fail_err
+            elif call_count[0] == 3:
+                # Success after skip: 0x101000 - 0x102000
+                region.GetRegionBase.return_value = 0x101000
+                region.GetRegionEnd.return_value = 0x102000
+                return success_err
+            else:
+                return fail_err
+
+        # Set max consecutive skip to 1 so we stop quickly after the 3rd region
+        bridge._MAX_CONSECUTIVE_SKIP = 1
+        mock_process.GetMemoryRegionInfo.side_effect = mock_get_region
+
+        ranges = bridge.enumerate_ranges()
+
+        # Should have 2 regions (skipped the failure in between)
+        assert len(ranges) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests -- SIP and ptrace pre-flight checks
+# ---------------------------------------------------------------------------
+
+class TestLLDBBridgePreflightChecks:
+    """Tests for SIP and ptrace pre-flight checks."""
+
+    def test_sip_warning_on_macos(self):
+        """Warning logged when SIP is enabled on macOS."""
+        bridge, *_ = _create_and_connect()
+        bridge._log = MagicMock()
+
+        with patch("platform.system", return_value="Darwin"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="System Integrity Protection status: enabled.")
+            bridge._check_macos_sip()
+
+        bridge._log.warning.assert_called_once()
+        assert "SIP" in bridge._log.warning.call_args[0][0]
+
+    def test_sip_silent_on_linux(self):
+        """No SIP warning on Linux."""
+        bridge, *_ = _create_and_connect()
+        bridge._log = MagicMock()
+
+        with patch("platform.system", return_value="Linux"):
+            bridge._check_macos_sip()
+
+        bridge._log.warning.assert_not_called()
+
+    def test_ptrace_scope_warning(self):
+        """Warning logged when ptrace_scope >= 2."""
+        bridge, *_ = _create_and_connect()
+        bridge._log = MagicMock()
+
+        with patch("builtins.open", MagicMock(
+            return_value=MagicMock(
+                __enter__=lambda s: s,
+                __exit__=MagicMock(return_value=False),
+                read=lambda *a: "2\n",
+            )
+        )):
+            bridge._check_ptrace_scope()
+
+        bridge._log.warning.assert_called_once()
