@@ -57,18 +57,18 @@ jobs:
           TODAY=$(date +%Y-%m-%d)
           CHANGELOG_ENTRY="## [${NEW_VERSION}] - ${TODAY}"
 
-          declare -A GROUPS
-          GROUPS[feat]=""
-          GROUPS[fix]=""
-          GROUPS[refactor]=""
-          GROUPS[docs]=""
-          GROUPS[test]=""
-          GROUPS[chore]=""
-          GROUPS[perf]=""
-          GROUPS[ci]=""
-          GROUPS[build]=""
-          GROUPS[style]=""
-          GROUPS[other]=""
+          declare -A COMMIT_GROUPS
+          COMMIT_GROUPS[feat]=""
+          COMMIT_GROUPS[fix]=""
+          COMMIT_GROUPS[refactor]=""
+          COMMIT_GROUPS[docs]=""
+          COMMIT_GROUPS[test]=""
+          COMMIT_GROUPS[chore]=""
+          COMMIT_GROUPS[perf]=""
+          COMMIT_GROUPS[ci]=""
+          COMMIT_GROUPS[build]=""
+          COMMIT_GROUPS[style]=""
+          COMMIT_GROUPS[other]=""
 
           while IFS= read -r msg; do
             [ -z "$msg" ] && continue
@@ -78,10 +78,10 @@ jobs:
             TYPE=$(echo "$msg" | sed -n 's/^\([a-z]*\)[:(].*/\1/p')
             case "$TYPE" in
               feat|fix|refactor|docs|test|chore|perf|ci|build|style)
-                GROUPS[$TYPE]+="- ${msg}"$'\n'
+                COMMIT_GROUPS[$TYPE]+="- ${msg}"$'\n'
                 ;;
               *)
-                GROUPS[other]+="- ${msg}"$'\n'
+                COMMIT_GROUPS[other]+="- ${msg}"$'\n'
                 ;;
             esac
           done < /tmp/commit_log.txt
@@ -105,10 +105,10 @@ jobs:
             LABELS[other]="Changes"
 
             for TYPE in feat fix refactor docs test chore perf ci build style other; do
-              if [ -n "${GROUPS[$TYPE]}" ]; then
+              if [ -n "${COMMIT_GROUPS[$TYPE]}" ]; then
                 echo "### ${LABELS[$TYPE]}"
                 echo ""
-                printf "%s" "${GROUPS[$TYPE]}"
+                printf "%s" "${COMMIT_GROUPS[$TYPE]}"
                 echo ""
               fi
             done
