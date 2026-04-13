@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.acquirer.collectors.frida_remote import FridaRemoteCollector
+from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.msl.types import ConnectionEntry, HandleEntry
 
 
@@ -411,3 +412,186 @@ class TestDarwinConnectionTable:
         # Linux: uses proc_net decode (host byte order swap)
         expected_linux = FridaRemoteCollector._decode_proc_net_addr("0100007F", False)
         assert linux_e.local_addr == expected_linux
+
+
+# ===========================================================================
+# Tests: P1.4b RPC envelope {data, warnings} contract
+# ===========================================================================
+
+class TestFridaRPCEnvelope:
+    """Tests for the new {data, warnings} RPC marshaling shape introduced
+    in P1.4b. Verifies warning surfacing into TargetSystemInfo.collector_warnings,
+    new field projection on TargetSystemInfo, and backward compatibility with
+    the legacy flat-shape RPC response.
+    """
+
+    def test_system_info_unwraps_data_warnings(self):
+        """{data: {...}, warnings: [...]} envelope is unwrapped correctly."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_system_info.return_value = {
+            "data": {"hostname": "h", "osDetail": "X", "bootTime": 123},
+            "warnings": ["w1", "w2"],
+        }
+        info = collector.collect_system_info()
+
+        assert isinstance(info, TargetSystemInfo)
+        assert info.hostname == "h"
+        assert info.os_detail == "X"
+        assert info.boot_time == 123
+        assert "w1" in info.collector_warnings
+        assert "w2" in info.collector_warnings
+
+    def test_system_info_android_fields_projected(self):
+        """Android enrichment fields land on TargetSystemInfo."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_system_info.return_value = {
+            "data": {
+                "osDetail": "Android 14",
+                "fingerprint": "google/raven/raven:14/UQ1A.240205.004/...",
+                "patchLevel": "2024-03-01",
+                "bootloaderLocked": "1",
+                "verifiedBoot": "green",
+                "dmVerity": "enforcing",
+                "buildType": "user",
+                "cryptoType": "file",
+                "env": "physical",
+                "hwVendor": "Google",
+                "hwModel": "Pixel 6",
+                "distro": "Android 14 (API 34)",
+            },
+            "warnings": [],
+        }
+        info = collector.collect_system_info()
+
+        assert info.os_detail == "Android 14"
+        assert info.fingerprint == "google/raven/raven:14/UQ1A.240205.004/..."
+        assert info.patch_level == "2024-03-01"
+        assert info.bootloader_locked == "1"
+        assert info.verified_boot == "green"
+        assert info.dm_verity == "enforcing"
+        assert info.build_type == "user"
+        assert info.crypto_type == "file"
+        assert info.env == "physical"
+        assert info.hw_vendor == "Google"
+        assert info.hw_model == "Pixel 6"
+        assert info.distro == "Android 14 (API 34)"
+        assert info.collector_warnings == []
+
+    def test_system_info_windows_fields_projected(self):
+        """Windows enrichment fields land on TargetSystemInfo."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_system_info.return_value = {
+            "data": {
+                "kernel": "10.0.22631",
+                "distro": "Windows 11 Pro 23H2 (Build 22631)",
+                "osDetail": "Windows 11 Pro 23H2 (Build 22631)",
+                "hwModel": "OptiPlex 7090",
+                "ramBytes": 17179869184,
+                "machineId": "abc-123",
+                "cpuBrand": "Intel(R) Core(TM) i7-11700",
+            },
+            "warnings": [],
+        }
+        info = collector.collect_system_info()
+
+        assert info.kernel == "10.0.22631"
+        assert info.distro == "Windows 11 Pro 23H2 (Build 22631)"
+        assert info.os_detail == "Windows 11 Pro 23H2 (Build 22631)"
+        assert info.hw_model == "OptiPlex 7090"
+        assert info.ram_bytes == 17179869184
+        assert info.machine_id == "abc-123"
+        assert info.cpu_brand == "Intel(R) Core(TM) i7-11700"
+
+    def test_connection_table_unwraps_envelope(self):
+        """Envelope-wrapped connection table is unwrapped and parsed."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_connection_table.return_value = {
+            "data": [{
+                "pid": 4242,
+                "family": 0x02,
+                "protocol": 0x06,
+                "state": 0x01,
+                "localAddr": "0100007F",
+                "localPort": 8080,
+                "remoteAddr": "00000000",
+                "remotePort": 0,
+            }],
+            "warnings": [],
+        }
+        entries = collector.collect_connection_table()
+        assert len(entries) == 1
+        assert entries[0].pid == 4242
+        assert entries[0].local_port == 8080
+
+    def test_legacy_flat_shape_still_works(self):
+        """Legacy flat-list shape is still accepted (backward compat)."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_connection_table.return_value = [{
+            "pid": 7,
+            "family": 0x02,
+            "protocol": 0x06,
+            "state": 0x01,
+            "localAddr": "0100007F",
+            "localPort": 22,
+            "remoteAddr": "00000000",
+            "remotePort": 0,
+        }]
+        entries = collector.collect_connection_table()
+        assert len(entries) == 1
+        assert entries[0].pid == 7
+        # Also verify legacy flat shape on system_info doesn't carry warnings.
+        collector._api.get_system_info.return_value = {
+            "hostname": "legacy",
+            "osDetail": "Linux legacy",
+            "bootTime": 0,
+        }
+        info = collector.collect_system_info()
+        assert info.hostname == "legacy"
+        assert info.os_detail == "Linux legacy"
+        assert info.collector_warnings == []
+
+    def test_process_identity_android_new_fields(self):
+        """processName, package, exePath populated for Android process."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_process_info.return_value = {
+            "data": {
+                "ppid": 1,
+                "sessionId": 0,
+                "startTimeNs": 1000,
+                "exePath": "/system/bin/app_process64",
+                "cmdLine": "com.whatsapp:push",
+                "processName": "com.whatsapp:push",
+                "package": "com.whatsapp",
+            },
+            "warnings": [],
+        }
+        info = collector.collect_process_identity(1234)
+        assert isinstance(info, TargetProcessInfo)
+        assert info.process_name == "com.whatsapp:push"
+        assert info.package == "com.whatsapp"
+        assert info.exe_path == "/system/bin/app_process64"
+        assert info.cmd_line == "com.whatsapp:push"
+
+    def test_warnings_surface_in_collector_warnings(self):
+        """JS-side warnings are surfaced into TargetSystemInfo.collector_warnings."""
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session)
+        collector._api = MagicMock()
+        collector._api.get_system_info.return_value = {
+            "data": {},
+            "warnings": ["linux_net_parse:ENOENT"],
+        }
+        info = collector.collect_system_info()
+        assert "linux_net_parse:ENOENT" in info.collector_warnings
