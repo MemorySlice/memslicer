@@ -405,6 +405,7 @@ def system_info_to_fields(
     *,
     include_serials: bool = False,
     include_network_identity: bool = False,
+    include_fingerprint: bool = False,
 ) -> dict[str, object]:
     """Project a :class:`TargetSystemInfo` onto the packer's field map.
 
@@ -450,6 +451,21 @@ def system_info_to_fields(
         fields["hw_serial"] = sys_info.hw_serial
     if include_network_identity:
         fields["nic_macs"] = list(sys_info.nic_macs or [])
+    # Android enrichment (non-privacy-sensitive except fingerprint).
+    # Emitted unconditionally — projector leaves empty strings which
+    # pack_os_detail drops. ``fingerprint`` is privacy-gated.
+    fields.update({
+        "patch_level": getattr(sys_info, "patch_level", ""),
+        "verified_boot": getattr(sys_info, "verified_boot", ""),
+        "bootloader_locked": getattr(sys_info, "bootloader_locked", ""),
+        "dm_verity": getattr(sys_info, "dm_verity", ""),
+        "build_type": getattr(sys_info, "build_type", ""),
+        "crypto_type": getattr(sys_info, "crypto_type", ""),
+        "env": getattr(sys_info, "env", ""),
+        "root_method": getattr(sys_info, "root_method", ""),
+    })
+    if include_fingerprint:
+        fields["fingerprint"] = getattr(sys_info, "fingerprint", "")
     return fields
 
 

@@ -341,6 +341,7 @@ class AcquisitionEngine(BaseAcquirer):
                                 sys_info,
                                 include_serials=attribution.include_serials,
                                 include_network_identity=attribution.include_network_identity,
+                                include_fingerprint=attribution.include_fingerprint,
                             )
                             collector_warnings = list(sys_info.collector_warnings)
                         else:

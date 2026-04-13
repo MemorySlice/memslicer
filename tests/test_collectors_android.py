@@ -58,9 +58,15 @@ class TestSELinuxExePathFallback:
     argv[0] from cmdline."""
 
     def test_fallback_to_cmdline_argv0(self, tmp_path: Path) -> None:
+        # P1.2 rewrite: the previous version of this test encoded the
+        # old buggy behavior (stuffing argv[0] into exe_path). On Android
+        # argv[0] is a package process name (e.g. "com.whatsapp:pushservice"),
+        # not a filesystem path. The current contract stores argv[0] in
+        # process_name / package and sets exe_path to the canonical
+        # app_process64 binary.
         pid = 1234
         stat_line = f"{pid} (com.example.app) S 1 1234 1234 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0 0 0 0 0 0 0 0 0 0 0 0"
-        cmdline = "/system/bin/app_process\x00-Xzygote\x00/system/bin\x00--zygote"
+        cmdline = "com.example.app:service\x00arg1\x00arg2"
 
         proc_root = _create_proc_tree(
             tmp_path, pid, stat_line=stat_line, cmdline=cmdline, exe_target=None,
@@ -69,8 +75,9 @@ class TestSELinuxExePathFallback:
         collector = AndroidCollector(proc_root=proc_root)
         info = collector.collect_process_identity(pid)
 
-        assert info.exe_path == "/system/bin/app_process"
-        assert "app_process" in info.cmd_line
+        assert info.exe_path == "/system/bin/app_process64"
+        assert info.process_name == "com.example.app:service"
+        assert info.package == "com.example.app"
 
     def test_no_fallback_when_exe_exists(self, tmp_path: Path) -> None:
         pid = 5678
@@ -137,11 +144,15 @@ class TestAndroidOsDetail:
         with patch("subprocess.run", side_effect=self._mock_getprop):
             info = collector.collect_system_info()
 
+        # P1.2: os_detail is now the Linux-style human composition
+        # ("distro (kernel arch)"). Fingerprint is captured in
+        # info.fingerprint and gated at the projector via
+        # --include-fingerprint; it no longer appears in os_detail here.
         assert "Android 14" in info.os_detail
         assert "(API 34)" in info.os_detail
-        assert "Google" in info.os_detail
-        assert "Pixel 6 Pro" in info.os_detail
-        assert "google/raven" in info.os_detail
+        assert info.hw_vendor == "Google"
+        assert info.hw_model == "Pixel 6 Pro"
+        assert info.fingerprint.startswith("google/raven")
 
     def test_partial_getprop(self, tmp_path: Path) -> None:
         """Only some properties are available."""
@@ -246,3 +257,265 @@ class TestMissingGetprop:
         # longer the raw /proc/version.
         assert "Linux version 5.10.0-android" not in info.os_detail
         assert info.raw_os == "Linux version 5.10.0-android"
+
+
+# ---------------------------------------------------------------------------
+# 5. P1.2 enrichment: build / verified boot / bootloader / crypto
+# ---------------------------------------------------------------------------
+
+def _make_android_getprop_mock(props: dict[str, str]):
+    """Return a side_effect callable that mocks ``subprocess.run`` for getprop
+    while letting non-``getprop`` invocations pass through (used to make
+    ``getenforce`` fall through to default behavior).
+    """
+    def _run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        if cmd and cmd[0] == "getprop":
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "\n".join(
+                f"[{k}]: [{v}]" for k, v in props.items()
+            )
+            return result
+        # Anything else (e.g. ``getenforce``): raise FileNotFoundError so
+        # the collector takes the "SELinux not detectable" branch.
+        raise FileNotFoundError(cmd[0] if cmd else "")
+    return _run
+
+
+def _blank_proc(tmp_path: Path) -> str:
+    return _create_proc_tree(
+        tmp_path, pid=1,
+        stat_line="1 (init) S 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+    )
+
+
+class TestAndroidEnrichment:
+    """P1.2: new structured fields populated from getprop."""
+
+    def test_patch_level_populated(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.build.version.security_patch": "2024-03-01",
+        })):
+            info = collector.collect_system_info()
+        assert info.patch_level == "2024-03-01"
+
+    def test_verified_boot_state(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.boot.verifiedbootstate": "green",
+        })):
+            info = collector.collect_system_info()
+        assert info.verified_boot == "green"
+
+    def test_bootloader_locked(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.boot.flash.locked": "1",
+        })):
+            info = collector.collect_system_info()
+        assert info.bootloader_locked == "1"
+
+    def test_build_type_user(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.build.type": "user",
+        })):
+            info = collector.collect_system_info()
+        assert info.build_type == "user"
+
+    def test_fingerprint_captured_but_field_populated(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.build.fingerprint": "google/raven/raven:14/UP1A.231105.001/abc:user/release-keys",
+        })):
+            info = collector.collect_system_info()
+        assert info.fingerprint.startswith("google/raven")
+
+
+# ---------------------------------------------------------------------------
+# 6. P1.2 environment detection
+# ---------------------------------------------------------------------------
+
+class TestAndroidEnvDetection:
+    """Android environment classification via getprop."""
+
+    def test_detect_emulator_via_qemu(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.kernel.qemu": "1",
+        })):
+            info = collector.collect_system_info()
+        assert info.env == "emulator"
+
+    def test_detect_cuttlefish_via_hardware(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.hardware": "cutf_cvm",
+        })):
+            info = collector.collect_system_info()
+        assert info.env == "cuttlefish"
+
+    def test_detect_genymotion_via_vbox(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.hardware": "vbox86p",
+        })):
+            info = collector.collect_system_info()
+        assert info.env == "genymotion"
+
+    def test_detect_physical_default(self, tmp_path: Path) -> None:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({
+            "ro.product.manufacturer": "Google",
+            "ro.product.model": "Pixel 8",
+            "ro.hardware": "shiba",
+        })):
+            info = collector.collect_system_info()
+        assert info.env == "physical"
+
+
+# ---------------------------------------------------------------------------
+# 7. P1.2 SELinux mode detection
+# ---------------------------------------------------------------------------
+
+class TestAndroidSELinux:
+    """SELinux mode detection via sysfs primary and getenforce fallback."""
+
+    def test_selinux_enforcing_from_sysfs(self, tmp_path: Path) -> None:
+        sysfs = tmp_path / "selinux_enforce"
+        sysfs.write_text("1")
+
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        collector._selinux_enforce_path = str(sysfs)
+
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({})):
+            info = collector.collect_system_info()
+        assert info.selinux == "enforcing"
+
+    def test_selinux_permissive_from_sysfs(self, tmp_path: Path) -> None:
+        sysfs = tmp_path / "selinux_enforce"
+        sysfs.write_text("0")
+
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        collector._selinux_enforce_path = str(sysfs)
+
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({})):
+            info = collector.collect_system_info()
+        assert info.selinux == "permissive"
+
+    def test_selinux_fallback_to_getenforce(self, tmp_path: Path) -> None:
+        # Sysfs probe points at a nonexistent path → fall through.
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        collector._selinux_enforce_path = str(tmp_path / "does_not_exist")
+
+        def _run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+            if cmd and cmd[0] == "getprop":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = ""
+                return result
+            if cmd and cmd[0] == "getenforce":
+                result = MagicMock()
+                result.returncode = 0
+                result.stdout = "Enforcing\n"
+                return result
+            raise FileNotFoundError(cmd[0])
+
+        with patch("subprocess.run", side_effect=_run):
+            info = collector.collect_system_info()
+        assert info.selinux == "enforcing"
+
+
+# ---------------------------------------------------------------------------
+# 8. P1.2 advisory root detection
+# ---------------------------------------------------------------------------
+
+class TestAndroidRootDetection:
+    """Advisory root detection via marker-path existence checks."""
+
+    def _collector_with_root_paths(
+        self, tmp_path: Path, paths: dict[str, list[str]],
+    ) -> AndroidCollector:
+        collector = AndroidCollector(proc_root=_blank_proc(tmp_path))
+        collector._root_paths = paths
+        # Point SELinux probe at a nonexistent path so those calls don't
+        # noise the assertion.
+        collector._selinux_enforce_path = str(tmp_path / "no_selinux")
+        return collector
+
+    def test_magisk_marker(self, tmp_path: Path) -> None:
+        marker = tmp_path / "magisk_marker"
+        marker.write_text("")
+        collector = self._collector_with_root_paths(
+            tmp_path, {"magisk": [str(marker)]},
+        )
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({})):
+            info = collector.collect_system_info()
+        assert "magisk" in info.root_method
+
+    def test_kernelsu_marker(self, tmp_path: Path) -> None:
+        marker = tmp_path / "ksu"
+        marker.write_text("")
+        collector = self._collector_with_root_paths(
+            tmp_path, {"kernelsu": [str(marker)]},
+        )
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({})):
+            info = collector.collect_system_info()
+        assert "kernelsu" in info.root_method
+
+    def test_zygisk_module_glob(self, tmp_path: Path) -> None:
+        modules = tmp_path / "modules"
+        mod_dir = modules / "zygisk_example"
+        mod_dir.mkdir(parents=True)
+        (mod_dir / "module.prop").write_text("id=zygisk_example\n")
+        collector = self._collector_with_root_paths(
+            tmp_path, {"zygisk": [str(modules / "zygisk_*")]},
+        )
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({})):
+            info = collector.collect_system_info()
+        assert "zygisk" in info.root_method
+
+    def test_no_root_indicators(self, tmp_path: Path) -> None:
+        collector = self._collector_with_root_paths(tmp_path, {})
+        with patch("subprocess.run", side_effect=_make_android_getprop_mock({})):
+            info = collector.collect_system_info()
+        assert info.root_method == ""
+
+
+# ---------------------------------------------------------------------------
+# 9. P1.2 exe_path fix edge cases
+# ---------------------------------------------------------------------------
+
+class TestAndroidExePathFix:
+    """Covers the P1.2 fix for the old argv[0]-as-exe_path bug."""
+
+    def test_package_process_name_with_colon(self, tmp_path: Path) -> None:
+        pid = 2000
+        stat_line = f"{pid} (pushservice) S 1 2000 2000 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0 0 0 0 0 0 0 0 0 0 0 0"
+        cmdline = "com.whatsapp:pushservice\x00--foo"
+
+        proc_root = _create_proc_tree(
+            tmp_path, pid, stat_line=stat_line, cmdline=cmdline, exe_target=None,
+        )
+        collector = AndroidCollector(proc_root=proc_root)
+        info = collector.collect_process_identity(pid)
+
+        assert info.process_name == "com.whatsapp:pushservice"
+        assert info.package == "com.whatsapp"
+        assert info.exe_path == "/system/bin/app_process64"
+
+    def test_package_no_colon(self, tmp_path: Path) -> None:
+        pid = 2001
+        stat_line = f"{pid} (app) S 1 2001 2001 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0 0 0 0 0 0 0 0 0 0 0 0"
+        cmdline = "com.example.app\x00--foo"
+
+        proc_root = _create_proc_tree(
+            tmp_path, pid, stat_line=stat_line, cmdline=cmdline, exe_target=None,
+        )
+        collector = AndroidCollector(proc_root=proc_root)
+        info = collector.collect_process_identity(pid)
+
+        assert info.process_name == "com.example.app"
+        assert info.package == "com.example.app"
+        assert info.exe_path == "/system/bin/app_process64"

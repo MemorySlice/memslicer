@@ -15,6 +15,11 @@ class TargetProcessInfo:
     start_time_ns: int = 0
     exe_path: str = ""
     cmd_line: str = ""
+    # Android-only: argv[0] from /proc/pid/cmdline (package process name,
+    # e.g. "com.whatsapp:pushservice") and the package identifier derived
+    # from it (argv[0].split(":")[0]). Other platforms leave these empty.
+    process_name: str = ""
+    package: str = ""
 
 
 @dataclass
@@ -80,6 +85,21 @@ class TargetSystemInfo:
     # Enrichment: network identity (opt-in, --include-network-identity).
     # ------------------------------------------------------------------
     nic_macs: list[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Enrichment: Android-specific (also applicable to non-Android where
+    # relevant). Populated by AndroidCollector; other collectors leave
+    # them as empty strings.
+    # ------------------------------------------------------------------
+    fingerprint: str = ""           # Android ro.build.fingerprint (privacy-gated)
+    patch_level: str = ""           # Android security_patch date
+    verified_boot: str = ""         # "green" / "yellow" / "orange" / "red"
+    bootloader_locked: str = ""     # "1" / "0" / ""
+    dm_verity: str = ""             # "enforcing" / "logging" / "disabled" / ""
+    build_type: str = ""            # "user" / "userdebug" / "eng"
+    crypto_type: str = ""           # "file" / "block" / "none" / ""
+    env: str = ""                   # "physical" / "emulator" / "cuttlefish" / "waydroid" / "genymotion"
+    root_method: str = ""           # advisory: "magisk" / "kernelsu" / "apatch" / "zygisk" / ""
 
     # ------------------------------------------------------------------
     # Provenance (populated by engine / cli_sysctx, not collectors).

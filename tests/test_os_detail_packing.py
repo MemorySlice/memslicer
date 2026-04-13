@@ -23,7 +23,9 @@ from memslicer.acquirer.os_detail import (
     build_human_os_string,
     pack_os_detail,
     parse_os_detail,
+    system_info_to_fields,
 )
+from memslicer.acquirer.investigation import TargetSystemInfo
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +305,29 @@ def test_injection_in_value_cannot_spawn_new_key(raw: str) -> None:
     assert set(parsed.keys()) - {"_human"} == {"target"} or parsed == {}
     if "target" in parsed:
         assert parsed["target"] == raw
+
+
+# ---------------------------------------------------------------------------
+# Projector gating: --include-fingerprint (P1.2)
+# ---------------------------------------------------------------------------
+
+class TestFingerprintGate:
+    """``system_info_to_fields`` must gate ``fingerprint`` on the flag."""
+
+    def test_fingerprint_gated_by_include_fingerprint(self) -> None:
+        sys_info = TargetSystemInfo(
+            distro="Android 14 (API 34)",
+            fingerprint="google/raven/raven:14/UP1A.231105.001/abc:user/release-keys",
+        )
+
+        closed = system_info_to_fields(sys_info, include_fingerprint=False)
+        assert "fingerprint" not in closed
+
+        opened = system_info_to_fields(sys_info, include_fingerprint=True)
+        assert "fingerprint" in opened
+        assert opened["fingerprint"].startswith("google/raven")
+
+        closed_packed = pack_os_detail(closed)
+        opened_packed = pack_os_detail(opened)
+        assert "google/raven" not in closed_packed
+        assert "google/raven" in opened_packed

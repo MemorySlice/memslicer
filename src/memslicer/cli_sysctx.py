@@ -126,6 +126,7 @@ def _collect_all(
         sys_info,
         include_serials=attribution.include_serials,
         include_network_identity=attribution.include_network_identity,
+        include_fingerprint=attribution.include_fingerprint,
     )
     collector_warnings = list(sys_info.collector_warnings)
     collector_warnings.extend(identity.warnings)
@@ -459,6 +460,7 @@ def main(
     domain_override: str,
     include_serials: bool,
     include_network_identity: bool,
+    include_fingerprint: bool,
     output_format: str | None,
     mode: str,
     strict: bool,
@@ -499,6 +501,7 @@ def main(
             is_remote=is_remote,
             include_serials=include_serials,
             include_network_identity=include_network_identity,
+            include_fingerprint=include_fingerprint,
         )
     except ForensicStringError as exc:
         raise click.BadParameter(str(exc))

@@ -233,6 +233,7 @@ class AttributionConfig:
     is_remote: bool = False
     include_serials: bool = False
     include_network_identity: bool = False
+    include_fingerprint: bool = False
 
 
 def validate_attribution(
@@ -244,6 +245,7 @@ def validate_attribution(
     is_remote: bool = False,
     include_serials: bool = False,
     include_network_identity: bool = False,
+    include_fingerprint: bool = False,
 ) -> AttributionConfig:
     """Run :func:`validate_forensic_string` on each operator-supplied string.
 
@@ -262,6 +264,7 @@ def validate_attribution(
         is_remote=is_remote,
         include_serials=include_serials,
         include_network_identity=include_network_identity,
+        include_fingerprint=include_fingerprint,
     )
 
 
@@ -314,6 +317,11 @@ def attribution_options(func: _F) -> _F:
     import click  # local import — identity.py stays importable without click
 
     options = [
+        click.option(
+            "--include-fingerprint", "include_fingerprint",
+            is_flag=True, default=False,
+            help="Emit ro.build.fingerprint in os_detail (Android; leaks device+region+carrier+build-date)",
+        ),
         click.option(
             "--include-network-identity", "include_network_identity",
             is_flag=True, default=False,
