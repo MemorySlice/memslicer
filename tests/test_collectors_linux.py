@@ -246,7 +246,13 @@ class TestCollectSystemInfo:
 
         assert info.hostname == "server01"
         assert info.domain == "example.com"
-        assert info.os_detail == "Linux version 6.1.0-amd64"
+        # raw_os holds the full /proc/version; os_detail is the
+        # human-readable distro+kernel+arch composition (which may be
+        # empty in this minimal fixture since /etc/os-release is absent
+        # and os.uname() reflects the test host). Just assert that the
+        # bloated /proc/version string is not smuggled into os_detail.
+        assert info.raw_os == "Linux version 6.1.0-amd64"
+        assert "Linux version 6.1.0-amd64" not in info.os_detail
         assert info.boot_time == 1700000000 * 1_000_000_000
 
     def test_domain_none_becomes_empty(self, tmp_path):
@@ -300,6 +306,267 @@ class TestCollectSystemInfo:
         info = collector.collect_system_info()
 
         assert info.boot_time == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: collect_system_info enrichment (P0 Linux)
+# ---------------------------------------------------------------------------
+
+
+def _build_enriched_proc_root(tmp_path: Path, *,
+                              with_dmi: bool = True,
+                              with_hypervisor_flag: bool = False,
+                              arm_cpuinfo: bool = False,
+                              model_name: str = "Intel(R) Xeon(R) Gold 6338",
+                              hw_model: str = "Latitude 7440") -> Path:
+    """Build a tmp_path tree with /proc plus fake /etc and /sys/class/dmi."""
+    # /proc baseline
+    _setup_system_files(tmp_path, btime=1700000000,
+                        hostname="enrichhost",
+                        domainname="(none)",
+                        version="Linux version 6.8.0-45-generic "
+                                "(buildd@lcy02) (gcc 13.2.0) "
+                                "#45-Ubuntu SMP PREEMPT_DYNAMIC")
+
+    # /proc/meminfo: 16 GiB
+    _write(tmp_path / "meminfo",
+           "MemTotal:       16384000 kB\n"
+           "MemFree:         1234567 kB\n")
+
+    # /proc/cpuinfo
+    if arm_cpuinfo:
+        _write(tmp_path / "cpuinfo",
+               "processor\t: 0\n"
+               "BogoMIPS\t: 243.75\n"
+               "Features\t: fp asimd\n"
+               "Hardware\t: Raspberry Pi 4 Model B Rev 1.4\n"
+               "CPU implementer\t: 0x41\n")
+    else:
+        flags_line = (
+            "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic "
+            + ("hypervisor " if with_hypervisor_flag else "")
+            + "sep mtrr\n"
+        )
+        _write(tmp_path / "cpuinfo",
+               "processor\t: 0\n"
+               f"model name\t: {model_name}\n"
+               "cpu MHz\t\t: 2400.000\n"
+               + flags_line)
+
+    # /proc/sys/kernel/random/boot_id
+    _write(tmp_path / "sys" / "kernel" / "random" / "boot_id",
+           "deadbeef-1234-5678-9abc-def012345678\n")
+
+    # Fake /etc
+    etc_dir = tmp_path / "etc_root"
+    _write(etc_dir / "os-release",
+           'PRETTY_NAME="Ubuntu 24.04.1 LTS"\n'
+           'NAME="Ubuntu"\n'
+           'VERSION="24.04.1 LTS (Noble Numbat)"\n'
+           'ID=ubuntu\n')
+    _write(etc_dir / "machine-id", "abc123def456abc123def456abc123de\n")
+
+    # Fake /sys/class/dmi/id
+    dmi_dir = tmp_path / "sys_dmi"
+    if with_dmi:
+        _write(dmi_dir / "sys_vendor", "Dell Inc.\n")
+        _write(dmi_dir / "product_name", hw_model + "\n")
+        _write(dmi_dir / "product_serial", "SN-XYZ-001\n")
+        _write(dmi_dir / "bios_version", "1.23.4\n")
+
+    return tmp_path
+
+
+def _make_enriched_collector(tmp_path: Path, *,
+                             dockerenv: bool = False,
+                             containerenv: bool = False,
+                             localtime_target: str | None = None) -> LinuxCollector:
+    """Build a LinuxCollector whose enrichment paths point into tmp_path."""
+    collector = LinuxCollector(proc_root=str(tmp_path))
+    collector._etc_os_release = str(tmp_path / "etc_root" / "os-release")
+    collector._etc_machine_id = str(tmp_path / "etc_root" / "machine-id")
+    collector._dbus_machine_id = str(tmp_path / "etc_root" / "dbus-machine-id")
+    collector._dmi_id_dir = str(tmp_path / "sys_dmi")
+
+    dockerenv_path = tmp_path / "dockerenv_marker"
+    if dockerenv:
+        dockerenv_path.write_text("")
+    collector._dockerenv_path = str(dockerenv_path)
+
+    containerenv_path = tmp_path / "containerenv_marker"
+    if containerenv:
+        containerenv_path.write_text("")
+    collector._containerenv_path = str(containerenv_path)
+
+    localtime = tmp_path / "localtime_link"
+    if localtime_target is not None:
+        try:
+            localtime.symlink_to(localtime_target)
+        except OSError:
+            pass
+    collector._etc_localtime = str(localtime)
+
+    return collector
+
+
+class TestCollectSystemInfoEnrichment:
+    """Tests for the P0 Linux enrichment fields on TargetSystemInfo."""
+
+    def test_ubuntu_baremetal_full_enrichment(self, tmp_path):
+        """Realistic Ubuntu tmp_path layout populates every P0 field."""
+        _build_enriched_proc_root(tmp_path)
+        collector = _make_enriched_collector(
+            tmp_path, localtime_target="/usr/share/zoneinfo/Europe/Berlin"
+        )
+
+        info = collector.collect_system_info()
+
+        # Core still intact.
+        assert info.hostname == "enrichhost"
+        assert info.boot_time == 1700000000 * 1_000_000_000
+
+        # Identity.
+        assert info.kernel == os.uname().release
+        assert info.arch == os.uname().machine
+        assert info.distro == "Ubuntu 24.04.1 LTS"
+        assert "Linux version 6.8.0-45-generic" in info.raw_os
+        assert info.os_detail.startswith("Ubuntu 24.04.1 LTS")
+        assert info.kernel in info.os_detail
+        assert info.arch in info.os_detail
+
+        # Hardware.
+        assert info.machine_id == "abc123def456abc123def456abc123de"
+        assert info.hw_vendor == "Dell Inc."
+        assert info.hw_model == "Latitude 7440"
+        assert info.hw_serial == "SN-XYZ-001"
+        assert info.bios_version == "1.23.4"
+
+        # CPU / memory.
+        assert info.cpu_brand == "Intel(R) Xeon(R) Gold 6338"
+        assert info.cpu_count == (os.cpu_count() or 0)
+        assert info.ram_bytes == 16384000 * 1024
+
+        # Boot state.
+        assert info.boot_id == "deadbeef-1234-5678-9abc-def012345678"
+        assert info.virtualization == "none"
+        assert info.timezone == "Europe/Berlin"
+
+    def test_proc_version_bug_fix(self, tmp_path):
+        """The full /proc/version string must never land in os_detail."""
+        _build_enriched_proc_root(tmp_path)
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        bloated = (
+            "Linux version 6.8.0-45-generic (buildd@lcy02) "
+            "(gcc 13.2.0) #45-Ubuntu SMP PREEMPT_DYNAMIC"
+        )
+        assert bloated not in info.os_detail
+        assert "buildd@" not in info.os_detail
+        assert "gcc" not in info.os_detail
+        assert info.kernel == os.uname().release
+
+    def test_docker_container_detected(self, tmp_path):
+        """/.dockerenv presence classifies virtualization as docker."""
+        _build_enriched_proc_root(tmp_path, with_hypervisor_flag=True,
+                                  with_dmi=False)
+        collector = _make_enriched_collector(tmp_path, dockerenv=True)
+
+        info = collector.collect_system_info()
+
+        assert info.virtualization == "docker"
+        # DMI absent → vendor/model/serial should all be empty.
+        assert info.hw_vendor == ""
+        assert info.hw_model == ""
+        assert info.hw_serial == ""
+
+    def test_podman_container_detected(self, tmp_path):
+        """/run/.containerenv presence classifies virtualization as podman."""
+        _build_enriched_proc_root(tmp_path, with_dmi=False)
+        collector = _make_enriched_collector(tmp_path, containerenv=True)
+
+        info = collector.collect_system_info()
+
+        assert info.virtualization == "podman"
+
+    def test_bare_metal_no_hypervisor(self, tmp_path):
+        """No container marker + no hypervisor flag → virt=none."""
+        _build_enriched_proc_root(tmp_path, with_hypervisor_flag=False)
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        assert info.virtualization == "none"
+
+    def test_hypervisor_flag_in_cpuinfo(self, tmp_path):
+        """cpuinfo hypervisor flag with no DMI hint maps to 'hypervisor'."""
+        _build_enriched_proc_root(tmp_path, with_hypervisor_flag=True,
+                                  with_dmi=False)
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        assert info.virtualization == "hypervisor"
+
+    def test_vmware_product_name_detected(self, tmp_path):
+        """A VMware product_name maps to virt=vmware."""
+        _build_enriched_proc_root(tmp_path, hw_model="VMware Virtual Platform")
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        assert info.virtualization == "vmware"
+
+    def test_arm_cpuinfo_fallback(self, tmp_path):
+        """ARM /proc/cpuinfo with no 'model name' falls back to Hardware."""
+        _build_enriched_proc_root(tmp_path, arm_cpuinfo=True, with_dmi=False)
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        assert info.cpu_brand == "Raspberry Pi 4 Model B Rev 1.4"
+
+    def test_missing_enrichment_sources_are_fail_soft(self, tmp_path):
+        """All P0 enrichment reads missing → empty/zero, no exception."""
+        _setup_system_files(tmp_path, btime=1700000000,
+                            hostname="bare", domainname="(none)",
+                            version="Linux version 5.0\n")
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        # Core still works.
+        assert info.hostname == "bare"
+        assert info.boot_time == 1700000000 * 1_000_000_000
+        # Enrichment silent on failure.
+        assert info.distro == ""
+        assert info.machine_id == ""
+        assert info.hw_vendor == ""
+        assert info.hw_model == ""
+        assert info.hw_serial == ""
+        assert info.bios_version == ""
+        assert info.cpu_brand == ""
+        assert info.ram_bytes == 0
+        assert info.boot_id == ""
+        assert info.timezone == ""
+        # uname still works on the test host.
+        assert info.kernel == os.uname().release
+        assert info.arch == os.uname().machine
+        # os_detail falls back to "kernel arch".
+        assert info.os_detail == f"{info.kernel} {info.arch}"
+
+    def test_os_release_without_pretty_name(self, tmp_path):
+        """NAME + VERSION fallback when PRETTY_NAME is absent."""
+        _build_enriched_proc_root(tmp_path)
+        # Overwrite os-release with NAME/VERSION only.
+        _write(tmp_path / "etc_root" / "os-release",
+               'NAME="Debian GNU/Linux"\nVERSION="12 (bookworm)"\n')
+        collector = _make_enriched_collector(tmp_path)
+
+        info = collector.collect_system_info()
+
+        assert info.distro == "Debian GNU/Linux 12 (bookworm)"
 
 
 # ---------------------------------------------------------------------------

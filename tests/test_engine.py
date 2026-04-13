@@ -534,9 +534,19 @@ class TestCollectorSystemContext:
             domain, offset = _read_padded_string(payload, offset)
             assert domain == "example.com"
 
-        # os_detail
+        # os_detail — since P0.4 the engine packs collector output through
+        # the msl.memslicer/1 microformat (see acquirer/os_detail.py). The
+        # original raw string survives as the ``raw_os`` key and is also
+        # used to build the human-readable prefix that leads the value, so
+        # a naive consumer still sees a sensible OS description.
         os_detail, offset = _read_padded_string(payload, offset)
-        assert os_detail == "Linux 6.1.0-generic x86_64"
+        assert os_detail.startswith("msl.memslicer/1 ")
+        assert "Linux 6.1.0-generic x86_64" in os_detail
+        # Parser round-trip: the packed raw_os must match the collector's
+        # emission, proving no data was silently dropped in the refactor.
+        from memslicer.acquirer.os_detail import parse_os_detail
+        parsed = parse_os_detail(os_detail)
+        assert parsed.get("raw_os") == "Linux 6.1.0-generic x86_64"
 
 
 class TestCollectorSystemTables:

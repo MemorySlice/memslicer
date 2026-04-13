@@ -84,6 +84,13 @@ class TestCollectSystemInfo:
     @patch("memslicer.acquirer.collectors.darwin.socket.gethostname", return_value="myhost")
     @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
     def test_system_info_full(self, mock_run, mock_hostname, collector):
+        ioreg_output = (
+            '+-o IOPlatformExpertDevice  <class IOPlatformExpertDevice>\n'
+            '    | {\n'
+            '    |   "IOPlatformUUID" = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"\n'
+            '    |   "IOPlatformSerialNumber" = "C02ZXYZABC123"\n'
+            '    | }\n'
+        )
         responses = {
             ("sysctl", "-n", "kern.boottime"): _make_completed(
                 "{ sec = 1712345678, usec = 0 } Mon Apr  1 00:00:00 2024\n"
@@ -93,6 +100,18 @@ class TestCollectSystemInfo:
                 "ProductName:\tmacOS\nProductVersion:\t14.4\nBuildVersion:\t23E214\n"
             ),
             ("uname", "-r"): _make_completed("23.4.0\n"),
+            ("sysctl", "-n", "kern.osrelease"): _make_completed("23.4.0\n"),
+            ("sysctl", "-n", "hw.machine"): _make_completed("arm64\n"),
+            ("sysctl", "-n", "hw.model"): _make_completed("MacBookPro18,2\n"),
+            ("sysctl", "-n", "machdep.cpu.brand_string"): _make_completed(
+                "Apple M1 Max\n"
+            ),
+            ("sysctl", "-n", "hw.ncpu"): _make_completed("10\n"),
+            ("sysctl", "-n", "hw.memsize"): _make_completed("34359738368\n"),
+            ("sysctl", "-n", "kern.hv_vmm_present"): _make_completed("0\n"),
+            ("ioreg", "-rd1", "-c", "IOPlatformExpertDevice"): _make_completed(
+                ioreg_output
+            ),
         }
 
         def side_effect(cmd, **kwargs):
@@ -100,7 +119,11 @@ class TestCollectSystemInfo:
 
         mock_run.side_effect = side_effect
 
-        info = collector.collect_system_info()
+        with patch(
+            "memslicer.acquirer.collectors.darwin.read_symlink",
+            return_value="/var/db/timezone/zoneinfo/Europe/Berlin",
+        ):
+            info = collector.collect_system_info()
 
         assert info.boot_time == 1712345678 * 1_000_000_000
         assert info.hostname == "myhost"
@@ -108,6 +131,23 @@ class TestCollectSystemInfo:
         assert "macOS" in info.os_detail
         assert "14.4" in info.os_detail
         assert "kernel 23.4.0" in info.os_detail
+        # Darwin intentionally leaves raw_os empty — system_info_to_fields
+        # falls back to os_detail when raw_os is empty, so the wire output
+        # still carries the legacy string without duplicating it here.
+        assert info.raw_os == ""
+        assert info.kernel == "23.4.0"
+        assert info.arch == "arm64"
+        assert info.distro == "macOS 14.4 (23E214)"
+        assert info.machine_id == "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        assert info.hw_vendor == "Apple"
+        assert info.hw_model == "MacBookPro18,2"
+        assert info.hw_serial == "C02ZXYZABC123"
+        assert info.bios_version == ""
+        assert info.cpu_brand == "Apple M1 Max"
+        assert info.cpu_count == 10
+        assert info.ram_bytes == 34359738368
+        assert info.virtualization == "none"
+        assert info.timezone == "Europe/Berlin"
 
     @patch("memslicer.acquirer.collectors.darwin.socket.gethostname", return_value="host")
     @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
@@ -138,6 +178,81 @@ class TestCollectSystemInfo:
 
         info = collector.collect_system_info()
         assert info.boot_time == 0
+
+    @patch("memslicer.acquirer.collectors.darwin.socket.gethostname", return_value="host")
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_collect_system_info_populates_machine_id_from_ioreg_not_kern_uuid(
+        self, mock_run, mock_hostname, collector
+    ):
+        """machine_id must come from IOPlatformUUID in ioreg, never from kern.uuid."""
+        ioreg_output = (
+            '    "IOPlatformUUID" = "11111111-2222-3333-4444-555555555555"\n'
+            '    "IOPlatformSerialNumber" = "SERIAL42"\n'
+        )
+        responses = {
+            ("ioreg", "-rd1", "-c", "IOPlatformExpertDevice"): _make_completed(
+                ioreg_output
+            ),
+        }
+
+        observed_cmds: list[tuple[str, ...]] = []
+
+        def side_effect(cmd, **kwargs):
+            observed_cmds.append(tuple(cmd))
+            return responses.get(tuple(cmd), _make_completed("", returncode=1))
+
+        mock_run.side_effect = side_effect
+
+        with patch(
+            "memslicer.acquirer.collectors.darwin.read_symlink",
+            return_value="",
+        ):
+            info = collector.collect_system_info()
+
+        assert info.machine_id == "11111111-2222-3333-4444-555555555555"
+        assert info.hw_serial == "SERIAL42"
+        # Must never shell out to sysctl kern.uuid for the platform UUID.
+        assert ("sysctl", "-n", "kern.uuid") not in observed_cmds
+
+    @patch("memslicer.acquirer.collectors.darwin.socket.gethostname", return_value="host")
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_collect_system_info_populates_hw_model_arch_ram_cpu(
+        self, mock_run, mock_hostname, collector
+    ):
+        """hw.model, hw.machine, hw.memsize, hw.ncpu, cpu brand all land on info."""
+        responses = {
+            ("sysctl", "-n", "kern.osrelease"): _make_completed("22.6.0\n"),
+            ("sysctl", "-n", "hw.machine"): _make_completed("x86_64\n"),
+            ("sysctl", "-n", "hw.model"): _make_completed("MacBookPro16,1\n"),
+            ("sysctl", "-n", "machdep.cpu.brand_string"): _make_completed(
+                "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz\n"
+            ),
+            ("sysctl", "-n", "hw.ncpu"): _make_completed("16\n"),
+            ("sysctl", "-n", "hw.memsize"): _make_completed("17179869184\n"),
+            ("sysctl", "-n", "kern.hv_vmm_present"): _make_completed("1\n"),
+        }
+        mock_run.side_effect = (
+            lambda cmd, **kw: responses.get(tuple(cmd), _make_completed("", returncode=1))
+        )
+
+        with patch(
+            "memslicer.acquirer.collectors.darwin.read_symlink",
+            return_value="/usr/share/zoneinfo/America/Los_Angeles",
+        ):
+            info = collector.collect_system_info()
+
+        assert info.kernel == "22.6.0"
+        assert info.arch == "x86_64"
+        assert info.hw_model == "MacBookPro16,1"
+        assert info.cpu_brand == "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz"
+        assert info.cpu_count == 16
+        assert info.ram_bytes == 17179869184
+        assert info.virtualization == "hypervisor"
+        assert info.timezone == "America/Los_Angeles"
+        # Unreachable fields gracefully default.
+        assert info.machine_id == ""
+        assert info.hw_serial == ""
+        assert info.bios_version == ""
 
 
 # ---------------------------------------------------------------------------

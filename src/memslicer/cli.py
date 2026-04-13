@@ -9,8 +9,13 @@ from pathlib import Path
 
 import click
 
-from memslicer.msl.constants import CompAlgo, OSType
+from memslicer.acquirer.identity import (
+    ForensicStringError,
+    attribution_options,
+    validate_attribution,
+)
 from memslicer.acquirer.region_filter import RegionFilter, SKIP_REASON_LABELS
+from memslicer.msl.constants import CompAlgo, OSType
 from memslicer.utils.protection import parse_protection
 
 
@@ -155,6 +160,7 @@ def _create_acquirer(
     max_chunk_size=20971520,
     investigation: bool = False,
     passphrase: str | None = None,
+    attribution=None,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -239,6 +245,7 @@ def _create_acquirer(
         investigation=investigation,
         passphrase=passphrase,
         collector=collector,
+        attribution=attribution,
     )
 
 
@@ -260,9 +267,12 @@ def _create_acquirer(
 @click.option("--encrypt", "-E", is_flag=True, default=False, help="Enable AEAD encryption")
 @click.option("--no-encrypt", is_flag=True, default=False, help="Disable encryption (overrides investigation default)")
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
+@attribution_options
 def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, max_region_size, investigation,
-        encrypt, no_encrypt, passphrase):
+        encrypt, no_encrypt, passphrase,
+        examiner, case_ref, hostname_override, domain_override,
+        include_serials, include_network_identity):
     """Dump process memory to MSL format.
 
     TARGET is a PID (integer) or process name (string).
@@ -274,6 +284,22 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
     # Validate backend-specific options
     if usb and backend != "frida":
         raise click.UsageError("--usb / -U is only supported with --backend frida")
+
+    # Validate + bundle operator attribution at the CLI boundary.
+    # Any ForensicStringError becomes a clean BadParameter message
+    # rather than propagating into the engine.
+    try:
+        attribution = validate_attribution(
+            examiner=examiner,
+            case_ref=case_ref,
+            hostname_override=hostname_override,
+            domain_override=domain_override,
+            is_remote=bool(usb or remote_addr),
+            include_serials=include_serials,
+            include_network_identity=include_network_identity,
+        )
+    except ForensicStringError as exc:
+        raise click.BadParameter(str(exc))
 
     # Determine encryption: investigation defaults to encrypted unless --no-encrypt
     use_encryption = encrypt or (investigation and not no_encrypt)
@@ -376,6 +402,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         remote_addr=remote_addr,
         investigation=investigation,
         passphrase=passphrase if use_encryption else None,
+        attribution=attribution,
     )
     acquirer.set_progress_callback(progress)
 

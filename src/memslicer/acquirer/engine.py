@@ -11,7 +11,9 @@ from typing import Callable
 
 from memslicer.acquirer.base import AcquireResult, BaseAcquirer
 from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange
+from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
 from memslicer.acquirer.investigation import InvestigationCollector
+from memslicer.acquirer.os_detail import pack_os_detail, system_info_to_fields
 from memslicer.acquirer.region_filter import RegionFilter
 from memslicer.msl.constants import (
     CompAlgo, OSType, PageState, RegionType, CapBit,
@@ -82,6 +84,13 @@ def volatility_key(r: MemoryRange) -> tuple[int, int]:
 ProgressCallback = Callable[[int, int, int, int, int], None]
 
 
+# _system_info_to_os_detail_fields used to live here as a private helper.
+# It's now the public ``system_info_to_fields`` in ``os_detail.py`` — same
+# home as the packer it feeds. A thin alias preserves the old name so any
+# external importer keeps working during the transition.
+_system_info_to_os_detail_fields = system_info_to_fields
+
+
 class AcquisitionEngine(BaseAcquirer):
     """Acquires process memory via a DebuggerBridge and writes MSL files.
 
@@ -102,6 +111,8 @@ class AcquisitionEngine(BaseAcquirer):
         investigation: bool = False,
         passphrase: str | None = None,
         collector: InvestigationCollector | None = None,
+        *,
+        attribution: AttributionConfig | None = None,
     ) -> None:
         self._bridge = bridge
         self._comp_algo = comp_algo
@@ -114,6 +125,9 @@ class AcquisitionEngine(BaseAcquirer):
         self._investigation = investigation
         self._passphrase = passphrase
         self._collector = collector
+        # Operator-supplied forensic attribution, pre-validated at the
+        # CLI boundary — safe to embed in SystemContext as-is.
+        self._attribution = attribution or AttributionConfig()
 
     def request_abort(self) -> None:
         """Request graceful abort of the current acquisition.
@@ -260,7 +274,6 @@ class AcquisitionEngine(BaseAcquirer):
 
                     # Block 2: SystemContext (Investigation mode only)
                     if self._investigation:
-                        import socket
                         import getpass
                         import platform as platform_mod
 
@@ -289,29 +302,69 @@ class AcquisitionEngine(BaseAcquirer):
                         # Update header cap_bitmap before writing tables
                         header.cap_bitmap = cap_bitmap
 
+                        # Operator attribution (CLI-validated).
+                        attribution = self._attribution
+                        acq_user = attribution.examiner or getpass.getuser()
+                        case_ref = attribution.case_ref
+
+                        # Pull raw collector values (or produce empty ones
+                        # if no collector is attached).
                         if self._collector is not None:
                             sys_info = self._collector.collect_system_info()
-                            sys_ctx = SystemContext(
-                                boot_time=sys_info.boot_time,
-                                target_count=1,
-                                table_bitmap=table_bitmap,
-                                acq_user=getpass.getuser(),
-                                hostname=sys_info.hostname,
-                                domain=sys_info.domain,
-                                os_detail=sys_info.os_detail,
-                                case_ref="",
-                            )
+                            boot_time = sys_info.boot_time
+                            collector_hostname = sys_info.hostname
+                            collector_domain = sys_info.domain
+                            raw_os_string = sys_info.os_detail
                         else:
-                            sys_ctx = SystemContext(
-                                boot_time=0,
-                                target_count=1,
-                                table_bitmap=table_bitmap,
-                                acq_user=getpass.getuser(),
-                                hostname=socket.gethostname(),
-                                domain="",
-                                os_detail=platform_mod.platform(),
-                                case_ref="",
+                            sys_info = None
+                            boot_time = 0
+                            collector_hostname = ""
+                            collector_domain = ""
+                            raw_os_string = platform_mod.platform()
+
+                        # Hostname/domain resolution — single source of
+                        # truth shared with cli_sysctx. On remote targets
+                        # the resolver refuses to fall back to
+                        # socket.gethostname() (which would mis-attribute
+                        # the MSL to the acquisition host).
+                        identity = resolve_target_identity(
+                            collector_hostname=collector_hostname,
+                            collector_domain=collector_domain,
+                            is_remote=attribution.is_remote,
+                            hostname_override=attribution.hostname_override,
+                            domain_override=attribution.domain_override,
+                            logger=self._log,
+                        )
+
+                        if sys_info is not None:
+                            fields = system_info_to_fields(
+                                sys_info,
+                                include_serials=attribution.include_serials,
+                                include_network_identity=attribution.include_network_identity,
                             )
+                            collector_warnings = list(sys_info.collector_warnings)
+                        else:
+                            fields = {"raw_os": raw_os_string}
+                            collector_warnings = []
+
+                        # Surface resolution warnings (e.g. remote
+                        # hostname unavailable) in the packed provenance.
+                        collector_warnings.extend(identity.warnings)
+                        if collector_warnings:
+                            fields["collector_warning"] = ",".join(collector_warnings)
+
+                        os_detail_packed = pack_os_detail(fields)
+
+                        sys_ctx = SystemContext(
+                            boot_time=boot_time,
+                            target_count=1,
+                            table_bitmap=table_bitmap,
+                            acq_user=acq_user,
+                            hostname=identity.hostname,
+                            domain=identity.domain,
+                            os_detail=os_detail_packed,
+                            case_ref=case_ref,
+                        )
                         sys_ctx_uuid = writer.write_system_context(sys_ctx)
 
                         # Write table blocks referencing SystemContext as parent

@@ -224,8 +224,11 @@ class TestMissingGetprop:
         with patch("subprocess.run", side_effect=FileNotFoundError("getprop")):
             info = collector.collect_system_info()
 
-        # Falls back to /proc/version from LinuxCollector
-        assert info.os_detail == "Linux version 5.10.0-android"
+        # Step 7 fix: os_detail is now the human-readable kernel/arch
+        # composition, not the raw /proc/version build string. The raw
+        # string still survives in raw_os for forensic lookup.
+        assert "Linux version 5.10.0-android" not in info.os_detail
+        assert info.raw_os == "Linux version 5.10.0-android"
         assert info.boot_time > 0
 
     def test_timeout_error(self, tmp_path: Path) -> None:
@@ -239,4 +242,7 @@ class TestMissingGetprop:
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("getprop", 5)):
             info = collector.collect_system_info()
 
-        assert info.os_detail == "Linux version 5.10.0-android"
+        # See note in test_file_not_found_error above — os_detail is no
+        # longer the raw /proc/version.
+        assert "Linux version 5.10.0-android" not in info.os_detail
+        assert info.raw_os == "Linux version 5.10.0-android"

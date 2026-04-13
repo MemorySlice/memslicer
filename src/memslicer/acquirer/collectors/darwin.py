@@ -11,9 +11,20 @@ from datetime import datetime
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
 
+from memslicer.acquirer.collectors._io import read_symlink
 from memslicer.acquirer.collectors.constants import (
     AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP,
     HT_UNKNOWN, HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE,
+)
+
+# Regexes for parsing ioreg output of IOPlatformExpertDevice.
+_IOREG_UUID_RE = re.compile(r'"IOPlatformUUID"\s*=\s*"([^"]+)"')
+_IOREG_SERIAL_RE = re.compile(r'"IOPlatformSerialNumber"\s*=\s*"([^"]+)"')
+
+# Timezone symlink prefixes to strip from /etc/localtime.
+_TZ_PREFIXES = (
+    "/var/db/timezone/zoneinfo/",
+    "/usr/share/zoneinfo/",
 )
 
 # TCP state map for lsof
@@ -96,12 +107,41 @@ class DarwinCollector:
         return info
 
     def collect_system_info(self) -> TargetSystemInfo:
-        """Collect system info via sysctl and sw_vers."""
+        """Collect system info via sysctl, sw_vers, and ioreg."""
         info = TargetSystemInfo()
         info.boot_time = self._read_boot_time()
         info.hostname = socket.gethostname()
         info.domain = self._read_domain()
-        info.os_detail = self._read_os_detail()
+
+        # sw_vers is expensive (subprocess) and used twice — cache once.
+        sw_vers_fields = self._read_sw_vers_fields()
+
+        # Enrichment: identity.
+        info.kernel = self._read_sysctl("kern.osrelease")
+        info.arch = self._read_sysctl("hw.machine")
+        info.distro = self._compose_darwin_distro(sw_vers_fields)
+
+        # Legacy os_detail string composed from the cached sw_vers +
+        # the kernel value we already have. Leave ``raw_os`` empty so
+        # the packer's ``raw_os or os_detail`` fallback in
+        # ``system_info_to_fields`` uses this string, avoiding the
+        # redundant duplicate assignment the earlier draft had.
+        info.os_detail = self._compose_legacy_os_detail(sw_vers_fields, info.kernel)
+
+        uuid, serial = self._read_ioreg_platform()
+        info.machine_id = uuid
+        info.hw_serial = serial
+        info.hw_vendor = "Apple"
+        info.hw_model = self._read_sysctl("hw.model")
+        # bios_version intentionally left empty for P0.
+        info.cpu_brand = self._read_sysctl("machdep.cpu.brand_string")
+        info.cpu_count = self._read_sysctl_int("hw.ncpu")
+        info.ram_bytes = self._read_sysctl_int("hw.memsize")
+
+        # Enrichment: boot state / runtime posture.
+        info.virtualization = self._read_virtualization()
+        info.timezone = self._read_timezone()
+
         return info
 
     def collect_process_table(self, target_pid: int) -> list[ProcessEntry]:
@@ -188,22 +228,88 @@ class DarwinCollector:
         domain = out.strip() if out else ""
         return "" if domain in ("(none)", "") else domain
 
-    def _read_os_detail(self) -> str:
-        """Build OS detail string from sw_vers and uname."""
-        parts: list[str] = []
-
+    def _read_sw_vers_fields(self) -> dict[str, str]:
+        """Run ``sw_vers`` once and parse the ``Key: value`` output."""
         sw_vers = self._run_cmd(["sw_vers"])
-        if sw_vers:
-            for line in sw_vers.strip().splitlines():
-                kv = line.split(":", 1)
-                if len(kv) == 2:
-                    parts.append(kv[1].strip())
+        if not sw_vers:
+            return {}
+        fields: dict[str, str] = {}
+        for line in sw_vers.strip().splitlines():
+            kv = line.split(":", 1)
+            if len(kv) == 2:
+                fields[kv[0].strip()] = kv[1].strip()
+        return fields
 
-        uname = self._run_cmd(["uname", "-r"])
-        if uname:
-            parts.append(f"kernel {uname.strip()}")
+    @staticmethod
+    def _compose_darwin_distro(sw_vers_fields: dict[str, str]) -> str:
+        """Compose ``ProductName ProductVersion (BuildVersion)`` from sw_vers."""
+        name = sw_vers_fields.get("ProductName", "")
+        version = sw_vers_fields.get("ProductVersion", "")
+        build = sw_vers_fields.get("BuildVersion", "")
+        parts = [p for p in (name, version) if p]
+        result = " ".join(parts)
+        if build:
+            return f"{result} ({build})" if result else f"({build})"
+        return result
 
-        return " ".join(parts) if parts else ""
+    @staticmethod
+    def _compose_legacy_os_detail(
+        sw_vers_fields: dict[str, str], kernel: str,
+    ) -> str:
+        """Join sw_vers values + ``kernel <release>`` (backwards compat)."""
+        parts: list[str] = [v for v in sw_vers_fields.values() if v]
+        if kernel:
+            parts.append(f"kernel {kernel}")
+        return " ".join(parts)
+
+    def _read_sysctl(self, key: str) -> str:
+        """Read a single sysctl value as trimmed string ('' on failure)."""
+        out = self._run_cmd(["sysctl", "-n", key])
+        return out.strip() if out else ""
+
+    def _read_sysctl_int(self, key: str) -> int:
+        """Read a single sysctl value as int (0 on failure)."""
+        raw = self._read_sysctl(key)
+        if not raw:
+            return 0
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    def _read_ioreg_platform(self) -> tuple[str, str]:
+        """Extract (IOPlatformUUID, IOPlatformSerialNumber) via a single ioreg call.
+
+        CRITICAL: the platform UUID comes from IOPlatformExpertDevice, not from
+        ``sysctl kern.uuid`` (which is the per-boot session UUID).
+        """
+        out = self._run_cmd(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"])
+        if not out:
+            return "", ""
+        uuid_match = _IOREG_UUID_RE.search(out)
+        serial_match = _IOREG_SERIAL_RE.search(out)
+        uuid = uuid_match.group(1) if uuid_match else ""
+        serial = serial_match.group(1) if serial_match else ""
+        return uuid, serial
+
+    def _read_virtualization(self) -> str:
+        """Return 'hypervisor' if kern.hv_vmm_present=1, 'none' if 0, '' otherwise."""
+        raw = self._read_sysctl("kern.hv_vmm_present")
+        if raw == "1":
+            return "hypervisor"
+        if raw == "0":
+            return "none"
+        return ""
+
+    def _read_timezone(self) -> str:
+        """Return IANA timezone via /etc/localtime symlink."""
+        link = read_symlink("/etc/localtime", self._log)
+        if not link:
+            return ""
+        for prefix in _TZ_PREFIXES:
+            if link.startswith(prefix):
+                return link[len(prefix):]
+        return link
 
     # ------------------------------------------------------------------
     # Private: parsing helpers

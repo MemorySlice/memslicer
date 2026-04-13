@@ -20,12 +20,25 @@ dependencies = [
 
 [project.scripts]
 memslicer = "memslicer.cli:cli"
+memslicer-sysctx = "memslicer.cli_sysctx:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+    "hypothesis",
+]
+pretty = [
+    "rich>=13.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "requires_root: skipped unless os.geteuid() == 0",
+    "requires_linux: skipped unless sys.platform.startswith('linux')",
+    "requires_darwin: skipped unless sys.platform == 'darwin'",
+    "requires_windows: skipped unless sys.platform == 'win32'",
 ]
 
 [tool.hatch.build.targets.wheel]

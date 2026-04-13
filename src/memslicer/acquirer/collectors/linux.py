@@ -6,6 +6,7 @@ import os
 import struct
 from pathlib import Path
 
+from memslicer.acquirer.collectors._io import read_proc_file, read_symlink
 from memslicer.acquirer.collectors.addr_utils import (
     decode_proc_net_ipv4,
     decode_proc_net_ipv6,
@@ -59,10 +60,43 @@ class LinuxCollector:
         info = TargetSystemInfo()
         info.boot_time = self._read_boot_time_ns()
         info.hostname = self._read_sysctl("kernel/hostname")
-        info.os_detail = self._read_file_text(f"{self._proc}/version")
 
         domain = self._read_sysctl("kernel/domainname")
         info.domain = "" if domain in ("(none)", "") else domain
+
+        # Identity: kernel / arch / distro / raw_os / os_detail
+        try:
+            uname = os.uname()
+            info.kernel = uname.release
+            info.arch = uname.machine
+        except OSError as exc:
+            self._log.warning("os.uname() failed: %s", exc)
+
+        info.raw_os = self._read_file_text(f"{self._proc}/version")
+        info.distro = self._read_os_release_distro()
+        info.os_detail = self._compose_os_detail(
+            info.distro, info.kernel, info.arch
+        )
+
+        # Identity: machine / hardware
+        info.machine_id = self._read_machine_id()
+        info.hw_vendor = self._read_dmi("sys_vendor")
+        info.hw_model = self._read_dmi("product_name")
+        info.hw_serial = self._read_dmi("product_serial")
+        info.bios_version = self._read_dmi("bios_version")
+
+        # CPU / memory
+        info.cpu_brand = self._read_cpuinfo_model()
+        info.cpu_count = os.cpu_count() or 0
+        info.ram_bytes = self._read_meminfo_bytes()
+
+        # Runtime / boot
+        info.timezone = self._read_timezone()
+        info.virtualization = self._detect_virtualization(info.hw_model)
+        info.boot_id = self._read_file_text(
+            f"{self._proc}/sys/kernel/random/boot_id"
+        )
+
         return info
 
     def collect_process_table(self, target_pid: int) -> list[ProcessEntry]:
@@ -184,13 +218,154 @@ class LinuxCollector:
         return self._read_file_text(f"{self._proc}/sys/{key}")
 
     def _read_file_text(self, path: str) -> str:
-        """Read and strip a single-line text file, returning '' on failure."""
-        try:
-            with open(path, "r") as fh:
-                return fh.read().strip()
-        except (OSError, PermissionError) as exc:
-            self._log.warning("Cannot read %s: %s", path, exc)
+        """Read and strip a single-line text file, returning '' on failure.
+
+        Delegates to :func:`memslicer.acquirer.collectors._io.read_proc_file`
+        for TOCTOU-hardened opens (``O_NOFOLLOW``) and size-capped reads.
+        """
+        return read_proc_file(path, logger=self._log)
+
+    # ------------------------------------------------------------------
+    # Private helpers: enrichment sources
+    # ------------------------------------------------------------------
+
+    # Paths outside of /proc. Exposed as instance attributes so tests
+    # can redirect them at the filesystem fixture without monkeypatching
+    # module-level constants. Containerized-root scoping is P1.5.
+    _etc_os_release = "/etc/os-release"
+    _etc_machine_id = "/etc/machine-id"
+    _dbus_machine_id = "/var/lib/dbus/machine-id"
+    _dmi_id_dir = "/sys/class/dmi/id"
+    _etc_localtime = "/etc/localtime"
+    _dockerenv_path = "/.dockerenv"
+    _containerenv_path = "/run/.containerenv"
+
+    @staticmethod
+    def _compose_os_detail(distro: str, kernel: str, arch: str) -> str:
+        """Compose a human-readable os_detail string from the parts."""
+        tail_parts = [p for p in (kernel, arch) if p]
+        tail = " ".join(tail_parts)
+        if distro and tail:
+            return f"{distro} ({tail})"
+        if distro:
+            return distro
+        return tail
+
+    def _read_os_release_distro(self) -> str:
+        """Parse /etc/os-release, returning PRETTY_NAME or NAME+VERSION."""
+        text = self._read_file_text(self._etc_os_release)
+        if not text:
             return ""
+
+        fields: dict[str, str] = {}
+        for line in text.splitlines():
+            if "=" not in line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            value = value.strip().strip('"').strip("'")
+            fields[key.strip()] = value
+
+        pretty = fields.get("PRETTY_NAME", "")
+        if pretty:
+            return pretty
+        name = fields.get("NAME", "")
+        version = fields.get("VERSION", "")
+        if name and version:
+            return f"{name} {version}"
+        return name
+
+    def _read_machine_id(self) -> str:
+        """Read /etc/machine-id, falling back to dbus machine-id."""
+        value = self._read_file_text(self._etc_machine_id)
+        if value:
+            return value
+        return self._read_file_text(self._dbus_machine_id)
+
+    def _read_dmi(self, name: str) -> str:
+        """Read a /sys/class/dmi/id/<name> field."""
+        return self._read_file_text(f"{self._dmi_id_dir}/{name}")
+
+    def _read_meminfo_bytes(self) -> int:
+        """Parse MemTotal (kB) from /proc/meminfo and return bytes."""
+        text = self._read_file_text(f"{self._proc}/meminfo")
+        if not text:
+            return 0
+        for line in text.splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                # Expected: "MemTotal:    16384000 kB"
+                try:
+                    return int(parts[1]) * 1024
+                except (IndexError, ValueError):
+                    return 0
+        return 0
+
+    def _read_cpuinfo_model(self) -> str:
+        """Parse the first human-readable CPU identifier from /proc/cpuinfo."""
+        text = self._read_file_text(f"{self._proc}/cpuinfo")
+        if not text:
+            return ""
+
+        # Prefer "model name" (x86). On ARM there is no model name;
+        # fall back to "Hardware" (legacy ARM), then "CPU implementer".
+        primary_key = "model name"
+        fallback_keys = ("Hardware", "CPU implementer")
+
+        fallback_hits: dict[str, str] = {}
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if not value:
+                continue
+            if key == primary_key:
+                return value
+            if key in fallback_keys and key not in fallback_hits:
+                fallback_hits[key] = value
+
+        for key in fallback_keys:
+            if key in fallback_hits:
+                return fallback_hits[key]
+        return ""
+
+    def _read_timezone(self) -> str:
+        """Read /etc/localtime symlink target, strip zoneinfo prefix."""
+        target = read_symlink(self._etc_localtime, self._log)
+        prefix = "/usr/share/zoneinfo/"
+        if target.startswith(prefix):
+            return target[len(prefix):]
+        return target
+
+    def _detect_virtualization(self, hw_model: str) -> str:
+        """Detect virtualization environment.
+
+        Returns one of: docker / podman / vmware / virtualbox / qemu /
+        kvm / hypervisor / none.
+        """
+        # Container markers win: they're the most specific.
+        if os.path.exists(self._dockerenv_path):
+            return "docker"
+        if os.path.exists(self._containerenv_path):
+            return "podman"
+
+        # Hardware model hints from SMBIOS.
+        model_lower = (hw_model or "").lower()
+        if "vmware" in model_lower:
+            return "vmware"
+        if "virtualbox" in model_lower:
+            return "virtualbox"
+        if "qemu" in model_lower:
+            return "qemu"
+        if "kvm" in model_lower:
+            return "kvm"
+
+        # Generic hypervisor flag from cpuinfo (x86 only, but harmless).
+        cpuinfo = self._read_file_text(f"{self._proc}/cpuinfo")
+        for line in cpuinfo.splitlines():
+            if line.startswith("flags") and " hypervisor" in f" {line}":
+                return "hypervisor"
+
+        return "none"
 
     # ------------------------------------------------------------------
     # Private helpers: process table

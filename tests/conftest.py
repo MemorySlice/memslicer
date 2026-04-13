@@ -1,4 +1,6 @@
 """Shared test fixtures for MemSlicer tests."""
+import os
+import sys
 import pytest
 import uuid
 from unittest.mock import MagicMock
@@ -6,6 +8,37 @@ from unittest.mock import MagicMock
 from memslicer.msl.constants import OSType, ArchType, CompAlgo, PageState, RegionType
 from memslicer.msl.types import FileHeader, MemoryRegion, ModuleEntry
 from memslicer.utils.timestamps import now_ns
+
+
+# ---------------------------------------------------------------------------
+# Platform / privilege markers (P0.7)
+# ---------------------------------------------------------------------------
+#
+# Tests can self-gate with ``@pytest.mark.requires_linux`` /
+# ``requires_darwin`` / ``requires_windows`` / ``requires_root``. The
+# runner auto-skips mismatched markers so a collector test file can
+# carry platform-specific fixtures without exploding on mismatched CI.
+
+def pytest_collection_modifyitems(config, items):
+    skip_non_linux = pytest.mark.skip(reason="requires Linux")
+    skip_non_darwin = pytest.mark.skip(reason="requires macOS")
+    skip_non_windows = pytest.mark.skip(reason="requires Windows")
+    skip_non_root = pytest.mark.skip(reason="requires root")
+
+    is_linux = sys.platform.startswith("linux")
+    is_darwin = sys.platform == "darwin"
+    is_windows = sys.platform == "win32"
+    is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+
+    for item in items:
+        if "requires_linux" in item.keywords and not is_linux:
+            item.add_marker(skip_non_linux)
+        if "requires_darwin" in item.keywords and not is_darwin:
+            item.add_marker(skip_non_darwin)
+        if "requires_windows" in item.keywords and not is_windows:
+            item.add_marker(skip_non_windows)
+        if "requires_root" in item.keywords and not is_root:
+            item.add_marker(skip_non_root)
 
 
 @pytest.fixture
