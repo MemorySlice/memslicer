@@ -28,6 +28,22 @@ class IOSCollector(DarwinCollector):
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
         super().__init__(logger=logger)
+        # Jailbreak detection markers: method -> tuple of filesystem paths
+        # that, if present, indicate that method's installer has run.
+        # Instance attribute so tests can redirect to a tmp_path fixture
+        # without patching os.path.exists.
+        self._jailbreak_markers: dict[str, tuple[str, ...]] = {
+            # Rootless jailbreaks (iOS 15+). /var/jb/ is the canonical
+            # marker used by Dopamine, palera1n, XinaA15.
+            "dopamine":  ("/var/jb/",),
+            "palera1n":  ("/binpack/", "/.bootstrapped_palera1n"),
+            "serotonin": ("/var/jb/usr/lib/libellekit.dylib",),
+            # Legacy rooted jailbreaks (pre-iOS 15).
+            "substrate": ("/Library/MobileSubstrate/",),
+            "checkra1n": ("/.checkra1n",),
+        }
+        # Roothide enumerates a glob pattern rather than a fixed path.
+        self._roothide_glob: str = "/var/containers/Bundle/Application/.jbroot-*"
 
     def collect_process_identity(self, pid: int) -> TargetProcessInfo:
         """Collect process identity with sandbox-aware fallbacks.
@@ -48,20 +64,69 @@ class IOSCollector(DarwinCollector):
         return info
 
     def collect_system_info(self) -> TargetSystemInfo:
-        """Collect system info with iOS-specific OS detail."""
+        """Collect system info with iOS-specific enrichment.
+
+        Layered on Darwin's base collection:
+          * Remap ``hw.machine`` (board ID on iOS) from arch -> hw_model.
+          * Supplement distro from ``kern.osproductversion`` / ``kern.osversion``.
+          * Populate ``boot_id`` from ``kern.bootsessionuuid``.
+          * Prefer SystemVersion.plist when readable.
+          * Probe for jailbreak markers to populate ``env`` / ``root_method``.
+        """
         info = super().collect_system_info()
 
-        # Override os_detail with iOS-specific info from SystemVersion.plist
-        ios_detail = self._read_system_version_plist()
-        if ios_detail:
-            info.os_detail = ios_detail
+        # On iOS, hw.machine is a board ID like "iPhone16,2", not an arch.
+        # Darwin's super() stored it in info.arch — remap to hw_model and
+        # correct arch to "arm64" (all modern iOS devices are arm64).
+        board_id = info.arch
+        if board_id and board_id.startswith(
+            ("iPhone", "iPad", "iPod", "Watch", "AppleTV")
+        ):
+            info.hw_model = board_id
+            info.arch = "arm64"
 
-        # Append device model from hw.machine
-        model = self._read_device_model()
-        if model and info.os_detail:
-            info.os_detail = f"{info.os_detail} ({model})"
-        elif model:
-            info.os_detail = f"iOS ({model})"
+        # Supplement with kern.osversion (build, e.g. "21E219") and
+        # kern.osproductversion (semantic, e.g. "17.4"). These are the
+        # same values SystemVersion.plist carries but readable without
+        # the plist, so they give a fallback distro on sandboxed iOS.
+        build_ver = self._read_sysctl("kern.osversion")
+        prod_ver = self._read_sysctl("kern.osproductversion")
+
+        # Boot session UUID: per-boot identifier that anchors the slice
+        # even if two reboots happen to report the same wall-clock boot
+        # time (rare, but observable on fast successive reboots).
+        boot_session = self._read_sysctl("kern.bootsessionuuid")
+        if boot_session:
+            info.boot_id = boot_session
+
+        # Compose a distro string from sysctl as a fallback. The plist
+        # supplement below can override this with authoritative content.
+        if prod_ver:
+            info.distro = f"iOS {prod_ver}" + (
+                f" ({build_ver})" if build_ver else ""
+            )
+
+        # Read the plist if accessible — it's authoritative when available.
+        plist_detail = self._read_system_version_plist()
+        if plist_detail:
+            info.os_detail = plist_detail
+        elif info.distro:
+            info.os_detail = info.distro
+
+        # Append the device model in parentheses (preserves existing
+        # behavior tested by TestCollectSystemInfoIOS).
+        if info.hw_model and info.os_detail and info.hw_model not in info.os_detail:
+            info.os_detail = f"{info.os_detail} ({info.hw_model})"
+        elif info.hw_model and not info.os_detail:
+            info.os_detail = f"iOS ({info.hw_model})"
+
+        # Jailbreak / environment detection (filesystem marker probe).
+        jb = self._detect_jailbreak()
+        if jb:
+            info.env = "jailbroken"
+            info.root_method = jb
+        else:
+            info.env = "stock"
 
         return info
 
@@ -126,3 +191,33 @@ class IOSCollector(DarwinCollector):
         """Read device model identifier via sysctl hw.machine."""
         out = self._run_cmd(["sysctl", "-n", "hw.machine"])
         return out.strip() if out else ""
+
+    def _detect_jailbreak(self) -> str:
+        """Probe filesystem for jailbreak markers.
+
+        Returns a comma-separated list of detected methods (advisory),
+        or an empty string when no markers are found. Uses instance
+        attributes ``_jailbreak_markers`` and ``_roothide_glob`` so tests
+        can redirect to tmp_path-based fixtures without patching globals.
+        """
+        import glob
+        import os as _os
+
+        detected: list[str] = []
+        for method, paths in self._jailbreak_markers.items():
+            for path in paths:
+                try:
+                    if _os.path.exists(path):
+                        detected.append(method)
+                        break
+                except OSError:
+                    continue
+
+        # Roothide uses a per-install glob pattern rather than a fixed path.
+        try:
+            if glob.glob(self._roothide_glob):
+                detected.append("roothide")
+        except OSError:
+            pass
+
+        return ",".join(detected)
