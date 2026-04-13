@@ -397,3 +397,183 @@ class TestWindowsHandleTableNonWindows:
             mock_os.name = "posix"
             entries = collector.collect_handle_table(1234)
         assert entries == []
+
+
+# ---------------------------------------------------------------------------
+# collect_system_info enriched (P1.1)
+# ---------------------------------------------------------------------------
+
+
+def _stub_all_sources(collector, **overrides):
+    """Patch every _win_* source on *collector* with safe defaults.
+
+    Keyword overrides replace individual return values. Returns a list of
+    active patchers so the caller can stop them (or rely on context
+    management via ExitStack — but for readability we use start/stop).
+    """
+    defaults = {
+        "_win_hostname": "",
+        "_win_domain": "",
+        "_win_version_ex": {"major": 10, "minor": 0, "build": 19045},
+        "_win_arch": "x86_64",
+        "_win_compose_distro": "Windows 10 Pro 22H2 (Build 19045.3803)",
+        "_win_machine_id": "abcd-1234",
+        "_win_hw_vendor_model": ("Dell Inc.", "Latitude 7440"),
+        "_win_bios": "1.2.3 20240101",
+        "_win_cpu": "Intel(R) Core(TM) i7",
+        "_win_cpu_count": 8,
+        "_win_ram_bytes": 16 * 1024 * 1024 * 1024,
+        "_win_timezone": "Pacific Standard Time",
+        "_win_boot_time_ns": 1_700_000_000_000_000_000,
+        "_win_secure_boot": "1",
+        "_win_service_running": True,
+        "_win_hw_serial": "SN-12345",
+        "_win_virt": "none",
+        "_win_disk_encryption": "bitlocker",
+        "_win_smbios_uuid": "",
+        "_win_nic_macs": ["00:11:22:33:44:55"],
+    }
+    defaults.update(overrides)
+    patchers = []
+    for name, value in defaults.items():
+        p = patch.object(collector, name, return_value=value)
+        p.start()
+        patchers.append(p)
+    return patchers
+
+
+def _stop(patchers):
+    for p in patchers:
+        p.stop()
+
+
+class TestCollectSystemInfoEnriched:
+    """Tests for the P1.1 enriched collect_system_info surface."""
+
+    def test_win11_23h2_pro(self, collector):
+        patchers = _stub_all_sources(
+            collector,
+            _win_version_ex={"major": 10, "minor": 0, "build": 22631},
+            _win_compose_distro="Windows 11 Pro 23H2 (Build 22631.3007)",
+        )
+        try:
+            info = collector.collect_system_info()
+        finally:
+            _stop(patchers)
+
+        assert info.distro.startswith("Windows 11")
+        assert info.kernel == "10.0.22631"
+        assert info.arch == "x86_64"
+
+    def test_win10_22h2_ent(self, collector):
+        patchers = _stub_all_sources(
+            collector,
+            _win_version_ex={"major": 10, "minor": 0, "build": 19045},
+            _win_compose_distro="Windows 10 Enterprise 22H2 (Build 19045.3803)",
+        )
+        try:
+            info = collector.collect_system_info()
+        finally:
+            _stop(patchers)
+
+        assert info.kernel == "10.0.19045"
+        assert "Windows 10 Enterprise 22H2" in info.distro
+
+    def test_server_2022(self, collector):
+        patchers = _stub_all_sources(
+            collector,
+            _win_version_ex={"major": 10, "minor": 0, "build": 20348},
+            _win_compose_distro="Windows Server 2022 Datacenter (Build 20348.2227)",
+        )
+        try:
+            info = collector.collect_system_info()
+        finally:
+            _stop(patchers)
+
+        assert "Server 2022" in info.distro
+        assert info.kernel == "10.0.20348"
+
+    def test_wow6432_shadow(self, collector):
+        """_win_read_registry with wow64_64=True reads the 64-bit view."""
+        calls = []
+
+        def fake_reader(hive, subkey, value, wow64_64=True):
+            calls.append((hive, subkey, value, wow64_64))
+            return "real" if wow64_64 else "shadow"
+
+        with patch.object(collector, "_win_read_registry", side_effect=fake_reader):
+            result_64 = collector._win_read_registry("HKLM", "X", "Y", wow64_64=True)
+            result_32 = collector._win_read_registry("HKLM", "X", "Y", wow64_64=False)
+
+        assert result_64 == "real"
+        assert result_32 == "shadow"
+        assert calls[0][3] is True
+        assert calls[1][3] is False
+
+    def test_domain_joined(self, collector):
+        patchers = _stub_all_sources(collector, _win_domain="corp.example.com")
+        try:
+            info = collector.collect_system_info()
+        finally:
+            _stop(patchers)
+
+        assert info.domain == "corp.example.com"
+
+    def test_wmi_unavailable_degrades(self, collector):
+        patchers = _stub_all_sources(collector, _win_service_running=False)
+        try:
+            info = collector.collect_system_info()
+        finally:
+            _stop(patchers)
+
+        assert "wmi_unavailable" in info.collector_warnings
+        assert info.hw_serial == ""
+        assert info.virtualization == ""
+        assert info.disk_encryption == ""
+
+    def test_productname_trap_fix(self, collector):
+        """Build 22631 + raw ProductName 'Windows 10 Pro' must compose as Windows 11."""
+        # Call the real composer with a stubbed _win_read_registry that
+        # returns the shipped-on-disk (wrong) ProductName plus a build
+        # number that proves it is Windows 11.
+        def fake_read(hive, subkey, value, wow64_64=True):
+            return {
+                "ProductName": "Windows 10 Pro",
+                "DisplayVersion": "23H2",
+                "CurrentBuildNumber": "22631",
+                "UBR": 3007,
+                "EditionID": "Professional",
+                "InstallationType": "Client",
+            }.get(value)
+
+        with patch.object(collector, "_win_read_registry", side_effect=fake_read):
+            distro = collector._win_compose_distro()
+
+        assert distro.startswith("Windows 11 Pro")
+        assert not distro.startswith("Windows 10 Pro")
+        assert "23H2" in distro
+        assert "22631" in distro
+
+    def test_nic_macs_iphlpapi_unavailable(self, collector):
+        patchers = _stub_all_sources(collector, _win_nic_macs=[])
+        try:
+            info = collector.collect_system_info()
+        finally:
+            _stop(patchers)
+
+        assert info.nic_macs == []
+
+    def test_collect_system_info_import_safe_on_darwin(self):
+        """On macOS every _win_* helper degrades gracefully without raising."""
+        real_collector = WindowsCollector()
+        # Do NOT stub anything: we want the real helpers exercised.
+        info = real_collector.collect_system_info()
+
+        # Wire-format fields default to empty strings / zero when sources
+        # are unavailable; collector must not raise.
+        assert isinstance(info.hostname, str)
+        assert isinstance(info.distro, str)
+        assert info.ram_bytes == 0
+        assert info.cpu_brand == ""
+        # wmi is unavailable on macOS, so the warning must be present.
+        assert "wmi_unavailable" in info.collector_warnings
