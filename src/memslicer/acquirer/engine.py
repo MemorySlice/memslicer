@@ -11,6 +11,7 @@ from typing import Callable
 
 from memslicer.acquirer.base import AcquireResult, BaseAcquirer
 from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange
+from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
 from memslicer.acquirer.investigation import InvestigationCollector
 from memslicer.acquirer.os_detail import pack_os_detail, system_info_to_fields
@@ -21,7 +22,8 @@ from memslicer.msl.constants import (
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
-    ProcessEntry, ConnectionEntry, HandleEntry,
+    ProcessEntry, ConnectionEntry, HandleEntry, TargetIntrospection,
+    KernelSymbolBundle,
 )
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.protection import (
@@ -32,6 +34,136 @@ from memslicer.utils.timestamps import now_ns
 
 # Default max chunk size for splitting large regions (same as fridump)
 _DEFAULT_MAX_CHUNK = 20971520  # 20 MB
+
+
+def _build_target_introspection(proc_info, pid: int) -> TargetIntrospection:
+    """Project a :class:`TargetProcessInfo` onto a :class:`TargetIntrospection`
+    for wire emission (P1.6.3, Block 0x0058).
+
+    Pulled out of the main acquire loop so ``AcquisitionEngine.acquire``
+    stays readable — the projection is mechanical and every field has
+    the same name on both sides. ``environ`` is stored on the
+    ``TargetProcessInfo`` as a ``str`` (the redactor joins entries with
+    ``\\x00``) and encoded to bytes here so the wire row carries the
+    NUL-separated blob directly.
+    """
+    environ_blob = b""
+    if getattr(proc_info, "environ", ""):
+        environ_blob = proc_info.environ.encode("utf-8", errors="replace")
+    return TargetIntrospection(
+        target_pid=pid,
+        tracer_pid=proc_info.tracer_pid,
+        login_uid=proc_info.login_uid,
+        session_audit_id=proc_info.session_audit_id,
+        selinux_context=proc_info.selinux_context,
+        target_ns_fingerprint=proc_info.target_ns_fingerprint,
+        target_ns_scope_vs_collector=proc_info.target_ns_scope_vs_collector,
+        smaps_rollup_pss_kib=proc_info.smaps_rollup_pss_kib,
+        smaps_rollup_swap_kib=proc_info.smaps_rollup_swap_kib,
+        smaps_anon_hugepages_kib=proc_info.smaps_anon_hugepages_kib,
+        rwx_region_count=proc_info.rwx_region_count,
+        target_cgroup=proc_info.target_cgroup,
+        target_cwd=proc_info.target_cwd,
+        target_root=proc_info.target_root,
+        cap_eff=proc_info.cap_eff,
+        cap_amb=proc_info.cap_amb,
+        no_new_privs=proc_info.no_new_privs,
+        seccomp_mode=proc_info.seccomp_mode,
+        core_dumping=proc_info.core_dumping,
+        thread_count=proc_info.thread_count,
+        sig_cgt=proc_info.sig_cgt,
+        io_rchar=proc_info.io_rchar,
+        io_wchar=proc_info.io_wchar,
+        io_read_bytes=proc_info.io_read_bytes,
+        io_write_bytes=proc_info.io_write_bytes,
+        limit_core=proc_info.limit_core,
+        limit_memlock=proc_info.limit_memlock,
+        limit_nofile=proc_info.limit_nofile,
+        personality_hex=proc_info.personality_hex,
+        ancestry=proc_info.ancestry,
+        exe_comm_mismatch=proc_info.exe_comm_mismatch,
+        environ=environ_blob,
+        redacted_env_keys=list(proc_info.redacted_env_keys),
+    )
+
+
+def _hex_to_bytes(hex_str: str, *, expected_len: int | None = None) -> bytes:
+    """Decode a hex string to raw bytes; return b"" on any failure.
+
+    The P1.6.1 collector stores build-ids, BTF hashes, vmcoreinfo hashes,
+    and kernel-config hashes as hex-encoded strings on ``TargetSystemInfo``.
+    The wire format (``KernelSymbolBundle`` TLV rows) carries them as raw
+    bytes, so this projection is the only place they are decoded.
+
+    When ``expected_len`` is given, the decoded byte string must be
+    exactly that long; otherwise the helper returns ``b""`` rather than
+    silently emitting a wrong-length TLV row. SHA-256 fields pass
+    ``expected_len=32``. The ``kernel_build_id`` field is variable-length
+    (typically 20 for SHA-1 builds, 16 for MD5 legacy builds) and does
+    not pass this parameter.
+    """
+    if not hex_str:
+        return b""
+    try:
+        raw = bytes.fromhex(hex_str)
+    except ValueError:
+        return b""
+    if expected_len is not None and len(raw) != expected_len:
+        return b""
+    return raw
+
+
+def _build_kernel_symbol_bundle(sys_info) -> KernelSymbolBundle:
+    """Project a :class:`TargetSystemInfo` onto a :class:`KernelSymbolBundle`
+    for wire emission (P1.6.1, Block 0x0055).
+
+    Every field in the bundle corresponds one-for-one to a
+    ``TargetSystemInfo`` attribute populated by the P1.6.1 collector
+    helpers. String-typed flags (``la57_enabled``, ``pti_active``,
+    ``ksm_active``, ``zswap_enabled``) are coerced from the canonical
+    ``"1"``/``"0"`` convention into the u8 wire slot; hex fields are
+    decoded via :func:`_hex_to_bytes`.
+    """
+    def _str_flag_to_u8(value: str) -> int:
+        return 1 if value == "1" else 0
+
+    return KernelSymbolBundle(
+        page_size=sys_info.page_size,
+        kernel_build_id=_hex_to_bytes(sys_info.kernel_build_id),
+        kaslr_text_va=sys_info.kaslr_text_va,
+        kernel_page_offset=sys_info.kernel_page_offset,
+        la57_enabled=_str_flag_to_u8(sys_info.la57_enabled),
+        pti_active=_str_flag_to_u8(sys_info.pti_active),
+        btf_sha256=_hex_to_bytes(sys_info.btf_sha256, expected_len=32),
+        btf_size_bytes=sys_info.btf_size_bytes,
+        vmcoreinfo_sha256=_hex_to_bytes(sys_info.vmcoreinfo_sha256, expected_len=32),
+        kernel_config_sha256=_hex_to_bytes(sys_info.kernel_config_sha256, expected_len=32),
+        clock_realtime_ns=sys_info.clock_realtime_ns,
+        clock_monotonic_ns=sys_info.clock_monotonic_ns,
+        clock_boottime_ns=sys_info.clock_boottime_ns,
+        clocksource=sys_info.clocksource,
+        thp_mode=sys_info.thp_mode,
+        ksm_active=_str_flag_to_u8(sys_info.ksm_active),
+        directmap_4k_kib=sys_info.directmap_4k,
+        directmap_2m_kib=sys_info.directmap_2m,
+        directmap_1g_kib=sys_info.directmap_1g,
+        zram_devices_json=sys_info.zram_devices,
+        zswap_enabled=_str_flag_to_u8(sys_info.zswap_enabled),
+    )
+
+
+def _connectivity_table_is_empty(table) -> bool:
+    """Return True when a :class:`ConnectivityTable` contains no rows of
+    any type. Used to decide whether to emit the block at all and
+    whether to set bit 4 in ``SystemContext.table_bitmap``.
+    """
+    if table is None:
+        return True
+    return not (
+        table.ipv4_routes or table.ipv6_routes or table.arp_entries
+        or table.packet_sockets or table.netdev_stats
+        or table.sockstat_families or table.snmp_counters
+    )
 
 
 def classify_region(file_path: str) -> RegionType:
@@ -211,6 +343,25 @@ class AcquisitionEngine(BaseAcquirer):
                 )
                 module_entries.append(entry)
 
+            # Live build-id extraction (Path A): reads the first 4 KiB
+            # of each module via the debugger bridge and populates
+            # ``ModuleEntry.native_blob`` + ``disk_hash``. Opt-in via
+            # ``include_module_build_ids`` — the default acquire path
+            # produces lean ModuleEntry blocks without build-ids so
+            # that a minimal process-centric slice does not pay for
+            # per-module bridge reads and SHA-256 work. Operators who
+            # need build-ids either pass the flag or run
+            # ``memslicer-enrich`` on the finished slice (Path C).
+            if module_entries and self._attribution.include_module_build_ids:
+                try:
+                    populate_from_bridge(
+                        module_entries, self._bridge, logger=self._log,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._log.warning(
+                        "build-id extraction failed: %s", exc,
+                    )
+
             # Build CapBitmap dynamically based on what will be emitted
             cap_bitmap = (1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
             if module_entries:
@@ -252,8 +403,15 @@ class AcquisitionEngine(BaseAcquirer):
 
                 try:
                     # Block 0: Process Identity (MUST be first)
+                    proc_info = None
                     if self._collector is not None:
-                        proc_info = self._collector.collect_process_identity(pid)
+                        proc_info = self._collector.collect_process_identity(
+                            pid,
+                            include_target_introspection=(
+                                self._attribution.include_target_introspection
+                            ),
+                            include_environ=self._attribution.include_environ,
+                        )
                         proc_id = ProcessIdentity(
                             ppid=proc_info.ppid,
                             session_id=proc_info.session_id,
@@ -268,7 +426,12 @@ class AcquisitionEngine(BaseAcquirer):
                         )
                     writer.write_process_identity(proc_id)
 
-                    # Block 1: Module list (before memory regions per spec)
+                    # Block 1: Module list (before memory regions per spec).
+                    # Note: TargetIntrospection (P1.6.3, Block 0x0058) used
+                    # to be emitted here between ProcessIdentity and the
+                    # module list, which violated the "ModuleListIndex MUST
+                    # be Block 1" rule. It now lands after SystemContext
+                    # among the other P1.6 extension blocks.
                     if module_entries:
                         writer.write_module_list(module_entries)
 
@@ -288,6 +451,33 @@ class AcquisitionEngine(BaseAcquirer):
                             connection_table = self._collect_connection_table()
                             handle_table = self._collect_handle_table(pid)
 
+                        # System-context extension block collection. These
+                        # must be materialized BEFORE ``SystemContext`` is
+                        # written so ``table_bitmap`` can include the bits
+                        # for any extension block that will actually appear
+                        # in the slice. Collector calls return empty values
+                        # when the platform is not Linux.
+                        if self._collector is not None:
+                            connectivity_table = self._collector.collect_connectivity_table()
+                        else:
+                            connectivity_table = None
+
+                        # KernelModuleList is opt-in: memslicer is
+                        # process-centric and kernel-wide enumeration is
+                        # irrelevant to the default per-target workflow.
+                        if (
+                            self._attribution.include_kernel_modules
+                            and self._collector is not None
+                        ):
+                            kernel_module_list = self._collector.collect_kernel_module_list()
+                        else:
+                            kernel_module_list = None
+
+                        if self._attribution.include_persistence_manifest and self._collector is not None:
+                            persistence_manifest = self._collector.collect_persistence_manifest()
+                        else:
+                            persistence_manifest = None
+
                         table_bitmap = 0
                         if process_table:
                             table_bitmap |= 0x01  # bit 0 = ProcessTable
@@ -298,6 +488,39 @@ class AcquisitionEngine(BaseAcquirer):
                         if handle_table:
                             table_bitmap |= 0x04  # bit 2 = HandleTable
                             cap_bitmap |= (1 << CapBit.SystemHandleTable)
+                        # System-context extension-block bits. All
+                        # bits are opt-in (default off) to keep the
+                        # process-centric acquire path lean.
+                        # KernelSymbolBundle (bit 4) depends on
+                        # ``sys_info`` which is collected below, so its
+                        # bit is applied after the ``sys_info`` block.
+                        # ConnectivityTable (bit 3), KernelModuleList
+                        # (bit 7), PersistenceManifest (bit 6), and
+                        # TargetIntrospection (bit 9) are set here when
+                        # their operator flag is enabled and the source
+                        # data is available. Bit 5 (PhysicalMemoryMap)
+                        # and bit 8 (ModuleBuildIdManifest) are reserved
+                        # and never set by the acquire path: the
+                        # physical memory map is orthogonal to the
+                        # process-centric acquisition model, and the
+                        # build-ID manifest is produced only by the
+                        # separate ``memslicer-enrich`` overlay tool.
+                        if not _connectivity_table_is_empty(connectivity_table):
+                            table_bitmap |= 0x08  # bit 3 = ConnectivityTable
+                        # PersistenceManifest (bit 6) tracks the operator
+                        # opt-in flag rather than row presence: the flag
+                        # means "emit the block", and an empty manifest is
+                        # a valid positive signal (the host had no files
+                        # under the scanned persistence roots).
+                        if persistence_manifest is not None:
+                            table_bitmap |= 0x40  # bit 6
+                        if kernel_module_list is not None and kernel_module_list.rows:
+                            table_bitmap |= 0x80  # bit 7
+                        if (
+                            proc_info is not None
+                            and self._attribution.include_target_introspection
+                        ):
+                            table_bitmap |= 0x200  # bit 9 = TargetIntrospection
 
                         # Update header cap_bitmap before writing tables
                         header.cap_bitmap = cap_bitmap
@@ -342,6 +565,7 @@ class AcquisitionEngine(BaseAcquirer):
                                 include_serials=attribution.include_serials,
                                 include_network_identity=attribution.include_network_identity,
                                 include_fingerprint=attribution.include_fingerprint,
+                                include_kernel_symbols=attribution.include_kernel_symbols,
                             )
                             collector_warnings = list(sys_info.collector_warnings)
                         else:
@@ -356,6 +580,21 @@ class AcquisitionEngine(BaseAcquirer):
 
                         os_detail_packed = pack_os_detail(fields)
 
+                        # KernelSymbolBundle (Block 0x0055). Gated on
+                        # the ``include_kernel_symbols`` attribution flag
+                        # (opt-in). The bundle is built when the flag is
+                        # set so the slice carries symbolication anchors
+                        # even when the collector could only partially
+                        # populate them; readers discover missing data
+                        # via the TLV skip-zero contract.
+                        kernel_symbol_bundle = None
+                        if (
+                            sys_info is not None
+                            and attribution.include_kernel_symbols
+                        ):
+                            kernel_symbol_bundle = _build_kernel_symbol_bundle(sys_info)
+                            table_bitmap |= 0x10  # bit 4 = KernelSymbolBundle
+
                         sys_ctx = SystemContext(
                             boot_time=boot_time,
                             target_count=1,
@@ -368,7 +607,39 @@ class AcquisitionEngine(BaseAcquirer):
                         )
                         sys_ctx_uuid = writer.write_system_context(sys_ctx)
 
-                        # Write table blocks referencing SystemContext as parent
+                        # P1.6 extension blocks, emitted immediately after
+                        # SystemContext so they share the investigation
+                        # scope. Ordering within this group is flexible
+                        # (readers do not depend on it); we emit
+                        # system-wide blocks first, then the per-target
+                        # TargetIntrospection, then the classic
+                        # Process/Connection/Handle tables.
+                        if kernel_symbol_bundle is not None:
+                            writer.write_kernel_symbol_bundle(kernel_symbol_bundle)
+                        if not _connectivity_table_is_empty(connectivity_table):
+                            writer.write_connectivity_table(connectivity_table)
+                        if kernel_module_list is not None and kernel_module_list.rows:
+                            writer.write_kernel_module_list(kernel_module_list)
+                        if persistence_manifest is not None:
+                            writer.write_persistence_manifest(persistence_manifest)
+
+                        # P1.6.3 — TargetIntrospection (Block 0x0058).
+                        # Per-target metadata; kept separate from the
+                        # system-wide P1.6 blocks above. This used to be
+                        # emitted between ProcessIdentity and
+                        # ModuleListIndex which violated the
+                        # "ModuleListIndex MUST be Block 1" rule; it now
+                        # lands in the investigation section.
+                        if (
+                            proc_info is not None
+                            and self._attribution.include_target_introspection
+                        ):
+                            writer.write_target_introspection(
+                                _build_target_introspection(proc_info, pid),
+                            )
+
+                        # Write classic table blocks referencing
+                        # SystemContext as parent.
                         if process_table:
                             writer.write_process_table(process_table, parent_uuid=sys_ctx_uuid)
                         if connection_table:

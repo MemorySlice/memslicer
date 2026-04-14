@@ -24,8 +24,12 @@ from memslicer.acquirer.os_detail import (
     pack_os_detail,
     parse_os_detail,
     system_info_to_fields,
+    target_info_to_fields,
 )
-from memslicer.acquirer.investigation import TargetSystemInfo
+from memslicer.acquirer.investigation import (
+    TargetProcessInfo,
+    TargetSystemInfo,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -331,3 +335,149 @@ class TestFingerprintGate:
         opened_packed = pack_os_detail(opened)
         assert "google/raven" not in closed_packed
         assert "google/raven" in opened_packed
+
+
+# ---------------------------------------------------------------------------
+# Projector: P1.6.2 module / loader posture fields
+# ---------------------------------------------------------------------------
+
+
+class TestP162LoaderFields:
+    def test_ld_so_preload_projected(self) -> None:
+        sys_info = TargetSystemInfo(ld_so_preload="/lib/libevil.so")
+        fields = system_info_to_fields(sys_info)
+        assert fields.get("ld_so_preload") == "/lib/libevil.so"
+
+    def test_module_loader_fields_projected(self) -> None:
+        sys_info = TargetSystemInfo(
+            ld_so_preload="/tmp/shim.so",
+            kernel_lockdown="integrity",
+            modules_disabled="0",
+            module_sig_enforce="1",
+        )
+        fields = system_info_to_fields(sys_info)
+        assert fields["ld_so_preload"] == "/tmp/shim.so"
+        assert fields["kernel_lockdown"] == "integrity"
+        assert fields["modules_disabled"] == "0"
+        assert fields["module_sig_enforce"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# P1.6.3 — target_info_to_fields projector
+# ---------------------------------------------------------------------------
+
+
+class TestP163TargetInfoProjector:
+
+    def test_target_info_to_fields_projects_populated(self) -> None:
+        info = TargetProcessInfo(
+            ppid=10,
+            exe_path="/usr/bin/target",
+            tracer_pid=1234,
+            login_uid=1000,
+            selinux_context="system_u:system_r:init_t:s0",
+            smaps_rollup_pss_kib=51200,
+            rwx_region_count=3,
+            target_cgroup="/user.slice/foo",
+            cap_eff="0000003fffffffff",
+            no_new_privs=1,
+            seccomp_mode=2,
+            thread_count=9,
+            ancestry="10:parent:1000,1:init:0",
+            exe_comm_mismatch=1,
+        )
+        fields = target_info_to_fields(info)
+        assert fields["target_ppid"] == 10
+        assert fields["target_exe_path"] == "/usr/bin/target"
+        assert fields["target_tracer_pid"] == 1234
+        assert fields["target_login_uid"] == 1000
+        assert fields["target_selinux_context"] == "system_u:system_r:init_t:s0"
+        assert fields["target_smaps_rollup_pss_kib"] == 51200
+        assert fields["target_rwx_region_count"] == 3
+        assert fields["target_target_cgroup"] == "/user.slice/foo"
+        assert fields["target_cap_eff"] == "0000003fffffffff"
+        assert fields["target_no_new_privs"] == 1
+        assert fields["target_seccomp_mode"] == 2
+        assert fields["target_thread_count"] == 9
+        assert fields["target_ancestry"] == "10:parent:1000,1:init:0"
+        assert fields["target_exe_comm_mismatch"] == 1
+
+    def test_target_info_to_fields_skips_empty_and_zero(self) -> None:
+        info = TargetProcessInfo()  # all defaults
+        fields = target_info_to_fields(info)
+        assert fields == {}
+
+
+# ---------------------------------------------------------------------------
+# P1.6.4 — new projector keys
+# ---------------------------------------------------------------------------
+
+
+class TestP164Projectors:
+    """Verify the 26 P1.6.4 fields reach the projected dict."""
+
+    def test_p164_sysctls_projected(self) -> None:
+        info = TargetSystemInfo()
+        info.kptr_restrict = "2"
+        info.dmesg_restrict = "1"
+        info.perf_event_paranoid = "3"
+        info.unprivileged_bpf_disabled = "1"
+        info.unprivileged_userns_clone = "0"
+        info.kexec_load_disabled = "1"
+        info.sysrq_state = "176"
+        info.core_pattern = "|/usr/bin/apport"
+        info.suid_dumpable = "0"
+        info.protected_symlinks = "1"
+        info.protected_hardlinks = "1"
+        info.protected_fifos = "1"
+        info.protected_regular = "2"
+        info.bpf_jit_enable = "1"
+        fields = system_info_to_fields(info)
+        assert fields["kptr_restrict"] == "2"
+        assert fields["dmesg_restrict"] == "1"
+        assert fields["perf_event_paranoid"] == "3"
+        assert fields["unprivileged_bpf_disabled"] == "1"
+        assert fields["unprivileged_userns_clone"] == "0"
+        assert fields["kexec_load_disabled"] == "1"
+        assert fields["sysrq_state"] == "176"
+        assert fields["core_pattern"] == "|/usr/bin/apport"
+        assert fields["suid_dumpable"] == "0"
+        assert fields["protected_symlinks"] == "1"
+        assert fields["protected_hardlinks"] == "1"
+        assert fields["protected_fifos"] == "1"
+        assert fields["protected_regular"] == "2"
+        assert fields["bpf_jit_enable"] == "1"
+
+    def test_p164_auth_log_fields_projected(self) -> None:
+        info = TargetSystemInfo()
+        info.taint_decoded = "F,O,E"
+        info.kexec_loaded = "1"
+        info.wtmp_size = 4096
+        info.wtmp_mtime_ns = 1_700_000_000_000_000_000
+        info.utmp_size = 384
+        info.btmp_size = 768
+        info.lastlog_size = 5000
+        info.hidden_pid_count = 2
+        fields = system_info_to_fields(info)
+        assert fields["taint_decoded"] == "F,O,E"
+        assert fields["kexec_loaded"] == "1"
+        assert fields["wtmp_size"] == 4096
+        assert fields["wtmp_mtime_ns"] == 1_700_000_000_000_000_000
+        assert fields["utmp_size"] == 384
+        assert fields["btmp_size"] == 768
+        assert fields["lastlog_size"] == 5000
+        assert fields["hidden_pid_count"] == 2
+
+    def test_p164_audit_state_projected(self) -> None:
+        info = TargetSystemInfo()
+        info.audit_state = "running"
+        info.audit_rules_count = 42
+        info.journald_storage = "persistent"
+        info.ntp_sync = "yes"
+        info.cpu_vuln_digest = "abcdef0123456789"
+        fields = system_info_to_fields(info)
+        assert fields["audit_state"] == "running"
+        assert fields["audit_rules_count"] == 42
+        assert fields["journald_storage"] == "persistent"
+        assert fields["ntp_sync"] == "yes"
+        assert fields["cpu_vuln_digest"] == "abcdef0123456789"

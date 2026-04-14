@@ -234,6 +234,25 @@ class AttributionConfig:
     include_serials: bool = False
     include_network_identity: bool = False
     include_fingerprint: bool = False
+    # Kernel posture is opt-in: memslicer is process-centric and the
+    # kernel-wide blocks (KernelSymbolBundle, KernelModuleList) are not
+    # needed for the default per-target workflow.
+    include_kernel_symbols: bool = False        # opt-in
+    include_kernel_modules: bool = False        # opt-in
+    # Live per-ModuleEntry build-id extraction (Path A via bridge read
+    # of each module's first page). Feeds ModuleEntry.native_blob and
+    # disk_hash. The retroactive ModuleBuildIdManifest (Block 0x005A)
+    # is produced only by ``memslicer-enrich``; this flag gates the
+    # live acquire path only.
+    include_module_build_ids: bool = False      # opt-in
+    # Per-target introspection gates. Opt-in: the default produces a
+    # lean per-target slice containing only the Process Identity block.
+    # Callers that need TracerPid, audit posture, namespace
+    # fingerprints, cgroup, ancestry etc. must enable this flag.
+    include_target_introspection: bool = False  # opt-in
+    include_environ: bool = False               # opt-in (credentials leak)
+    # Persistence manifest gate.
+    include_persistence_manifest: bool = False  # opt-in
 
 
 def validate_attribution(
@@ -246,6 +265,12 @@ def validate_attribution(
     include_serials: bool = False,
     include_network_identity: bool = False,
     include_fingerprint: bool = False,
+    include_kernel_symbols: bool = False,
+    include_kernel_modules: bool = False,
+    include_module_build_ids: bool = False,
+    include_target_introspection: bool = False,
+    include_environ: bool = False,
+    include_persistence_manifest: bool = False,
 ) -> AttributionConfig:
     """Run :func:`validate_forensic_string` on each operator-supplied string.
 
@@ -265,6 +290,12 @@ def validate_attribution(
         include_serials=include_serials,
         include_network_identity=include_network_identity,
         include_fingerprint=include_fingerprint,
+        include_kernel_symbols=include_kernel_symbols,
+        include_kernel_modules=include_kernel_modules,
+        include_module_build_ids=include_module_build_ids,
+        include_target_introspection=include_target_introspection,
+        include_environ=include_environ,
+        include_persistence_manifest=include_persistence_manifest,
     )
 
 
@@ -317,6 +348,67 @@ def attribution_options(func: _F) -> _F:
     import click  # local import — identity.py stays importable without click
 
     options = [
+        click.option(
+            "--include-persistence-manifest", "include_persistence_manifest",
+            is_flag=True, default=False,
+            help=(
+                "Emit the PersistenceManifest block listing systemd units, "
+                "cron entries, and other persistence paths (names+mtime+size "
+                "only; no content). May leak application inventory; default: off."
+            ),
+        ),
+        click.option(
+            "--include-environ", "include_environ",
+            is_flag=True, default=False,
+            help=(
+                "Emit /proc/<pid>/environ in TargetIntrospection "
+                "(may leak credentials; default: off)"
+            ),
+        ),
+        click.option(
+            "--include-target-introspection/--no-include-target-introspection",
+            "include_target_introspection",
+            default=False,
+            help=(
+                "Collect per-target process introspection "
+                "(TracerPid, loginuid, SELinux context, smaps, cgroup, "
+                "ancestry, etc.) and emit the TargetIntrospection block "
+                "(default: off)"
+            ),
+        ),
+        click.option(
+            "--include-module-build-ids/--no-include-module-build-ids",
+            "include_module_build_ids",
+            default=False,
+            help=(
+                "Live build-id extraction: read the first 4 KiB of each "
+                "loaded module through the debugger bridge and populate "
+                "ModuleEntry build-ids and per-module disk hashes "
+                "(default: off). The retroactive ModuleBuildIdManifest "
+                "overlay block is produced separately by memslicer-enrich."
+            ),
+        ),
+        click.option(
+            "--include-kernel-symbols/--no-include-kernel-symbols",
+            "include_kernel_symbols",
+            default=False,
+            help=(
+                "Emit kernel symbolication anchors in os_detail and the "
+                "KernelSymbolBundle block "
+                "(page_size, build_id, KASLR base, BTF hash, clocks; "
+                "default: off, memslicer is process-centric)"
+            ),
+        ),
+        click.option(
+            "--include-kernel-modules/--no-include-kernel-modules",
+            "include_kernel_modules",
+            default=False,
+            help=(
+                "Emit the KernelModuleList block enumerating loaded kernel "
+                "modules from /proc/modules and /sys/module "
+                "(default: off, memslicer is process-centric)"
+            ),
+        ),
         click.option(
             "--include-fingerprint", "include_fingerprint",
             is_flag=True, default=False,

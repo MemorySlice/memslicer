@@ -4,7 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from memslicer.msl.types import ProcessEntry, ConnectionEntry, HandleEntry
+from memslicer.msl.types import (
+    ProcessEntry, ConnectionEntry, HandleEntry, ConnectivityTable,
+    KernelModuleList, PersistenceManifest,
+)
 
 
 @dataclass
@@ -20,6 +23,45 @@ class TargetProcessInfo:
     # from it (argv[0].split(":")[0]). Other platforms leave these empty.
     process_name: str = ""
     package: str = ""
+
+    # ------------------------------------------------------------------
+    # P1.6.3: per-target introspection (gated by
+    # ``include_target_introspection``; Linux-primary, other collectors
+    # leave them at empty/zero defaults).
+    # ------------------------------------------------------------------
+    tracer_pid: int = 0
+    login_uid: int = 0
+    session_audit_id: int = 0
+    selinux_context: str = ""
+    target_ns_fingerprint: str = ""
+    target_ns_scope_vs_collector: str = ""
+    smaps_rollup_pss_kib: int = 0
+    smaps_rollup_swap_kib: int = 0
+    smaps_anon_hugepages_kib: int = 0
+    rwx_region_count: int = 0
+    target_cgroup: str = ""
+    target_cwd: str = ""
+    target_root: str = ""
+    cap_eff: str = ""
+    cap_amb: str = ""
+    no_new_privs: int = 0           # 0 or 1
+    seccomp_mode: int = 0           # 0=disabled, 1=strict, 2=filter
+    core_dumping: int = 0           # 0 or 1
+    thread_count: int = 0
+    sig_cgt: str = ""
+    io_rchar: int = 0
+    io_wchar: int = 0
+    io_read_bytes: int = 0
+    io_write_bytes: int = 0
+    limit_core: str = ""
+    limit_memlock: str = ""
+    limit_nofile: str = ""
+    personality_hex: str = ""
+    ancestry: str = ""
+    exe_comm_mismatch: int = 0      # 0 or 1
+    # Privacy-gated (``include_environ``)
+    environ: str = ""
+    redacted_env_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +144,94 @@ class TargetSystemInfo:
     root_method: str = ""           # advisory: "magisk" / "kernelsu" / "apatch" / "zygisk" / ""
 
     # ------------------------------------------------------------------
+    # Enrichment: Linux kernel/posture (P1.5 — Linux-specific).
+    # All additive; other platforms leave them empty.
+    # ------------------------------------------------------------------
+    kernel_cmdline: str = ""          # /proc/cmdline
+    kernel_tainted: str = ""          # /proc/sys/kernel/tainted (decimal)
+    lsm_stack: str = ""               # /sys/kernel/security/lsm (comma list)
+    yama_ptrace_scope: str = ""       # /proc/sys/kernel/yama/ptrace_scope (0-3)
+    aslr_mode: str = ""               # /proc/sys/kernel/randomize_va_space (0/1/2)
+    efi_mode: str = ""                # "1" if /sys/firmware/efi/ exists else ""
+    collector_caps: str = ""          # hex CapEff from /proc/self/status (or Win token)
+    container_scope: str = ""         # "host" / "container" / "partial" / ""
+    container_runtime: str = ""       # "docker" / "podman" / "lxc" / "kubernetes" / ""
+    ns_fingerprint: str = ""          # comma-separated ns inodes
+
+    # ------------------------------------------------------------------
+    # Enrichment: memory-forensics anchors (P1.6.1 — Linux-primary).
+    # All additive; other platforms leave them empty/zero. See
+    # :class:`memslicer.msl.types.KernelSymbolBundle` for the wire-level
+    # counterpart written by ``write_kernel_symbol_bundle``.
+    # ------------------------------------------------------------------
+    page_size: int = 0
+    kernel_build_id: str = ""
+    kaslr_text_va: int = 0
+    kernel_page_offset: int = 0
+    la57_enabled: str = ""              # "1" / "0" / ""
+    pti_active: str = ""                # "1" / "0" / ""
+    btf_sha256: str = ""
+    btf_size_bytes: int = 0
+    vmcoreinfo_sha256: str = ""
+    vmcoreinfo_present: str = ""        # "1" / "0" / ""
+    kernel_config_sha256: str = ""
+    clock_realtime_ns: int = 0
+    clock_monotonic_ns: int = 0
+    clock_boottime_ns: int = 0
+    clocksource: str = ""
+    zram_devices: str = ""              # comma-separated "name:size:algo"
+    zswap_enabled: str = ""             # "1" / "0" / ""
+    thp_mode: str = ""                  # "always" / "madvise" / "never"
+    ksm_active: str = ""                # "1" / "0" / ""
+    directmap_4k: int = 0               # KiB (from /proc/meminfo)
+    directmap_2m: int = 0
+    directmap_1g: int = 0
+    physmem_ranges: list[tuple[int, int, str]] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Enrichment: module / loader posture (P1.6.2 — Linux-primary).
+    # ------------------------------------------------------------------
+    ld_so_preload: str = ""           # /etc/ld.so.preload content
+    kernel_lockdown: str = ""         # "none" / "integrity" / "confidentiality" / ""
+    modules_disabled: str = ""        # "1" / "0" / ""
+    module_sig_enforce: str = ""      # "1" / "0" / ""
+
+    # ------------------------------------------------------------------
+    # P1.6.4: rootkit / anti-forensics / sysctl posture
+    # (Linux-primary; other collectors leave them empty).
+    # ------------------------------------------------------------------
+    # Decoded kernel posture (derived from ``kernel_tainted``).
+    taint_decoded: str = ""              # letter-encoded, e.g. "F,O,E"
+    kexec_loaded: str = ""               # "1" / "0" / ""
+    wtmp_size: int = 0
+    wtmp_mtime_ns: int = 0
+    utmp_size: int = 0
+    btmp_size: int = 0
+    lastlog_size: int = 0
+    hidden_pid_count: int = 0
+    # Security sysctls.
+    kptr_restrict: str = ""
+    dmesg_restrict: str = ""
+    perf_event_paranoid: str = ""
+    unprivileged_bpf_disabled: str = ""
+    unprivileged_userns_clone: str = ""
+    kexec_load_disabled: str = ""
+    sysrq_state: str = ""
+    core_pattern: str = ""
+    suid_dumpable: str = ""
+    protected_symlinks: str = ""
+    protected_hardlinks: str = ""
+    protected_fifos: str = ""
+    protected_regular: str = ""
+    bpf_jit_enable: str = ""
+    # auditd / journald / time / CPU-vulnerabilities posture.
+    audit_state: str = ""                # "running" / "absent" / ""
+    audit_rules_count: int = 0
+    journald_storage: str = ""           # "persistent" / "volatile" / "none" / "auto" / ""
+    ntp_sync: str = ""                   # "yes" / "no" / "unknown" / ""
+    cpu_vuln_digest: str = ""            # 16 hex chars (first 8 bytes of SHA256)
+
+    # ------------------------------------------------------------------
     # Provenance (populated by engine / cli_sysctx, not collectors).
     # ------------------------------------------------------------------
     mode: str = ""                       # "safe" / "deep"
@@ -119,8 +249,24 @@ class InvestigationCollector(Protocol):
     fields that cannot be collected on the current platform.
     """
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
-        """Collect identity metadata for the target process."""
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
+        """Collect identity metadata for the target process.
+
+        P1.6.3 keyword arguments:
+
+        - ``include_target_introspection`` (default ``True``): opt-out
+          for the per-target introspection harvest (TracerPid, loginuid,
+          SELinux context, smaps rollup, cgroup, ancestry, …).
+        - ``include_environ`` (default ``False``): opt-in for
+          ``/proc/<pid>/environ`` emission (may leak credentials; the
+          collector applies the shared redaction heuristic regardless).
+        """
         ...
 
     def collect_system_info(self) -> TargetSystemInfo:
@@ -137,4 +283,34 @@ class InvestigationCollector(Protocol):
 
     def collect_handle_table(self, pid: int) -> list[HandleEntry]:
         """Enumerate open file handles for a process. Returns empty list on failure."""
+        ...
+
+    def collect_kernel_module_list(self) -> KernelModuleList:
+        """Collect loaded kernel modules (``/proc/modules`` + ``/sys/module``).
+
+        Returns an empty :class:`KernelModuleList` on platforms that
+        don't implement it. Linux populates rows from both sources and
+        flags skew between them for LKM-rootkit detection.
+        """
+        ...
+
+    def collect_connectivity_table(self) -> ConnectivityTable:
+        """Collect kernel network state (routes, ARP, packet sockets, etc.).
+
+        Returns an empty ConnectivityTable on platforms that don't
+        implement it. Linux collectors populate it from /proc/net/*;
+        other platforms return a default-constructed instance.
+        """
+        ...
+
+    def collect_persistence_manifest(self) -> PersistenceManifest:
+        """Collect a filesystem persistence manifest (P1.6.4, Block 0x0056).
+
+        Walks top-level filesystem persistence paths (systemd, cron,
+        profile.d, pam.d, udev, modprobe, modules, rc_local) and emits
+        one row per entry with names + mtime + size + mode only — no
+        content reads. Linux-primary; other platforms return an empty
+        :class:`PersistenceManifest`. Gated behind
+        ``--include-persistence-manifest``.
+        """
         ...

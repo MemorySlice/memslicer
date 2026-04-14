@@ -102,6 +102,14 @@ class BlockType(IntEnum):
     ProcessTable = 0x0051
     ConnectionTable = 0x0052
     HandleTable = 0x0053
+    ConnectivityTable = 0x0054
+    KernelSymbolBundle = 0x0055
+    PersistenceManifest = 0x0056
+    KernelModuleList = 0x0057
+    TargetIntrospection = 0x0058
+    # Non-spec extension blocks (outside the 0x0054-0x0058 spec range).
+    PhysicalMemoryMap = 0x0059
+    ModuleBuildIdManifest = 0x005A
     EndOfCapture = 0x0FFF
     VASMap = 0x1001
     PointerGraph = 0x1003

@@ -127,6 +127,7 @@ def _collect_all(
         include_serials=attribution.include_serials,
         include_network_identity=attribution.include_network_identity,
         include_fingerprint=attribution.include_fingerprint,
+        include_kernel_symbols=attribution.include_kernel_symbols,
     )
     collector_warnings = list(sys_info.collector_warnings)
     collector_warnings.extend(identity.warnings)
@@ -158,7 +159,13 @@ def _collect_all(
     handle_table: list[dict[str, Any]] = []
     if target_pid is not None:
         try:
-            pi = collector.collect_process_identity(target_pid)
+            pi = collector.collect_process_identity(
+                target_pid,
+                include_target_introspection=(
+                    attribution.include_target_introspection
+                ),
+                include_environ=attribution.include_environ,
+            )
             process_identity = asdict(pi) if is_dataclass(pi) else dict(pi)
         except Exception as exc:  # noqa: BLE001
             logger.warning("collect_process_identity raised: %s", exc)
@@ -461,6 +468,12 @@ def main(
     include_serials: bool,
     include_network_identity: bool,
     include_fingerprint: bool,
+    include_kernel_symbols: bool,
+    include_kernel_modules: bool,
+    include_module_build_ids: bool,
+    include_target_introspection: bool,
+    include_environ: bool,
+    include_persistence_manifest: bool,
     output_format: str | None,
     mode: str,
     strict: bool,
@@ -502,6 +515,12 @@ def main(
             include_serials=include_serials,
             include_network_identity=include_network_identity,
             include_fingerprint=include_fingerprint,
+            include_kernel_symbols=include_kernel_symbols,
+            include_kernel_modules=include_kernel_modules,
+            include_module_build_ids=include_module_build_ids,
+            include_target_introspection=include_target_introspection,
+            include_environ=include_environ,
+            include_persistence_manifest=include_persistence_manifest,
         )
     except ForensicStringError as exc:
         raise click.BadParameter(str(exc))

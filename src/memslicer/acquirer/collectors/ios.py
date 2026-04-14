@@ -11,7 +11,10 @@ import re
 
 from memslicer.acquirer.collectors.darwin import DarwinCollector
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
-from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
+from memslicer.msl.types import (
+    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
+    KernelModuleList, PersistenceManifest,
+)
 
 
 class IOSCollector(DarwinCollector):
@@ -45,13 +48,24 @@ class IOSCollector(DarwinCollector):
         # Roothide enumerates a glob pattern rather than a fixed path.
         self._roothide_glob: str = "/var/containers/Bundle/Application/.jbroot-*"
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
         """Collect process identity with sandbox-aware fallbacks.
 
         On stock iOS, ps may not be available. Falls back to
-        sysctl where possible.
+        sysctl where possible. P1.6.3 kwargs are forwarded to the
+        Darwin base class; that base ignores them.
         """
-        info = super().collect_process_identity(pid)
+        info = super().collect_process_identity(
+            pid,
+            include_target_introspection=include_target_introspection,
+            include_environ=include_environ,
+        )
 
         # If ps failed (stock iOS), try sysctl for basic info
         if not info.exe_path:
@@ -149,6 +163,18 @@ class IOSCollector(DarwinCollector):
                 "Jailbroken device required for network enumeration."
             )
         return entries
+
+    def collect_connectivity_table(self) -> ConnectivityTable:
+        """Not implemented on iOS -- returns empty ConnectivityTable."""
+        return ConnectivityTable()
+
+    def collect_kernel_module_list(self) -> KernelModuleList:
+        """Not implemented on iOS -- returns empty KernelModuleList."""
+        return KernelModuleList()
+
+    def collect_persistence_manifest(self) -> PersistenceManifest:
+        """Not implemented on iOS -- returns empty PersistenceManifest."""
+        return PersistenceManifest()
 
     def collect_handle_table(self, pid: int) -> list[HandleEntry]:
         """Enumerate handles. May be limited by sandbox."""

@@ -272,7 +272,11 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         verbose, read_timeout, include_unreadable, max_region_size, investigation,
         encrypt, no_encrypt, passphrase,
         examiner, case_ref, hostname_override, domain_override,
-        include_serials, include_network_identity, include_fingerprint):
+        include_serials, include_network_identity, include_fingerprint,
+        include_kernel_symbols, include_kernel_modules,
+        include_module_build_ids,
+        include_target_introspection, include_environ,
+        include_persistence_manifest):
     """Dump process memory to MSL format.
 
     TARGET is a PID (integer) or process name (string).
@@ -298,6 +302,12 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
             include_serials=include_serials,
             include_network_identity=include_network_identity,
             include_fingerprint=include_fingerprint,
+            include_kernel_symbols=include_kernel_symbols,
+            include_kernel_modules=include_kernel_modules,
+            include_module_build_ids=include_module_build_ids,
+            include_target_introspection=include_target_introspection,
+            include_environ=include_environ,
+            include_persistence_manifest=include_persistence_manifest,
         )
     except ForensicStringError as exc:
         raise click.BadParameter(str(exc))

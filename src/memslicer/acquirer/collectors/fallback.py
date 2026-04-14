@@ -4,7 +4,10 @@ from __future__ import annotations
 import logging
 
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
-from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
+from memslicer.msl.types import (
+    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
+    KernelModuleList, PersistenceManifest,
+)
 
 
 class NullCollector:
@@ -19,7 +22,13 @@ class NullCollector:
         self._log = logger or logging.getLogger("memslicer")
         self._log.warning("Using NullCollector: investigation data will be minimal")
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
         return TargetProcessInfo()
 
     def collect_system_info(self) -> TargetSystemInfo:
@@ -33,3 +42,14 @@ class NullCollector:
 
     def collect_handle_table(self, pid: int) -> list[HandleEntry]:
         return []
+
+    def collect_connectivity_table(self) -> ConnectivityTable:
+        return ConnectivityTable()
+
+    def collect_kernel_module_list(self) -> KernelModuleList:
+        """Not implemented on unsupported platforms — returns empty list."""
+        return KernelModuleList()
+
+    def collect_persistence_manifest(self) -> PersistenceManifest:
+        """Not implemented on unsupported platforms — returns empty manifest."""
+        return PersistenceManifest()

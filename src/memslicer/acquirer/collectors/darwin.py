@@ -9,7 +9,10 @@ import subprocess
 from datetime import datetime
 
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
-from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
+from memslicer.msl.types import (
+    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
+    KernelModuleList, PersistenceManifest,
+)
 
 from memslicer.acquirer.collectors._io import read_symlink
 from memslicer.acquirer.collectors.constants import (
@@ -59,8 +62,20 @@ class DarwinCollector:
     # Public API
     # ------------------------------------------------------------------
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
-        """Collect process identity via ps command."""
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
+        """Collect process identity via ps command.
+
+        The P1.6.3 ``include_target_introspection`` / ``include_environ``
+        kwargs are accepted for protocol compatibility but currently
+        ignored — macOS introspection harvest is not implemented in
+        this sub-phase. Linux-only fields stay at their empty defaults.
+        """
         info = TargetProcessInfo()
 
         # Single ps call for all fields; lstart has spaces so we use careful parsing
@@ -175,6 +190,18 @@ class DarwinCollector:
 
         self._log.info("Collected %d connection entries", len(entries))
         return entries
+
+    def collect_connectivity_table(self) -> ConnectivityTable:
+        """Not implemented on Darwin -- returns empty ConnectivityTable."""
+        return ConnectivityTable()
+
+    def collect_kernel_module_list(self) -> KernelModuleList:
+        """Not implemented on Darwin -- returns empty KernelModuleList."""
+        return KernelModuleList()
+
+    def collect_persistence_manifest(self) -> PersistenceManifest:
+        """Not implemented on Darwin -- returns empty PersistenceManifest."""
+        return PersistenceManifest()
 
     def collect_handle_table(self, pid: int) -> list[HandleEntry]:
         """Enumerate file handles via lsof -p."""

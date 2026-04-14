@@ -1,6 +1,7 @@
 """Shared constants for investigation collectors."""
 
 # Address family
+AF_UNIX = 0x01
 AF_INET = 0x02
 AF_INET6 = 0x0A
 

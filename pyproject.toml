@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 memslicer = "memslicer.cli:cli"
 memslicer-sysctx = "memslicer.cli_sysctx:main"
+memslicer-enrich = "memslicer.cli_enrich:main"
 
 [project.optional-dependencies]
 dev = [

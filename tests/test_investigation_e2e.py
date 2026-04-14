@@ -37,7 +37,7 @@ from memslicer.msl.constants import (
 # ---------------------------------------------------------------------------
 # Constants for parsing
 # ---------------------------------------------------------------------------
-SYSCTX_FIXED_HEADER_SIZE = 32  # 8+4+4+2+2+2+2+2+6
+SYSCTX_FIXED_HEADER_SIZE = 32  # 8+1+4+2+2+2+2+2+9
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ class MockBridge:
 # MockCollector for PART 3
 # ---------------------------------------------------------------------------
 class MockCollector:
-    def collect_process_identity(self, pid):
+    def collect_process_identity(self, pid, **kwargs):
         from memslicer.acquirer.investigation import TargetProcessInfo
         return TargetProcessInfo(ppid=500, session_id=7, start_time_ns=1700000000_000000000,
                                 exe_path="/opt/app/server", cmd_line="/opt/app/server --port 8080")
@@ -251,7 +251,7 @@ def main() -> int:
                 (boot_time, target_count, table_bitmap,
                  acq_user_len, hostname_len, domain_len,
                  os_detail_len, case_ref_len, _reserved6) = struct.unpack_from(
-                    "<QIIHHHHH6s", sc_payload, 0,
+                    "<QBIHHHHH9s", sc_payload, 0,
                 )
                 # skip 2 more bytes (CaseRefLen) + 6 reserved = already parsed
 
@@ -447,7 +447,7 @@ def main() -> int:
                 (boot_time3, target_count3, table_bitmap3,
                  acq_user_len3, hostname_len3, domain_len3,
                  os_detail_len3, case_ref_len3, _reserved6_3) = struct.unpack_from(
-                    "<QIIHHHHH6s", sc_payload3, 0,
+                    "<QBIHHHHH9s", sc_payload3, 0,
                 )
 
                 all_pass &= _check("PART3: boot_time is non-zero",

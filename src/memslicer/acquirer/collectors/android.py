@@ -95,7 +95,13 @@ class AndroidCollector(LinuxCollector):
     # Public API
     # ------------------------------------------------------------------
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
         """Collect process identity with SELinux-aware fallbacks.
 
         On Android, ``/proc/<pid>/exe`` is frequently unreadable due to
@@ -108,7 +114,11 @@ class AndroidCollector(LinuxCollector):
         set to the canonical ``app_process64`` path so analysts always
         have a real binary to consult.
         """
-        info = super().collect_process_identity(pid)
+        info = super().collect_process_identity(
+            pid,
+            include_target_introspection=include_target_introspection,
+            include_environ=include_environ,
+        )
 
         if not info.exe_path and info.cmd_line:
             parts = info.cmd_line.split()

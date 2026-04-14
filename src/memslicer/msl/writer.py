@@ -14,7 +14,9 @@ from memslicer.msl.constants import (
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, KeyHint, ImportProvenance,
-    RelatedDump,
+    RelatedDump, KernelSymbolBundle, PhysicalMemoryMap, ConnectivityTable,
+    KernelModuleList, ModuleBuildIdManifest, TargetIntrospection,
+    PersistenceManifest,
 )
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.compression import compress
@@ -393,18 +395,18 @@ class MSLWriter:
         os_detail_raw = ctx.os_detail.encode("utf-8") + b"\x00" if ctx.os_detail else b"\x00"
         case_ref_raw = ctx.case_ref.encode("utf-8") + b"\x00" if ctx.case_ref else b""
 
-        # Fixed header: 32 bytes
+        # Fixed header: 32 bytes — BootTsn(8) + TCt(1) + TBm(4) + 5xLen(10) + R(9)
         payload = struct.pack(
-            "<QIIHHHHH6s",
-            ctx.boot_time,          # 8B
-            ctx.target_count,       # 4B
-            ctx.table_bitmap,       # 4B
+            "<QBIHHHHH9s",
+            ctx.boot_time,          # 8B BootTsn
+            ctx.target_count,       # 1B TCt (target count, max 255)
+            ctx.table_bitmap,       # 4B TBm (table bitmap)
             len(acq_user_raw),      # 2B AcqUserLen
             len(hostname_raw),      # 2B HostnameLen
             len(domain_raw),        # 2B DomainLen (0 if omitted)
             len(os_detail_raw),     # 2B OSDetailLen
             len(case_ref_raw),      # 2B CaseRefLen (0 if omitted)
-            b"\x00" * 6,            # 6B Reserved
+            b"\x00" * 9,            # 9B Reserved
         )
         # Variable strings (pad8 each)
         if acq_user_raw:
@@ -599,6 +601,391 @@ class MSLWriter:
         )
 
         return self._write_block(BlockType.RelatedDump, payload)
+
+    # ------------------------------------------------------------------
+    # Kernel symbol bundle (P1.6.1, Block 0x0055)
+    # ------------------------------------------------------------------
+
+    def write_kernel_symbol_bundle(self, bundle: KernelSymbolBundle) -> bytes:
+        """Write a KernelSymbolBundle block. Returns block UUID.
+
+        Tagged-row TLV payload:
+            row_count: u32
+            reserved:  u32
+            rows:      (tag u16, len u16, value bytes[len]) * row_count
+
+        Only non-zero / non-empty fields are emitted as rows.
+        """
+        rows: list[bytes] = []
+
+        def emit(tag: int, value: bytes) -> None:
+            if not value:
+                return
+            rows.append(struct.pack("<HH", tag, len(value)) + value)
+
+        def emit_u32(tag: int, v: int) -> None:
+            if v:
+                emit(tag, struct.pack("<I", v))
+
+        def emit_u64(tag: int, v: int) -> None:
+            if v:
+                emit(tag, struct.pack("<Q", v))
+
+        def emit_u8(tag: int, v: int) -> None:
+            if v:
+                emit(tag, struct.pack("<B", v))
+
+        def emit_str(tag: int, s: str) -> None:
+            if s:
+                emit(tag, s.encode("utf-8"))
+
+        emit_u32(0x0001, bundle.page_size)
+        emit(0x0002, bundle.kernel_build_id)
+        emit_u64(0x0003, bundle.kaslr_text_va)
+        emit_u64(0x0004, bundle.kernel_page_offset)
+        emit_u8(0x0005, bundle.la57_enabled)
+        emit_u8(0x0006, bundle.pti_active)
+        emit(0x0007, bundle.btf_sha256)
+        emit_u64(0x0008, bundle.btf_size_bytes)
+        emit(0x0009, bundle.vmcoreinfo_sha256)
+        emit(0x000A, bundle.kernel_config_sha256)
+        emit_u64(0x000B, bundle.clock_realtime_ns)
+        emit_u64(0x000C, bundle.clock_monotonic_ns)
+        emit_u64(0x000D, bundle.clock_boottime_ns)
+        emit_str(0x000E, bundle.clocksource)
+        emit_str(0x000F, bundle.thp_mode)
+        emit_u8(0x0010, bundle.ksm_active)
+        emit_u64(0x0011, bundle.directmap_4k_kib)
+        emit_u64(0x0012, bundle.directmap_2m_kib)
+        emit_u64(0x0013, bundle.directmap_1g_kib)
+        emit_str(0x0014, bundle.zram_devices_json)
+        emit_u8(0x0015, bundle.zswap_enabled)
+
+        payload = struct.pack("<II", len(rows), 0) + b"".join(rows)
+        return self._write_block(BlockType.KernelSymbolBundle, payload)
+
+    # ------------------------------------------------------------------
+    # Physical memory map (P1.6.1, Block 0x0059 — non-spec extension)
+    # ------------------------------------------------------------------
+
+    def write_physical_memory_map(self, mmap: PhysicalMemoryMap) -> bytes:
+        """Write a PhysicalMemoryMap block. Returns block UUID.
+
+        Payload layout:
+            row_count: u32
+            reserved:  u32
+            rows: for each range:
+                start:     u64
+                end:       u64
+                label_len: u16
+                reserved:  u16
+                label:     bytes[label_len]  (UTF-8, not NUL-terminated)
+        """
+        rows: list[bytes] = []
+        for start, end, label in mmap.ranges:
+            label_bytes = label.encode("utf-8")
+            rows.append(
+                struct.pack("<QQHH", start, end, len(label_bytes), 0)
+                + label_bytes
+            )
+        payload = struct.pack("<II", len(mmap.ranges), 0) + b"".join(rows)
+        return self._write_block(BlockType.PhysicalMemoryMap, payload)
+
+    # ------------------------------------------------------------------
+    # ConnectivityTable (P1.6.5, Block 0x0054)
+    # ------------------------------------------------------------------
+
+    def write_connectivity_table(self, table: ConnectivityTable) -> bytes:
+        """Write a ConnectivityTable block (0x0054, P1.6.5).
+
+        Tagged-row TLV payload:
+            row_count: u32
+            reserved:  u32
+            rows:      (row_type u8, row_len u16, row_body bytes[row_len]) * row_count
+
+        Row bodies pack tight; no internal padding. Unknown row_types
+        are skippable via ``row_len``.
+        """
+        rows: list[bytes] = []
+
+        def _str_field(s: str) -> bytes:
+            encoded = s.encode("utf-8")
+            return struct.pack("<H", len(encoded)) + encoded
+
+        for r in table.ipv4_routes:
+            body = (
+                _str_field(r.iface)
+                + r.dest + r.gateway + r.mask
+                + struct.pack("<HII", r.flags, r.metric, r.mtu)
+            )
+            rows.append(struct.pack("<BH", 0x01, len(body)) + body)
+
+        for r in table.ipv6_routes:
+            body = (
+                _str_field(r.iface)
+                + r.dest
+                + struct.pack("<B", r.dest_prefix)
+                + r.next_hop
+                + struct.pack("<II", r.metric, r.flags)
+            )
+            rows.append(struct.pack("<BH", 0x02, len(body)) + body)
+
+        for r in table.arp_entries:
+            body = (
+                struct.pack("<B", r.family)
+                + r.ip
+                + struct.pack("<HH", r.hw_type, r.flags)
+                + r.hw_addr
+                + _str_field(r.iface)
+            )
+            rows.append(struct.pack("<BH", 0x03, len(body)) + body)
+
+        for r in table.packet_sockets:
+            body = struct.pack(
+                "<IQHIIQ",
+                r.pid, r.inode, r.proto, r.iface_index, r.user, r.rmem,
+            )
+            rows.append(struct.pack("<BH", 0x04, len(body)) + body)
+
+        for r in table.netdev_stats:
+            body = (
+                _str_field(r.iface)
+                + struct.pack(
+                    "<QQQQQQQQ",
+                    r.rx_bytes, r.rx_packets, r.rx_errs, r.rx_drop,
+                    r.tx_bytes, r.tx_packets, r.tx_errs, r.tx_drop,
+                )
+            )
+            rows.append(struct.pack("<BH", 0x05, len(body)) + body)
+
+        for r in table.sockstat_families:
+            body = struct.pack("<BIIQ", r.family, r.in_use, r.alloc, r.mem)
+            rows.append(struct.pack("<BH", 0x06, len(body)) + body)
+
+        for r in table.snmp_counters:
+            body = (
+                _str_field(r.mib)
+                + _str_field(r.counter)
+                + struct.pack("<Q", r.value)
+            )
+            rows.append(struct.pack("<BH", 0x07, len(body)) + body)
+
+        total_rows = (
+            len(table.ipv4_routes) + len(table.ipv6_routes)
+            + len(table.arp_entries) + len(table.packet_sockets)
+            + len(table.netdev_stats) + len(table.sockstat_families)
+            + len(table.snmp_counters)
+        )
+        payload = struct.pack("<II", total_rows, 0) + b"".join(rows)
+        return self._write_block(BlockType.ConnectivityTable, payload)
+
+    # ------------------------------------------------------------------
+    # KernelModuleList (P1.6.2, Block 0x0057)
+    # ------------------------------------------------------------------
+
+    def write_kernel_module_list(self, table: KernelModuleList) -> bytes:
+        """Write a KernelModuleList block (0x0057, P1.6.2)."""
+        rows_bytes: list[bytes] = []
+        for r in table.rows:
+            name_bytes = r.name.encode("utf-8")
+            row = (
+                struct.pack("<H", len(name_bytes))
+                + name_bytes
+                + struct.pack(
+                    "<QIBBQBB",
+                    r.size, r.refcount, r.state, r.taint,
+                    r.base, r.flags, 0,
+                )
+            )
+            rows_bytes.append(row)
+        payload = struct.pack("<II", len(table.rows), 0) + b"".join(rows_bytes)
+        return self._write_block(BlockType.KernelModuleList, payload)
+
+    # ------------------------------------------------------------------
+    # TargetIntrospection (P1.6.3, Block 0x0058)
+    # ------------------------------------------------------------------
+
+    def write_target_introspection(self, info: TargetIntrospection) -> bytes:
+        """Write a TargetIntrospection block (0x0058, P1.6.3).
+
+        Tagged-row TLV payload:
+
+        .. code-block:: text
+
+            target_pid: u32          # for multi-target disambiguation
+            reserved:   u32          # must be zero
+            rows:       (tag u16, len u16, value bytes[len]) * N
+
+        Unlike :meth:`write_kernel_symbol_bundle`, the 8-byte header is
+        ``(target_pid, reserved)`` — NOT ``(row_count, reserved)``. The
+        TLV-skip-zero policy makes row_count awkward to pre-compute, so
+        readers discover rows by walking TLV to end-of-payload.
+
+        Zero / empty values are not emitted (same skip-zero policy as
+        :class:`KernelSymbolBundle`).
+        """
+        rows: list[bytes] = []
+
+        def emit(tag: int, value: bytes) -> None:
+            if not value:
+                return
+            rows.append(struct.pack("<HH", tag, len(value)) + value)
+
+        def emit_u8(tag: int, v: int) -> None:
+            if v:
+                emit(tag, struct.pack("<B", v))
+
+        def emit_u32(tag: int, v: int) -> None:
+            if v:
+                emit(tag, struct.pack("<I", v))
+
+        def emit_u64(tag: int, v: int) -> None:
+            if v:
+                emit(tag, struct.pack("<Q", v))
+
+        def emit_str(tag: int, s: str) -> None:
+            if s:
+                emit(tag, s.encode("utf-8"))
+
+        emit_u32(0x0001, info.tracer_pid)
+        emit_u32(0x0002, info.login_uid)
+        emit_u32(0x0003, info.session_audit_id)
+        emit_str(0x0004, info.selinux_context)
+        emit_str(0x0005, info.target_ns_fingerprint)
+        emit_str(0x0006, info.target_ns_scope_vs_collector)
+        emit_u64(0x0007, info.smaps_rollup_pss_kib)
+        emit_u64(0x0008, info.smaps_rollup_swap_kib)
+        emit_u64(0x0009, info.smaps_anon_hugepages_kib)
+        emit_u32(0x000A, info.rwx_region_count)
+        emit_str(0x000B, info.target_cgroup)
+        emit_str(0x000C, info.target_cwd)
+        emit_str(0x000D, info.target_root)
+        emit_str(0x000E, info.cap_eff)
+        emit_str(0x000F, info.cap_amb)
+        emit_u8(0x0010, info.no_new_privs)
+        emit_u8(0x0011, info.seccomp_mode)
+        emit_u8(0x0012, info.core_dumping)
+        emit_u32(0x0013, info.thread_count)
+        emit_str(0x0014, info.sig_cgt)
+        emit_u64(0x0015, info.io_rchar)
+        emit_u64(0x0016, info.io_wchar)
+        emit_u64(0x0017, info.io_read_bytes)
+        emit_u64(0x0018, info.io_write_bytes)
+        emit_str(0x0019, info.limit_core)
+        emit_str(0x001A, info.limit_memlock)
+        emit_str(0x001B, info.limit_nofile)
+        emit_str(0x001C, info.personality_hex)
+        emit_str(0x001D, info.ancestry)
+        emit_u8(0x001E, info.exe_comm_mismatch)
+        if info.environ:
+            raw_env = (
+                info.environ
+                if isinstance(info.environ, bytes)
+                else info.environ.encode("utf-8")
+            )
+            emit(0x001F, raw_env)
+        if info.redacted_env_keys:
+            emit_str(0x0020, ",".join(info.redacted_env_keys))
+
+        payload = struct.pack("<II", info.target_pid, 0) + b"".join(rows)
+        return self._write_block(BlockType.TargetIntrospection, payload)
+
+    # ------------------------------------------------------------------
+    # ModuleBuildIdManifest (P1.6.2, Block 0x005A — non-spec extension)
+    # ------------------------------------------------------------------
+
+    def write_module_build_id_manifest(
+        self, manifest: ModuleBuildIdManifest,
+    ) -> bytes:
+        """Write a ModuleBuildIdManifest block (0x005A, P1.6.2).
+
+        Fixed-size 64-byte rows — no variable-length fields — so the
+        append-only overlay can be parsed without a schema lookup.
+        """
+        ROW_SIZE = 64
+        rows_bytes: list[bytes] = []
+        for r in manifest.rows:
+            if len(r.build_id) > 20:
+                raise ValueError(
+                    f"build_id too long: {len(r.build_id)} > 20"
+                )
+            if len(r.disk_hash) > 32:
+                raise ValueError(
+                    f"disk_hash too long: {len(r.disk_hash)} > 32"
+                )
+            build_id_padded = r.build_id + b"\x00" * (20 - len(r.build_id))
+            disk_hash_padded = r.disk_hash + b"\x00" * (32 - len(r.disk_hash))
+            row = (
+                struct.pack(
+                    "<QBBBB",
+                    r.base_addr, r.build_id_len,
+                    r.build_id_source, r.flags, 0,
+                )
+                + build_id_padded
+                + disk_hash_padded
+            )
+            assert len(row) == ROW_SIZE
+            rows_bytes.append(row)
+        payload = (
+            struct.pack("<II", len(manifest.rows), 0)
+            + b"".join(rows_bytes)
+        )
+        return self._write_block(
+            BlockType.ModuleBuildIdManifest, payload,
+        )
+
+    # ------------------------------------------------------------------
+    # PersistenceManifest (P1.6.4, Block 0x0056)
+    # ------------------------------------------------------------------
+
+    def write_persistence_manifest(self, manifest: PersistenceManifest) -> bytes:
+        """Write a PersistenceManifest block (0x0056, P1.6.4).
+
+        Fixed-row payload — no tag dispatch. Every row has the same
+        layout:
+
+        .. code-block:: text
+
+            Payload header:
+                row_count: u32
+                reserved:  u32
+            Row:
+                source:   u8       # 1..11 persistence class
+                reserved: u8
+                path_len: u16
+                path:     bytes[path_len]   # utf-8, not NUL-terminated
+                mtime_ns: u64
+                size:     u64      # bytes
+                mode:     u32      # st_mode
+
+        Source type enum:
+
+        * 1 = systemd_system        (/etc/systemd/system, /run/…, /usr/lib/…)
+        * 2 = systemd_user          (/etc/systemd/user)
+        * 3 = cron_system           (/etc/crontab, /etc/cron.d, /etc/cron.*)
+        * 4 = cron_user             (/var/spool/cron, …/crontabs)
+        * 5 = rc_local              (/etc/rc.local)
+        * 6 = profile_d             (/etc/profile.d)
+        * 7 = pam_d                 (/etc/pam.d)
+        * 8 = udev_rules            (/etc/udev/rules.d, /run/udev/rules.d)
+        * 9 = modprobe_d            (/etc/modprobe.d)
+        * 10 = system_generators    (/etc/systemd/system-generators, …)
+        * 11 = modules_load         (/etc/modules, /etc/modules-load.d)
+        """
+        rows_bytes: list[bytes] = []
+        for r in manifest.rows:
+            path_bytes = r.path.encode("utf-8")
+            row = (
+                struct.pack("<BBH", r.source, 0, len(path_bytes))
+                + path_bytes
+                + struct.pack("<QQI", r.mtime_ns, r.size, r.mode)
+            )
+            rows_bytes.append(row)
+        payload = (
+            struct.pack("<II", len(manifest.rows), 0)
+            + b"".join(rows_bytes)
+        )
+        return self._write_block(BlockType.PersistenceManifest, payload)
 
     # ------------------------------------------------------------------
     # End of capture

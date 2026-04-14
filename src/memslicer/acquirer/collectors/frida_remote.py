@@ -15,7 +15,10 @@ from memslicer.acquirer.collectors.addr_utils import (
     decode_proc_net_addr,
 )
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
-from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
+from memslicer.msl.types import (
+    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
+    KernelModuleList, PersistenceManifest,
+)
 
 
 # The Frida JS script extension for investigation data collection.
@@ -100,8 +103,20 @@ class FridaRemoteCollector:
             return response["data"], list(warnings)
         return response, []
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
-        """Collect process identity via Frida RPC on target."""
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
+        """Collect process identity via Frida RPC on target.
+
+        P1.6.3 kwargs are accepted for protocol compatibility but
+        currently ignored — the remote agent doesn't expose the
+        per-target introspection harvest yet. Linux-only fields stay
+        at their empty defaults.
+        """
         if self._api is None:
             return TargetProcessInfo()
 
@@ -218,6 +233,18 @@ class FridaRemoteCollector:
             return []
 
         return [self._parse_connection_entry(e) for e in data]
+
+    def collect_connectivity_table(self) -> ConnectivityTable:
+        """Not implemented over Frida RPC -- returns empty ConnectivityTable."""
+        return ConnectivityTable()
+
+    def collect_kernel_module_list(self) -> KernelModuleList:
+        """Not implemented over Frida RPC -- returns empty KernelModuleList."""
+        return KernelModuleList()
+
+    def collect_persistence_manifest(self) -> PersistenceManifest:
+        """Not implemented over Frida RPC -- returns empty PersistenceManifest."""
+        return PersistenceManifest()
 
     def collect_handle_table(self, pid: int) -> list[HandleEntry]:
         """Collect handle table via Frida RPC on target."""

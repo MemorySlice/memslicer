@@ -343,16 +343,16 @@ def test_existing_parser_reads_new_os_detail():
     assert len(sys_ctx_blocks) == 1, "exactly one SystemContext block expected"
     payload = sys_ctx_blocks[0]["payload"]
 
-    # SystemContext fixed header (32 bytes): boot_time(8) + target_count(4)
+    # SystemContext fixed header (32 bytes): boot_time(8) + target_count(1)
     # + table_bitmap(4) + acq_user_len(2) + hostname_len(2) + domain_len(2)
-    # + os_detail_len(2) + case_ref_len(2) + reserved(6)
+    # + os_detail_len(2) + case_ref_len(2) + reserved(9)
     (
         acq_user_len,
         hostname_len,
         domain_len,
         os_detail_len,
         case_ref_len,
-    ) = struct.unpack_from("<HHHHH", payload, 16)
+    ) = struct.unpack_from("<HHHHH", payload, 13)
 
     # Variable-length section: each string is NUL-terminated and pad8'd.
     cursor = 32

@@ -17,7 +17,10 @@ except ImportError:
     winreg = None  # type: ignore[assignment]
 
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
-from memslicer.msl.types import ConnectionEntry, HandleEntry, ProcessEntry
+from memslicer.msl.types import (
+    ConnectionEntry, HandleEntry, ProcessEntry, ConnectivityTable,
+    KernelModuleList, PersistenceManifest,
+)
 
 from memslicer.acquirer.collectors.constants import (
     AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP,
@@ -66,8 +69,19 @@ class WindowsCollector:
     def __init__(self, logger: logging.Logger | None = None) -> None:
         self._log = logger or logging.getLogger("memslicer")
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
-        """Collect process identity via wmic/PowerShell."""
+    def collect_process_identity(
+        self,
+        pid: int,
+        *,
+        include_target_introspection: bool = True,
+        include_environ: bool = False,
+    ) -> TargetProcessInfo:
+        """Collect process identity via wmic/PowerShell.
+
+        P1.6.3 kwargs are accepted for protocol compatibility but
+        currently ignored — the Windows introspection harvest is not
+        implemented in this sub-phase.
+        """
         info = TargetProcessInfo()
 
         # Try wmic first, then PowerShell
@@ -190,6 +204,18 @@ class WindowsCollector:
 
         self._log.info("Collected %d connection entries", len(entries))
         return entries
+
+    def collect_connectivity_table(self) -> ConnectivityTable:
+        """Not implemented on Windows -- returns empty ConnectivityTable."""
+        return ConnectivityTable()
+
+    def collect_kernel_module_list(self) -> KernelModuleList:
+        """Not implemented on Windows -- returns empty KernelModuleList."""
+        return KernelModuleList()
+
+    def collect_persistence_manifest(self) -> PersistenceManifest:
+        """Not implemented on Windows -- returns empty PersistenceManifest."""
+        return PersistenceManifest()
 
     def collect_handle_table(self, pid: int) -> list[HandleEntry]:
         """Collect handle table via NtQuerySystemInformation.

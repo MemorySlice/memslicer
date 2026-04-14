@@ -596,7 +596,9 @@ class TestCollectProcessTable:
         assert by_pid[500].exe_name == "python"
         assert by_pid[500].is_target is True
         assert by_pid[500].uid == 1000
-        assert by_pid[500].rss == 5000 * 4096
+        # P1.6.1: RSS now uses the cached host page size (previously
+        # hardcoded to 4096, which was wrong on ARM64 / macOS hosts).
+        assert by_pid[500].rss == 5000 * collector._page_size
 
     def test_non_numeric_entries_ignored(self, tmp_path):
         """Non-numeric entries in /proc (e.g., 'net', 'sys') are skipped."""
@@ -1128,3 +1130,822 @@ class TestErrorHandling:
         pids = {e.pid for e in entries}
         assert 1 in pids
         assert 999 not in pids
+
+
+# ---------------------------------------------------------------------------
+# P1.5 helpers — build a fake tmp_path /proc tree for posture/container tests
+# ---------------------------------------------------------------------------
+
+
+def _make_posture_proc(tmp_path: Path) -> Path:
+    """Create a minimal /proc tree plus the system files needed for
+    collect_system_info. Returns the proc root path.
+    """
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _setup_system_files(proc, btime=1700000000, hostname="phost",
+                        domainname="(none)", version="Linux version 6.8")
+    return proc
+
+
+def _isolate_posture_paths(collector: LinuxCollector, tmp_path: Path,
+                           proc: Path) -> None:
+    """Redirect every P1.5 enrichment path onto the tmp_path fixture.
+
+    Also redirects the enrichment paths added in earlier phases so that
+    ``collect_system_info`` never reads from the host filesystem.
+    """
+    # Earlier-phase enrichment paths — redirect to nonexistent locations
+    # so the host /etc and /sys are never consulted by accident.
+    collector._etc_os_release = str(tmp_path / "nope_os_release")
+    collector._etc_machine_id = str(tmp_path / "nope_machine_id")
+    collector._dbus_machine_id = str(tmp_path / "nope_dbus_machine_id")
+    collector._dmi_id_dir = str(tmp_path / "nope_dmi")
+    collector._etc_localtime = str(tmp_path / "nope_localtime")
+    collector._dockerenv_path = str(tmp_path / "nope_dockerenv")
+    collector._containerenv_path = str(tmp_path / "nope_containerenv")
+    # P1.5 paths — default to missing; tests override individually.
+    collector._efi_dir = str(tmp_path / "efi_missing")
+    collector._lsm_path = str(tmp_path / "lsm_missing")
+    collector._self_status = str(proc / "self" / "status")
+    collector._self_ns_dir = str(proc / "self" / "ns")
+    collector._pid1_ns_dir = str(proc / "1" / "ns")
+    collector._pid1_cgroup = str(proc / "1" / "cgroup")
+    collector._mountinfo = str(proc / "self" / "mountinfo")
+    collector._systemd_container_marker = str(tmp_path / "systemd_container_missing")
+    # P1.6.1 paths — default to missing; individual tests opt-in.
+    collector._sys_kernel_notes = str(tmp_path / "p16_sys_kernel_notes")
+    collector._sys_kernel_btf = str(tmp_path / "p16_btf_vmlinux")
+    collector._sys_kernel_vmcoreinfo = str(tmp_path / "p16_vmcoreinfo")
+    collector._proc_kallsyms = str(tmp_path / "p16_kallsyms")
+    collector._proc_config_gz = str(tmp_path / "p16_config.gz")
+    collector._boot_config_prefix = str(tmp_path / "p16_boot_config-")
+    collector._proc_iomem = str(tmp_path / "p16_iomem")
+    collector._meltdown_vuln_file = str(tmp_path / "p16_meltdown")
+    collector._clocksource_file = str(tmp_path / "p16_clocksource")
+    collector._sys_block_zram_dir = str(tmp_path / "p16_sys_block")
+    collector._zswap_enabled_file = str(tmp_path / "p16_zswap_enabled")
+    collector._thp_enabled_file = str(tmp_path / "p16_thp_enabled")
+    collector._ksm_run_file = str(tmp_path / "p16_ksm_run")
+    collector._proc_cpuinfo = str(tmp_path / "p16_cpuinfo")
+    # P1.6.2 module / loader posture paths — default to missing.
+    collector._etc_ld_so_preload = str(tmp_path / "p162_ld_so_preload")
+    collector._sys_kernel_lockdown = str(tmp_path / "p162_lockdown")
+    collector._proc_modules_disabled = str(tmp_path / "p162_modules_disabled")
+    collector._proc_module_sig_enforce = str(tmp_path / "p162_module_sig_enforce")
+    collector._proc_modules = str(tmp_path / "p162_proc_modules")
+    collector._sys_module_dir = str(tmp_path / "p162_sys_module_missing")
+
+    # P1.6.4 rootkit / anti-forensics / sysctl posture paths —
+    # default to missing; tests override individually.
+    p164 = tmp_path / "p164"
+    collector._kexec_loaded_file = str(p164 / "kexec_loaded")
+    collector._wtmp_path = str(p164 / "wtmp")
+    collector._utmp_path = str(p164 / "utmp")
+    collector._btmp_path = str(p164 / "btmp")
+    collector._lastlog_path = str(p164 / "lastlog")
+    collector._pid_max_file = str(p164 / "pid_max")
+    collector._sysctl_kptr_restrict = str(p164 / "kptr_restrict")
+    collector._sysctl_dmesg_restrict = str(p164 / "dmesg_restrict")
+    collector._sysctl_perf_event_paranoid = str(p164 / "perf_event_paranoid")
+    collector._sysctl_unprivileged_bpf_disabled = str(p164 / "unpriv_bpf")
+    collector._sysctl_unprivileged_userns_clone = str(p164 / "unpriv_userns")
+    collector._sysctl_kexec_load_disabled = str(p164 / "kexec_load_disabled")
+    collector._sysctl_sysrq = str(p164 / "sysrq")
+    collector._sysctl_suid_dumpable = str(p164 / "suid_dumpable")
+    collector._sysctl_protected_symlinks = str(p164 / "protected_symlinks")
+    collector._sysctl_protected_hardlinks = str(p164 / "protected_hardlinks")
+    collector._sysctl_protected_fifos = str(p164 / "protected_fifos")
+    collector._sysctl_protected_regular = str(p164 / "protected_regular")
+    collector._sysctl_bpf_jit_enable = str(p164 / "bpf_jit_enable")
+    collector._core_pattern_file = str(p164 / "core_pattern")
+    collector._auditd_pid_file = str(p164 / "auditd.pid")
+    collector._auditd_pid_file_alt = str(p164 / "auditd.pid.alt")
+    collector._auditd_binary = str(p164 / "auditd_binary_missing")
+    collector._audit_rules_file = str(p164 / "audit.rules")
+    collector._journald_conf_file = str(p164 / "journald.conf")
+    collector._journald_persistent_dir = str(p164 / "journal_persistent")
+    collector._journald_volatile_dir = str(p164 / "journal_volatile")
+    collector._timesync_sync_file = str(p164 / "timesync_synchronized")
+    collector._chrony_drift_file = str(p164 / "chrony_drift")
+    collector._cpu_vuln_dir = str(p164 / "cpu_vulnerabilities")
+    # Persistence roots — default to nonexistent paths so the
+    # walker yields an empty manifest in all posture tests.
+    collector._persistence_sources = [
+        (1, str(p164 / "persist_systemd_system_missing")),
+    ]
+    collector._persistence_single_files = [
+        (3, str(p164 / "persist_crontab_missing")),
+    ]
+    # Replace _kill_func with a deterministic stub: always ESRCH.
+    # This prevents the hidden-PID sweep from issuing real signals
+    # to host processes — tests that need a different pattern
+    # override _kill_func themselves.
+    def _always_esrch(pid, sig):
+        raise ProcessLookupError()
+    collector._kill_func = _always_esrch
+
+
+def _make_posture_collector(tmp_path: Path) -> tuple[LinuxCollector, Path]:
+    """Build a LinuxCollector with every P1.5 path isolated under tmp_path."""
+    proc = _make_posture_proc(tmp_path)
+    collector = LinuxCollector(proc_root=str(proc))
+    _isolate_posture_paths(collector, tmp_path, proc)
+    return collector, proc
+
+
+# ---------------------------------------------------------------------------
+# Tests: P1.5 kernel posture enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestLinuxKernelPosture:
+    """Tests for LinuxCollector kernel-posture enrichment (P1.5)."""
+
+    def test_kernel_cmdline_captured(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "cmdline",
+               "BOOT_IMAGE=/vmlinuz root=/dev/sda1 nokaslr")
+
+        info = collector.collect_system_info()
+
+        assert "BOOT_IMAGE=/vmlinuz" in info.kernel_cmdline
+        assert "nokaslr" in info.kernel_cmdline
+
+    def test_kernel_tainted_captured(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "sys" / "kernel" / "tainted", "4096\n")
+
+        info = collector.collect_system_info()
+
+        assert info.kernel_tainted == "4096"
+
+    def test_lsm_stack_captured(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        lsm_path = tmp_path / "lsm_file"
+        _write(lsm_path, "lockdown,capability,yama,apparmor\n")
+        collector._lsm_path = str(lsm_path)
+
+        info = collector.collect_system_info()
+
+        assert info.lsm_stack == "lockdown,capability,yama,apparmor"
+
+    def test_yama_ptrace_scope_captured(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "sys" / "kernel" / "yama" / "ptrace_scope", "1\n")
+
+        info = collector.collect_system_info()
+
+        assert info.yama_ptrace_scope == "1"
+
+    def test_aslr_mode_captured(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "sys" / "kernel" / "randomize_va_space", "2\n")
+
+        info = collector.collect_system_info()
+
+        assert info.aslr_mode == "2"
+
+    def test_efi_mode_set_when_dir_exists(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        efi_dir = tmp_path / "efi_present"
+        efi_dir.mkdir()
+        collector._efi_dir = str(efi_dir)
+
+        info = collector.collect_system_info()
+
+        assert info.efi_mode == "1"
+
+    def test_efi_mode_empty_when_dir_missing(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        # Default isolation points at a nonexistent dir.
+
+        info = collector.collect_system_info()
+
+        assert info.efi_mode == ""
+
+
+class TestLinuxCollectorCaps:
+    """Tests for ``CapEff`` parsing into ``collector_caps``."""
+
+    def test_collector_caps_parsed_from_status(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "self" / "status",
+               "Name:\tpython\nCapEff:\t0000003fffffffff\n")
+
+        info = collector.collect_system_info()
+
+        assert info.collector_caps == "0000003fffffffff"
+
+    def test_collector_caps_empty_on_missing_line(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "self" / "status",
+               "Name:\tpython\nState:\tR (running)\n")
+
+        info = collector.collect_system_info()
+
+        assert info.collector_caps == ""
+
+    def test_collector_caps_empty_when_status_missing(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        # No /proc/self/status written.
+
+        info = collector.collect_system_info()
+
+        assert info.collector_caps == ""
+
+
+class TestLinuxContainerScope:
+    """Tests for container-scope / namespace / runtime detection."""
+
+    def _write_ns_links(self, ns_dir: Path, targets: dict[str, str]) -> None:
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        for ns, target in targets.items():
+            link = ns_dir / ns
+            try:
+                os.symlink(target, link)
+            except OSError:
+                pass
+
+    def test_host_scope_when_ns_match(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        identical = {
+            "mnt":    "mnt:[4026531840]",
+            "pid":    "pid:[4026531836]",
+            "net":    "net:[4026531993]",
+            "user":   "user:[4026531837]",
+            "uts":    "uts:[4026531838]",
+            "ipc":    "ipc:[4026531839]",
+            "cgroup": "cgroup:[4026531835]",
+            "time":   "time:[4026531834]",
+        }
+        self._write_ns_links(proc / "self" / "ns", identical)
+        self._write_ns_links(proc / "1" / "ns", identical)
+
+        info = collector.collect_system_info()
+
+        assert info.container_scope == "host"
+        assert info.ns_fingerprint != ""
+        assert "mnt:[4026531840]" in info.ns_fingerprint
+
+    def test_container_scope_when_ns_differ(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        self_t = {
+            "mnt":    "mnt:[4100000000]",
+            "pid":    "pid:[4100000001]",
+            "net":    "net:[4100000002]",
+            "user":   "user:[4100000003]",
+            "uts":    "uts:[4100000004]",
+            "ipc":    "ipc:[4100000005]",
+            "cgroup": "cgroup:[4100000006]",
+            "time":   "time:[4100000007]",
+        }
+        pid1_t = {
+            "mnt":    "mnt:[4026531840]",
+            "pid":    "pid:[4026531836]",
+            "net":    "net:[4026531993]",
+            "user":   "user:[4026531837]",
+            "uts":    "uts:[4026531838]",
+            "ipc":    "ipc:[4026531839]",
+            "cgroup": "cgroup:[4026531835]",
+            "time":   "time:[4026531834]",
+        }
+        self._write_ns_links(proc / "self" / "ns", self_t)
+        self._write_ns_links(proc / "1" / "ns", pid1_t)
+
+        info = collector.collect_system_info()
+
+        assert info.container_scope == "container"
+
+    def test_partial_scope_when_some_differ(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        self_t = {
+            "mnt":    "mnt:[4100000000]",  # differs
+            "pid":    "pid:[4026531836]",
+            "net":    "net:[4100000002]",  # differs
+            "user":   "user:[4026531837]",
+            "uts":    "uts:[4026531838]",
+            "ipc":    "ipc:[4026531839]",
+            "cgroup": "cgroup:[4026531835]",
+            "time":   "time:[4026531834]",
+        }
+        pid1_t = {
+            "mnt":    "mnt:[4026531840]",
+            "pid":    "pid:[4026531836]",
+            "net":    "net:[4026531993]",
+            "user":   "user:[4026531837]",
+            "uts":    "uts:[4026531838]",
+            "ipc":    "ipc:[4026531839]",
+            "cgroup": "cgroup:[4026531835]",
+            "time":   "time:[4026531834]",
+        }
+        self._write_ns_links(proc / "self" / "ns", self_t)
+        self._write_ns_links(proc / "1" / "ns", pid1_t)
+
+        info = collector.collect_system_info()
+
+        assert info.container_scope == "partial"
+
+    def test_runtime_docker_via_dockerenv(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        dockerenv = tmp_path / "dockerenv_marker"
+        dockerenv.write_text("")
+        collector._dockerenv_path = str(dockerenv)
+
+        info = collector.collect_system_info()
+
+        assert info.container_runtime == "docker"
+
+    def test_runtime_podman_via_containerenv(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        containerenv = tmp_path / "containerenv_marker"
+        containerenv.write_text("")
+        collector._containerenv_path = str(containerenv)
+
+        info = collector.collect_system_info()
+
+        assert info.container_runtime == "podman"
+
+    def test_runtime_kubernetes_via_pid1_cgroup(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(proc / "1" / "cgroup",
+               "12:memory:/kubepods/burstable/pod123/container456\n")
+
+        info = collector.collect_system_info()
+
+        assert info.container_runtime == "kubernetes"
+
+    def test_runtime_empty_on_host(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        # No container markers, no pid1 cgroup file.
+
+        info = collector.collect_system_info()
+
+        assert info.container_runtime == ""
+
+
+class TestLinuxHidepidWarning:
+    """Tests for the ``hidepid_active`` collector warning."""
+
+    def test_hidepid_active_adds_warning(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(
+            proc / "self" / "mountinfo",
+            "26 1 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:5 "
+            "- proc proc rw,nosuid,nodev,noexec,relatime,hidepid=2\n",
+        )
+
+        info = collector.collect_system_info()
+
+        assert "hidepid_active" in info.collector_warnings
+
+    def test_hidepid_zero_no_warning(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        _write(
+            proc / "self" / "mountinfo",
+            "26 1 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:5 "
+            "- proc proc rw,nosuid,nodev,noexec,relatime,hidepid=0\n",
+        )
+
+        info = collector.collect_system_info()
+
+        assert "hidepid_active" not in info.collector_warnings
+
+    def test_no_mountinfo_no_warning(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        # No mountinfo written.
+
+        info = collector.collect_system_info()
+
+        assert "hidepid_active" not in info.collector_warnings
+
+
+# ---------------------------------------------------------------------------
+# Tests: P1.5 unix-socket connection rows
+# ---------------------------------------------------------------------------
+
+
+class TestLinuxUnixSocketConnectionTable:
+    """Tests for AF_UNIX entries in ``collect_connection_table``."""
+
+    _UNIX_HEADER = (
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+    )
+
+    def _write_unix(self, proc_root: Path, inode: int, path: str) -> None:
+        content = (
+            self._UNIX_HEADER
+            + f"0000000000000000: 00000002 00000000 00010000 0001 01 {inode} {path}\n"
+        )
+        _write(proc_root / "net" / "unix", content)
+
+    def test_unix_socket_parsed_as_connection(self, tmp_path):
+        from memslicer.acquirer.collectors.constants import AF_UNIX
+
+        _setup_basic_process(tmp_path, pid=77, comm="server")
+        fd_dir = tmp_path / "77" / "fd"
+        (fd_dir / "3").symlink_to("socket:[54321]")
+        # Empty tcp/udp files so they parse cleanly.
+        _setup_net_tcp(tmp_path, [])
+        _setup_net_tcp6(tmp_path, [])
+        _setup_net_udp(tmp_path, [])
+        _setup_net_udp6(tmp_path, [])
+        self._write_unix(tmp_path, 54321, "/var/run/example.sock")
+
+        collector = LinuxCollector(proc_root=str(tmp_path))
+        entries = collector.collect_connection_table()
+
+        unix_entries = [e for e in entries if e.family == AF_UNIX]
+        assert len(unix_entries) == 1
+        assert unix_entries[0].pid == 77
+
+    def test_unix_socket_without_owner(self, tmp_path):
+        from memslicer.acquirer.collectors.constants import AF_UNIX
+
+        _setup_net_tcp(tmp_path, [])
+        _setup_net_tcp6(tmp_path, [])
+        _setup_net_udp(tmp_path, [])
+        _setup_net_udp6(tmp_path, [])
+        self._write_unix(tmp_path, 99999, "/tmp/orphan.sock")
+
+        collector = LinuxCollector(proc_root=str(tmp_path))
+        entries = collector.collect_connection_table()
+
+        unix_entries = [e for e in entries if e.family == AF_UNIX]
+        assert len(unix_entries) == 1
+        assert unix_entries[0].pid == 0
+
+    def test_unix_file_missing_no_crash(self, tmp_path):
+        """tcp/udp still parse correctly when /proc/net/unix is absent."""
+        tcp_line = _make_net_line(0, "0100007F", "1F90",
+                                  "00000000", "0000", "0A", 500, 12345)
+        _setup_net_tcp(tmp_path, [tcp_line])
+        _setup_net_tcp6(tmp_path, [])
+        _setup_net_udp(tmp_path, [])
+        _setup_net_udp6(tmp_path, [])
+        # No /proc/net/unix file.
+
+        collector = LinuxCollector(proc_root=str(tmp_path))
+        entries = collector.collect_connection_table()
+
+        # TCP entry still present; no crash.
+        assert any(e.local_port == 0x1F90 for e in entries)
+
+
+# ---------------------------------------------------------------------------
+# Tests: P1.6.1 memory-forensics anchors
+# ---------------------------------------------------------------------------
+
+
+def _encode_gnu_build_id_note(build_id: bytes) -> bytes:
+    """Encode a synthetic PT_NOTE body with a single NT_GNU_BUILD_ID entry.
+
+    Layout matches what the kernel exposes at /sys/kernel/notes: raw
+    ELF note format (n_namesz u32, n_descsz u32, n_type u32, name,
+    desc) with 4-byte alignment padding.
+    """
+    name = b"GNU\x00"
+    header = struct.pack("<III", len(name), len(build_id), 3)
+
+    def _pad4(b: bytes) -> bytes:
+        rem = len(b) % 4
+        return b + (b"\x00" * (4 - rem) if rem else b"")
+
+    return header + _pad4(name) + _pad4(build_id)
+
+
+class TestLinuxMemoryForensicsAnchors:
+    """Tests for LinuxCollector memory-forensics anchors (P1.6.1)."""
+
+    def test_page_size_resolved_from_sysconf(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        info = collector.collect_system_info()
+        assert info.page_size == os.sysconf("SC_PAGE_SIZE")
+
+    def test_page_size_fallback_warning(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        collector._page_size = 4096
+        collector._page_size_is_fallback = True
+        info = collector.collect_system_info()
+        assert "page_size_assumed_4k" in info.collector_warnings
+
+    def test_rss_uses_cached_page_size(self, tmp_path):
+        _setup_basic_process(tmp_path, pid=42, rss_pages=10)
+        _setup_system_files(tmp_path)
+        collector = LinuxCollector(proc_root=str(tmp_path))
+        collector._page_size = 16384
+        collector._page_size_is_fallback = False
+        assert collector._read_rss(f"{tmp_path}/42") == 10 * 16384
+
+    def test_kernel_build_id_parsed_from_notes(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        bid = bytes(range(20))
+        notes_path = tmp_path / "p16_sys_kernel_notes_real"
+        notes_path.write_bytes(_encode_gnu_build_id_note(bid))
+        collector._sys_kernel_notes = str(notes_path)
+
+        info = collector.collect_system_info()
+        assert info.kernel_build_id == bid.hex()
+
+    def test_kernel_build_id_missing_file(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        info = collector.collect_system_info()
+        assert info.kernel_build_id == ""
+
+    def test_kaslr_text_va_parsed_from_kallsyms(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        ks = tmp_path / "kallsyms_real"
+        ks.write_text(
+            "ffffffff81000000 T _stext\n"
+            "ffff888000000000 D page_offset_base\n"
+        )
+        collector._proc_kallsyms = str(ks)
+
+        info = collector.collect_system_info()
+        assert info.kaslr_text_va == 0xFFFFFFFF81000000
+        assert info.kernel_page_offset == 0xFFFF888000000000
+        assert "kallsyms_restricted" not in info.collector_warnings
+
+    def test_kaslr_restricted_emits_warning(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        ks = tmp_path / "kallsyms_restricted"
+        ks.write_text(
+            "0000000000000000 T _stext\n"
+            "0000000000000000 D page_offset_base\n"
+        )
+        collector._proc_kallsyms = str(ks)
+
+        info = collector.collect_system_info()
+        assert info.kaslr_text_va == 0
+        assert "kallsyms_restricted" in info.collector_warnings
+
+    def test_btf_hash_and_size_parsed(self, tmp_path):
+        import hashlib as _hashlib
+        collector, _ = _make_posture_collector(tmp_path)
+        btf_data = b"BTF\x00payload\x01\x02\x03" * 16
+        btf_path = tmp_path / "btf_vmlinux_real"
+        btf_path.write_bytes(btf_data)
+        collector._sys_kernel_btf = str(btf_path)
+
+        info = collector.collect_system_info()
+        assert info.btf_sha256 == _hashlib.sha256(btf_data).hexdigest()
+        assert info.btf_size_bytes == len(btf_data)
+        assert "btf_unavailable" not in info.collector_warnings
+
+    def test_btf_missing_emits_warning(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        info = collector.collect_system_info()
+        assert info.btf_sha256 == ""
+        assert info.btf_size_bytes == 0
+        assert "btf_unavailable" in info.collector_warnings
+
+    def test_vmcoreinfo_missing_degrades(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        info = collector.collect_system_info()
+        assert info.vmcoreinfo_present == "0"
+        assert "vmcoreinfo_unreadable" in info.collector_warnings
+
+    def test_clock_triple_populated(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        info = collector.collect_system_info()
+        assert info.clock_realtime_ns > 0
+        assert info.clock_monotonic_ns > 0
+        assert info.clock_boottime_ns >= 0
+
+    def test_clocksource_parsed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        cs = tmp_path / "clocksource_real"
+        cs.write_text("tsc\n")
+        collector._clocksource_file = str(cs)
+
+        info = collector.collect_system_info()
+        assert info.clocksource == "tsc"
+
+    def test_zswap_enabled_parsed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        zs = tmp_path / "zswap_enabled_real"
+        zs.write_text("Y\n")
+        collector._zswap_enabled_file = str(zs)
+
+        info = collector.collect_system_info()
+        assert info.zswap_enabled == "1"
+
+    def test_thp_mode_parsed_from_bracketed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        thp = tmp_path / "thp_enabled_real"
+        thp.write_text("always [madvise] never\n")
+        collector._thp_enabled_file = str(thp)
+
+        info = collector.collect_system_info()
+        assert info.thp_mode == "madvise"
+
+    def test_ksm_run_parsed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        ksm = tmp_path / "ksm_run_real"
+        ksm.write_text("1\n")
+        collector._ksm_run_file = str(ksm)
+
+        info = collector.collect_system_info()
+        assert info.ksm_active == "1"
+
+    def test_directmap_sizes_from_meminfo(self, tmp_path):
+        collector, proc = _make_posture_collector(tmp_path)
+        # Append DirectMap lines to the existing /proc/meminfo (create it).
+        _write(
+            proc / "meminfo",
+            "MemTotal:       8000000 kB\n"
+            "DirectMap4k:    524288 kB\n"
+            "DirectMap2M:   2097152 kB\n"
+            "DirectMap1G:  67108864 kB\n",
+        )
+
+        info = collector.collect_system_info()
+        assert info.directmap_4k == 524288
+        assert info.directmap_2m == 2097152
+        assert info.directmap_1g == 67108864
+
+    def test_la57_detected_from_cpuinfo_flags(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        ci = tmp_path / "cpuinfo_real"
+        ci.write_text(
+            "processor\t: 0\n"
+            "flags\t\t: fpu vme de pse tsc la57 sse sse2\n"
+        )
+        collector._proc_cpuinfo = str(ci)
+
+        info = collector.collect_system_info()
+        assert info.la57_enabled == "1"
+
+    def test_pti_active_from_meltdown_file(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        mf = tmp_path / "meltdown_real"
+        mf.write_text("Mitigation: PTI\n")
+        collector._meltdown_vuln_file = str(mf)
+
+        info = collector.collect_system_info()
+        assert info.pti_active == "1"
+
+    def test_physmem_ranges_parsed_from_iomem(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        io_file = tmp_path / "iomem_real"
+        io_file.write_text(
+            "00000000-00000fff : Reserved\n"
+            "  00000000-00000fff : reserved (nested)\n"
+            "00100000-7fffffff : System RAM\n"
+            "  01000000-01ffffff : Kernel code\n"
+        )
+        collector._proc_iomem = str(io_file)
+
+        info = collector.collect_system_info()
+        assert len(info.physmem_ranges) == 2
+        starts = [r[0] for r in info.physmem_ranges]
+        assert 0x100000 in starts
+        labels = [r[2] for r in info.physmem_ranges]
+        assert "System RAM" in labels
+
+    def test_physmem_all_zeros_emits_iomem_warning(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        io_file = tmp_path / "iomem_zero"
+        io_file.write_text(
+            "00000000-00000000 : System RAM\n"
+            "00000000-00000000 : Reserved\n"
+        )
+        collector._proc_iomem = str(io_file)
+
+        info = collector.collect_system_info()
+        assert "iomem_root_only" in info.collector_warnings
+
+
+# ---------------------------------------------------------------------------
+# Tests: P1.6.2 kernel module list + module/loader posture
+# ---------------------------------------------------------------------------
+
+
+class TestLinuxKernelModules:
+    """Tests for ``collect_kernel_module_list`` and P1.6.2 loader posture."""
+
+    def _make_proc_modules(self, tmp_path: Path, content: str) -> Path:
+        path = tmp_path / "p162_modules"
+        path.write_text(content)
+        return path
+
+    def _make_sys_module_dir(
+        self, tmp_path: Path, modules: dict[str, str],
+    ) -> Path:
+        root = tmp_path / "p162_sys_module"
+        root.mkdir()
+        for name, taint in modules.items():
+            mod_dir = root / name
+            mod_dir.mkdir()
+            (mod_dir / "taint").write_text(taint)
+        return root
+
+    def test_parse_proc_modules_basic(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        content = (
+            "ext4 745472 1 - Live 0xffffffffc0000000\n"
+            "btrfs 1593344 0 - Live 0xffffffffc0100000\n"
+            "xfs 2097152 2 - Live 0xffffffffc0200000\n"
+        )
+        collector._proc_modules = str(self._make_proc_modules(tmp_path, content))
+        collector._sys_module_dir = str(tmp_path / "nonexistent_sysmod")
+
+        table = collector.collect_kernel_module_list()
+        assert len(table.rows) == 3
+        names = [r.name for r in table.rows]
+        assert names == ["ext4", "btrfs", "xfs"]
+        assert table.rows[0].size == 745472
+        assert table.rows[0].refcount == 1
+        assert table.rows[0].state == 1   # Live
+        assert table.rows[0].base == 0xffffffffc0000000
+        # No sysfs tree -> every row is proc-only (flag bit 0).
+        assert all(r.flags == 0x01 for r in table.rows)
+
+    def test_parse_proc_modules_unloading_state(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        content = "foo 1000 0 - Unloading 0xffffffffc0000000\n"
+        collector._proc_modules = str(self._make_proc_modules(tmp_path, content))
+        collector._sys_module_dir = str(tmp_path / "nonexistent_sysmod")
+
+        table = collector.collect_kernel_module_list()
+        assert table.rows[0].state == 3
+
+    def test_sysfs_module_taint_parsed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        content = "foo 1000 0 - Live 0xffffffffc0000000\n"
+        collector._proc_modules = str(self._make_proc_modules(tmp_path, content))
+        sysmod = self._make_sys_module_dir(tmp_path, {"foo": "P"})
+        collector._sys_module_dir = str(sysmod)
+
+        table = collector.collect_kernel_module_list()
+        assert len(table.rows) == 1
+        assert table.rows[0].name == "foo"
+        assert table.rows[0].taint != 0  # P -> bit 0 set
+        assert table.rows[0].flags == 0  # in both sources
+
+    def test_skew_detection_proc_only(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        content = (
+            "ghost 1000 0 - Live 0xffffffffc0000000\n"
+            "ext4 2000 0 - Live 0xffffffffc0100000\n"
+        )
+        collector._proc_modules = str(self._make_proc_modules(tmp_path, content))
+        sysmod = self._make_sys_module_dir(tmp_path, {"ext4": ""})
+        collector._sys_module_dir = str(sysmod)
+
+        table = collector.collect_kernel_module_list()
+        by_name = {r.name: r for r in table.rows}
+        assert by_name["ghost"].flags == 0x01   # proc-only
+        assert by_name["ext4"].flags == 0
+
+    def test_skew_detection_sysfs_only(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        content = "ext4 2000 0 - Live 0xffffffffc0100000\n"
+        collector._proc_modules = str(self._make_proc_modules(tmp_path, content))
+        sysmod = self._make_sys_module_dir(
+            tmp_path, {"ext4": "", "phantom": ""},
+        )
+        collector._sys_module_dir = str(sysmod)
+
+        table = collector.collect_kernel_module_list()
+        by_name = {r.name: r for r in table.rows}
+        assert "phantom" in by_name
+        assert by_name["phantom"].flags == 0x02   # sysfs-only
+
+    def test_collect_kernel_module_list_empty_sources(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        # Both sources missing — returns empty table without raising.
+        table = collector.collect_kernel_module_list()
+        assert table.rows == []
+
+    def test_ld_so_preload_present_triggers_warning(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        preload = tmp_path / "ld_preload_fixture"
+        preload.write_text("/tmp/hook.so\n")
+        collector._etc_ld_so_preload = str(preload)
+
+        info = collector.collect_system_info()
+        assert info.ld_so_preload == "/tmp/hook.so"
+        assert "ld_so_preload_present" in info.collector_warnings
+
+    def test_kernel_lockdown_parses_bracketed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        lockdown = tmp_path / "lockdown_fixture"
+        lockdown.write_text("none [integrity] confidentiality\n")
+        collector._sys_kernel_lockdown = str(lockdown)
+
+        info = collector.collect_system_info()
+        assert info.kernel_lockdown == "integrity"
+
+    def test_modules_disabled_and_sig_enforce_parsed(self, tmp_path):
+        collector, _ = _make_posture_collector(tmp_path)
+        md = tmp_path / "mod_disabled_fixture"
+        md.write_text("1\n")
+        se = tmp_path / "mod_sig_enforce_fixture"
+        se.write_text("1\n")
+        collector._proc_modules_disabled = str(md)
+        collector._proc_module_sig_enforce = str(se)
+
+        info = collector.collect_system_info()
+        assert info.modules_disabled == "1"
+        assert info.module_sig_enforce == "1"

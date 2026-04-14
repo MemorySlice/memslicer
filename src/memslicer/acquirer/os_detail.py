@@ -406,6 +406,7 @@ def system_info_to_fields(
     include_serials: bool = False,
     include_network_identity: bool = False,
     include_fingerprint: bool = False,
+    include_kernel_symbols: bool = True,
 ) -> dict[str, object]:
     """Project a :class:`TargetSystemInfo` onto the packer's field map.
 
@@ -464,8 +465,146 @@ def system_info_to_fields(
         "env": getattr(sys_info, "env", ""),
         "root_method": getattr(sys_info, "root_method", ""),
     })
+    # P1.5: Linux kernel/posture enrichment (empty-string-safe on other
+    # platforms; pack_os_detail drops empty values).
+    fields.update({
+        "kernel_cmdline":    getattr(sys_info, "kernel_cmdline", ""),
+        "kernel_tainted":    getattr(sys_info, "kernel_tainted", ""),
+        "lsm_stack":         getattr(sys_info, "lsm_stack", ""),
+        "yama_ptrace_scope": getattr(sys_info, "yama_ptrace_scope", ""),
+        "aslr_mode":         getattr(sys_info, "aslr_mode", ""),
+        "efi_mode":          getattr(sys_info, "efi_mode", ""),
+        "container_scope":   getattr(sys_info, "container_scope", ""),
+        "container_runtime": getattr(sys_info, "container_runtime", ""),
+        "ns_fingerprint":    getattr(sys_info, "ns_fingerprint", ""),
+    })
+    # P1.6.2: module / loader posture (empty-string-safe).
+    fields.update({
+        "ld_so_preload":     getattr(sys_info, "ld_so_preload", ""),
+        "kernel_lockdown":   getattr(sys_info, "kernel_lockdown", ""),
+        "modules_disabled":  getattr(sys_info, "modules_disabled", ""),
+        "module_sig_enforce": getattr(sys_info, "module_sig_enforce", ""),
+    })
+    # P1.6.4: rootkit / anti-forensics / sysctl posture (empty-string-safe).
+    # All 26 fields projected unconditionally — host posture, no gating.
+    # ``pack_os_detail`` drops empty values automatically.
+    fields.update({
+        # Decoded kernel posture
+        "taint_decoded":             getattr(sys_info, "taint_decoded", ""),
+        "kexec_loaded":              getattr(sys_info, "kexec_loaded", ""),
+        "wtmp_size":                 getattr(sys_info, "wtmp_size", 0),
+        "wtmp_mtime_ns":             getattr(sys_info, "wtmp_mtime_ns", 0),
+        "utmp_size":                 getattr(sys_info, "utmp_size", 0),
+        "btmp_size":                 getattr(sys_info, "btmp_size", 0),
+        "lastlog_size":              getattr(sys_info, "lastlog_size", 0),
+        "hidden_pid_count":          getattr(sys_info, "hidden_pid_count", 0),
+        # Security sysctls
+        "kptr_restrict":             getattr(sys_info, "kptr_restrict", ""),
+        "dmesg_restrict":            getattr(sys_info, "dmesg_restrict", ""),
+        "perf_event_paranoid":       getattr(sys_info, "perf_event_paranoid", ""),
+        "unprivileged_bpf_disabled": getattr(sys_info, "unprivileged_bpf_disabled", ""),
+        "unprivileged_userns_clone": getattr(sys_info, "unprivileged_userns_clone", ""),
+        "kexec_load_disabled":       getattr(sys_info, "kexec_load_disabled", ""),
+        "sysrq_state":               getattr(sys_info, "sysrq_state", ""),
+        "core_pattern":              getattr(sys_info, "core_pattern", ""),
+        "suid_dumpable":             getattr(sys_info, "suid_dumpable", ""),
+        "protected_symlinks":        getattr(sys_info, "protected_symlinks", ""),
+        "protected_hardlinks":       getattr(sys_info, "protected_hardlinks", ""),
+        "protected_fifos":           getattr(sys_info, "protected_fifos", ""),
+        "protected_regular":         getattr(sys_info, "protected_regular", ""),
+        "bpf_jit_enable":            getattr(sys_info, "bpf_jit_enable", ""),
+        # auditd / journald / time / CPU-vulnerabilities posture
+        "audit_state":               getattr(sys_info, "audit_state", ""),
+        "audit_rules_count":         getattr(sys_info, "audit_rules_count", 0),
+        "journald_storage":          getattr(sys_info, "journald_storage", ""),
+        "ntp_sync":                  getattr(sys_info, "ntp_sync", ""),
+        "cpu_vuln_digest":           getattr(sys_info, "cpu_vuln_digest", ""),
+    })
+    # collector_caps is already listed in FIELD_ORDER as a provenance key;
+    # project it from the structured field so it survives truncation.
+    fields["collector_caps"] = getattr(sys_info, "collector_caps", "")
     if include_fingerprint:
         fields["fingerprint"] = getattr(sys_info, "fingerprint", "")
+    # P1.6.1: memory-forensics anchors (opt-out via --no-include-kernel-symbols).
+    # Scalar anchors only; list-typed ``physmem_ranges`` is emitted via the
+    # dedicated ``write_physical_memory_map`` block in a later sub-phase.
+    if include_kernel_symbols:
+        fields.update({
+            "page_size":            getattr(sys_info, "page_size", 0),
+            "kernel_build_id":      getattr(sys_info, "kernel_build_id", ""),
+            "kaslr_text_va":        getattr(sys_info, "kaslr_text_va", 0),
+            "kernel_page_offset":   getattr(sys_info, "kernel_page_offset", 0),
+            "la57_enabled":         getattr(sys_info, "la57_enabled", ""),
+            "pti_active":           getattr(sys_info, "pti_active", ""),
+            "btf_sha256":           getattr(sys_info, "btf_sha256", ""),
+            "btf_size_bytes":       getattr(sys_info, "btf_size_bytes", 0),
+            "vmcoreinfo_sha256":    getattr(sys_info, "vmcoreinfo_sha256", ""),
+            "vmcoreinfo_present":   getattr(sys_info, "vmcoreinfo_present", ""),
+            "kernel_config_sha256": getattr(sys_info, "kernel_config_sha256", ""),
+            "clock_realtime_ns":    getattr(sys_info, "clock_realtime_ns", 0),
+            "clock_monotonic_ns":   getattr(sys_info, "clock_monotonic_ns", 0),
+            "clock_boottime_ns":    getattr(sys_info, "clock_boottime_ns", 0),
+            "clocksource":          getattr(sys_info, "clocksource", ""),
+            "zram_devices":         getattr(sys_info, "zram_devices", ""),
+            "zswap_enabled":        getattr(sys_info, "zswap_enabled", ""),
+            "thp_mode":             getattr(sys_info, "thp_mode", ""),
+            "ksm_active":           getattr(sys_info, "ksm_active", ""),
+            "directmap_4k":         getattr(sys_info, "directmap_4k", 0),
+            "directmap_2m":         getattr(sys_info, "directmap_2m", 0),
+            "directmap_1g":         getattr(sys_info, "directmap_1g", 0),
+        })
+    return fields
+
+
+def target_info_to_fields(
+    proc_info,
+    *,
+    include_environ: bool = False,
+) -> dict[str, object]:
+    """Project a :class:`TargetProcessInfo` onto a key/value dict for
+    CLI rendering.
+
+    Used by ``cli_sysctx.py`` to render the per-target introspection
+    fields in plain / rich / JSON output. **Not** used for wire
+    emission — wire data is carried by the ``TargetIntrospection``
+    block (0x0058) via :meth:`MSLWriter.write_target_introspection`.
+
+    Every populated field is projected with a ``target_`` prefix.
+    Empty / zero values are dropped (same "absent means not collected"
+    convention as :func:`system_info_to_fields`). ``include_environ``
+    gates the two privacy-sensitive fields.
+    """
+    fields: dict[str, object] = {}
+    attrs = (
+        # Baseline identity.
+        "ppid", "session_id", "start_time_ns", "exe_path", "cmd_line",
+        "process_name", "package",
+        # P1.6.3 introspection (non-environ).
+        "tracer_pid", "login_uid", "session_audit_id",
+        "selinux_context", "target_ns_fingerprint",
+        "target_ns_scope_vs_collector",
+        "smaps_rollup_pss_kib", "smaps_rollup_swap_kib",
+        "smaps_anon_hugepages_kib", "rwx_region_count",
+        "target_cgroup", "target_cwd", "target_root",
+        "cap_eff", "cap_amb", "no_new_privs", "seccomp_mode",
+        "core_dumping", "thread_count", "sig_cgt",
+        "io_rchar", "io_wchar", "io_read_bytes", "io_write_bytes",
+        "limit_core", "limit_memlock", "limit_nofile",
+        "personality_hex", "ancestry", "exe_comm_mismatch",
+    )
+    for attr in attrs:
+        value = getattr(proc_info, attr, None)
+        if value is None or value == 0 or value == "" or value == b"":
+            continue
+        fields[f"target_{attr}"] = value
+
+    if include_environ:
+        environ_value = getattr(proc_info, "environ", "")
+        if environ_value:
+            fields["target_environ"] = environ_value
+        redacted = getattr(proc_info, "redacted_env_keys", None)
+        if redacted:
+            fields["target_redacted_env_keys"] = list(redacted)
     return fields
 
 
@@ -479,4 +618,5 @@ __all__: Iterable[str] = (
     "pack_os_detail",
     "parse_os_detail",
     "system_info_to_fields",
+    "target_info_to_fields",
 )

@@ -72,9 +72,9 @@ def _read_system_context(output: Path) -> dict[str, object]:
     payload = _find_block(blocks, BlockType.SystemContext)
     assert payload is not None, "SystemContext block missing"
 
-    boot_time, target_count, table_bitmap = struct.unpack_from("<QII", payload, 0)
+    boot_time, target_count, table_bitmap = struct.unpack_from("<QBI", payload, 0)
     acq_len, host_len, dom_len, osd_len, cref_len = struct.unpack_from(
-        "<HHHHH", payload, 16,
+        "<HHHHH", payload, 13,
     )
     offset = 32
 
@@ -383,3 +383,234 @@ class TestValidateForensicString:
         # 130 × 2 = 260 bytes → rejected.
         with pytest.raises(ForensicStringError):
             validate_forensic_string("ä" * 130, field_name="x")
+
+
+# ---------------------------------------------------------------------------
+# include_kernel_symbols / include_kernel_modules flags on AttributionConfig
+# ---------------------------------------------------------------------------
+
+
+class TestIncludeKernelSymbolsFlag:
+    """Regression coverage for the ``include_kernel_symbols`` gate.
+
+    memslicer is process-centric, so kernel-wide posture blocks are
+    opt-in: the default must be ``False`` and the flag must be honoured
+    when explicitly enabled.
+    """
+
+    def test_default_attribution_config_include_kernel_symbols_false(self) -> None:
+        cfg = AttributionConfig()
+        assert cfg.include_kernel_symbols is False
+
+    def test_default_attribution_config_include_kernel_modules_false(self) -> None:
+        cfg = AttributionConfig()
+        assert cfg.include_kernel_modules is False
+
+    def test_validate_attribution_honours_true(self) -> None:
+        from memslicer.acquirer.identity import validate_attribution
+        cfg = validate_attribution(include_kernel_symbols=True)
+        assert cfg.include_kernel_symbols is True
+
+    def test_validate_attribution_honours_kernel_modules_true(self) -> None:
+        from memslicer.acquirer.identity import validate_attribution
+        cfg = validate_attribution(include_kernel_modules=True)
+        assert cfg.include_kernel_modules is True
+
+    def test_system_info_to_fields_respects_include_kernel_symbols(self) -> None:
+        from memslicer.acquirer.os_detail import system_info_to_fields
+
+        info = TargetSystemInfo()
+        info.page_size = 4096
+        info.kernel_build_id = "abcd1234"
+        info.kaslr_text_va = 0xFFFFFFFF81000000
+
+        without = system_info_to_fields(info, include_kernel_symbols=False)
+        assert "page_size" not in without
+        assert "kernel_build_id" not in without
+        assert "kaslr_text_va" not in without
+
+        with_ = system_info_to_fields(info, include_kernel_symbols=True)
+        assert with_["page_size"] == 4096
+        assert with_["kernel_build_id"] == "abcd1234"
+        assert with_["kaslr_text_va"] == 0xFFFFFFFF81000000
+
+
+# ---------------------------------------------------------------------------
+# include_module_build_ids flag
+# ---------------------------------------------------------------------------
+
+
+class TestIncludeModuleBuildIdsFlag:
+    """Regression coverage for the ``include_module_build_ids`` gate.
+
+    The live Path-A build-id extraction is opt-in: the default acquire
+    path must leave ``ModuleEntry.native_blob`` empty and must not call
+    through to the bridge's per-module reads.
+    """
+
+    def test_default_attribution_config_include_module_build_ids_false(
+        self,
+    ) -> None:
+        cfg = AttributionConfig()
+        assert cfg.include_module_build_ids is False
+
+    def test_validate_attribution_honours_include_module_build_ids(
+        self,
+    ) -> None:
+        from memslicer.acquirer.identity import validate_attribution
+        cfg = validate_attribution(include_module_build_ids=True)
+        assert cfg.include_module_build_ids is True
+        cfg_off = validate_attribution(include_module_build_ids=False)
+        assert cfg_off.include_module_build_ids is False
+
+
+# ---------------------------------------------------------------------------
+# include_target_introspection / include_environ flags
+# ---------------------------------------------------------------------------
+
+
+class TestIncludeTargetIntrospectionFlag:
+    """Regression coverage for the target-introspection attribution gates.
+
+    memslicer is process-centric, so the TargetIntrospection block is
+    opt-in: the default must be ``False`` so the default slice carries
+    only Process Identity for per-target metadata.
+    """
+
+    def test_default_attribution_config_include_target_introspection_false(
+        self,
+    ) -> None:
+        cfg = AttributionConfig()
+        assert cfg.include_target_introspection is False
+
+    def test_default_attribution_config_include_environ_false(self) -> None:
+        cfg = AttributionConfig()
+        assert cfg.include_environ is False
+
+    def test_validate_attribution_honours_include_target_introspection(
+        self,
+    ) -> None:
+        from memslicer.acquirer.identity import validate_attribution
+        cfg = validate_attribution(include_target_introspection=True)
+        assert cfg.include_target_introspection is True
+        cfg_off = validate_attribution(include_target_introspection=False)
+        assert cfg_off.include_target_introspection is False
+
+    def test_validate_attribution_honours_include_environ(self) -> None:
+        from memslicer.acquirer.identity import validate_attribution
+        cfg = validate_attribution(include_environ=True)
+        assert cfg.include_environ is True
+
+    def test_target_introspection_block_omitted_by_default(
+        self, tmp_path: Path,
+    ) -> None:
+        """With the default ``include_target_introspection=False`` the
+        acquire loop does NOT emit a ``TargetIntrospection`` block."""
+        bridge, collector = _minimal_bridge_and_collector()
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=collector,
+        )
+        output = tmp_path / "dump.msl"
+        engine.acquire(output)
+
+        raw = output.read_bytes()
+        blocks = _parse_blocks(raw)
+        types = {btype for (btype, _flags, _payload) in blocks}
+        assert BlockType.TargetIntrospection not in types
+
+    def test_target_introspection_block_emitted_when_flag_true(
+        self, tmp_path: Path,
+    ) -> None:
+        bridge, collector = _minimal_bridge_and_collector()
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=collector,
+            attribution=AttributionConfig(include_target_introspection=True),
+        )
+        output = tmp_path / "dump.msl"
+        engine.acquire(output)
+
+        raw = output.read_bytes()
+        blocks = _parse_blocks(raw)
+        types = {btype for (btype, _flags, _payload) in blocks}
+        assert BlockType.TargetIntrospection in types
+
+    def test_target_info_to_fields_respects_include_environ(self) -> None:
+        from memslicer.acquirer.os_detail import target_info_to_fields
+        info = TargetProcessInfo(
+            ppid=10, tracer_pid=1234,
+            environ="PATH=/bin\x00AWS_SECRET_ACCESS_KEY=<redacted>",
+            redacted_env_keys=["AWS_SECRET_ACCESS_KEY"],
+        )
+
+        without = target_info_to_fields(info, include_environ=False)
+        assert "target_environ" not in without
+        assert "target_redacted_env_keys" not in without
+        # Non-environ fields still projected.
+        assert without["target_tracer_pid"] == 1234
+        assert without["target_ppid"] == 10
+
+        with_ = target_info_to_fields(info, include_environ=True)
+        assert "target_environ" in with_
+        assert with_["target_redacted_env_keys"] == ["AWS_SECRET_ACCESS_KEY"]
+
+
+# ---------------------------------------------------------------------------
+# P1.6.4 — include_persistence_manifest flag
+# ---------------------------------------------------------------------------
+
+
+class TestIncludePersistenceManifestFlag:
+    """Regression coverage for the P1.6.4 persistence-manifest gate."""
+
+    def test_default_false(self) -> None:
+        cfg = AttributionConfig()
+        assert cfg.include_persistence_manifest is False
+
+    def test_validate_attribution_threads_flag(self) -> None:
+        from memslicer.acquirer.identity import validate_attribution
+        cfg = validate_attribution(include_persistence_manifest=True)
+        assert cfg.include_persistence_manifest is True
+        cfg_off = validate_attribution(include_persistence_manifest=False)
+        assert cfg_off.include_persistence_manifest is False
+
+    def test_system_info_to_fields_unaffected(self) -> None:
+        """The persistence-manifest flag gates wire emission of block
+        0x0056 only; ``system_info_to_fields`` never reads it."""
+        from memslicer.acquirer.os_detail import system_info_to_fields
+
+        info = TargetSystemInfo()
+        info.kptr_restrict = "2"
+        # Projection happens regardless of the flag.
+        fields = system_info_to_fields(info)
+        assert fields.get("kptr_restrict") == "2"
+
+    def test_persistence_manifest_block_omitted_by_default(
+        self, tmp_path: Path,
+    ) -> None:
+        bridge, collector = _minimal_bridge_and_collector()
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=collector,
+        )
+        output = tmp_path / "dump.msl"
+        engine.acquire(output)
+
+        raw = output.read_bytes()
+        blocks = _parse_blocks(raw)
+        types = {btype for (btype, _flags, _payload) in blocks}
+        assert BlockType.PersistenceManifest not in types
+
+    def test_persistence_manifest_block_emitted_when_flag_true(
+        self, tmp_path: Path,
+    ) -> None:
+        bridge, collector = _minimal_bridge_and_collector()
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=collector,
+            attribution=AttributionConfig(include_persistence_manifest=True),
+        )
+        output = tmp_path / "dump.msl"
+        engine.acquire(output)
+
+        raw = output.read_bytes()
+        blocks = _parse_blocks(raw)
+        types = {btype for (btype, _flags, _payload) in blocks}
+        assert BlockType.PersistenceManifest in types

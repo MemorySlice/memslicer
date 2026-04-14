@@ -382,7 +382,7 @@ class MockCollector:
             os_detail="Linux 6.1.0-generic x86_64",
         )
 
-    def collect_process_identity(self, pid):
+    def collect_process_identity(self, pid, **kwargs):
         return self.process_info
 
     def collect_system_info(self):
@@ -400,6 +400,24 @@ class MockCollector:
 
     def collect_handle_table(self, pid):
         return [HandleEntry(pid=pid, fd=3, handle_type=0x01, path="/tmp/test.log")]
+
+    def collect_persistence_manifest(self, **kwargs):
+        # P1.6.4 stub — engine only calls this when the
+        # ``--include-persistence-manifest`` flag is on.
+        from memslicer.msl.types import PersistenceManifest
+        return PersistenceManifest()
+
+    def collect_connectivity_table(self, **kwargs):
+        # P1.6.5 stub — returns an empty ConnectivityTable so the engine
+        # treats it as "no rows" and skips writing the 0x0054 block.
+        from memslicer.msl.types import ConnectivityTable
+        return ConnectivityTable()
+
+    def collect_kernel_module_list(self, **kwargs):
+        # P1.6.2 stub — returns an empty KernelModuleList so the engine
+        # skips writing the 0x0057 block.
+        from memslicer.msl.types import KernelModuleList
+        return KernelModuleList()
 
 
 # ---------------------------------------------------------------------------
@@ -509,12 +527,12 @@ class TestCollectorSystemContext:
         assert payload is not None, "SystemContext block not found"
 
         # Fixed 32-byte header:
-        # boot_time(8) + target_count(4) + table_bitmap(4)
+        # boot_time(8) + target_count(1) + table_bitmap(4)
         # + acq_user_len(2) + hostname_len(2) + domain_len(2) + os_detail_len(2)
         # + case_ref_len(2) + reserved(6)
-        boot_time, target_count, table_bitmap = struct.unpack_from("<QII", payload, 0)
+        boot_time, target_count, table_bitmap = struct.unpack_from("<QBI", payload, 0)
         acq_user_len, hostname_len, domain_len, os_detail_len, case_ref_len = struct.unpack_from(
-            "<HHHHH", payload, 16,
+            "<HHHHH", payload, 13,
         )
 
         assert boot_time == 1699000000_000000000
@@ -596,8 +614,8 @@ class TestCollectorSystemTables:
         payload = _find_block(blocks, BlockType.SystemContext)
         assert payload is not None, "SystemContext block not found"
 
-        # table_bitmap is at offset 12 in the 32-byte fixed header
-        _boot_time, _target_count, table_bitmap = struct.unpack_from("<QII", payload, 0)
+        # table_bitmap is at offset 9 in the 32-byte fixed header
+        _boot_time, _target_count, table_bitmap = struct.unpack_from("<QBI", payload, 0)
         assert table_bitmap & 0x01, "ProcessTable bit (0x01) should be set in table_bitmap"
         assert table_bitmap & 0x02, "ConnectionTable bit (0x02) should be set in table_bitmap"
         assert table_bitmap & 0x04, "HandleTable bit (0x04) should be set in table_bitmap"

@@ -38,7 +38,12 @@ class _FakeCollector:
 
     _is_memslicer_collector = True
 
-    def collect_process_identity(self, pid: int) -> TargetProcessInfo:
+    def collect_process_identity(
+        self, pid: int, **kwargs,
+    ) -> TargetProcessInfo:
+        # P1.6.3: accept include_target_introspection / include_environ
+        # kwargs for protocol compatibility; the fake collector doesn't
+        # care what's requested.
         return TargetProcessInfo(
             ppid=1,
             session_id=2,
@@ -92,7 +97,7 @@ class _EmptyCollector:
 
     _is_memslicer_collector = True
 
-    def collect_process_identity(self, pid): return TargetProcessInfo()
+    def collect_process_identity(self, pid, **kwargs): return TargetProcessInfo()
     def collect_system_info(self): return TargetSystemInfo()
     def collect_process_table(self, pid): return []
     def collect_connection_table(self): return []
