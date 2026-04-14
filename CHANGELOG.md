@@ -3,6 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 
+
+## [0.2.4] - 2026-04-14
+
+### Changes
+
+- serveral improvements in the linux acquisition
+
 ## [0.2.3] - 2026-04-12
 
 ### Bug Fixes
