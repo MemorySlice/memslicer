@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memslicer"
-version = "0.2.4"
+version = "0.2.6"
 description = "MSL memory dump tool with pluggable debugger backends (Frida, GDB, LLDB)"
 requires-python = ">= 3.10"
 license = "Apache-2.0"
