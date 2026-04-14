@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+
+## [0.2.3] - 2026-04-12
+
+### Bug Fixes
+
+- fix: workflow fixes regarding GROUP
+
 ## [0.1.0] - 2026-03-15
 
 Initial release of MemSlicer.
