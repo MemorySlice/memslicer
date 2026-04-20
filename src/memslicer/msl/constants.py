@@ -173,3 +173,17 @@ class ClockSource(IntEnum):
     QueryPerformanceCounter = 0x03
     mach_absolute_time = 0x04
     Other = 0xFF
+
+
+class HashAlgo(IntEnum):
+    """Integrity hash algorithm selector (spec Section 4.4, Table 12).
+
+    Applies to PrevHash, EoC FileHash, and Module Entry DiskHash.
+    All registered algorithms produce 32-byte output.
+    KDF always uses HKDF-BLAKE3 regardless of this setting.
+    """
+
+    BLAKE3 = 0x00       # Default.  High throughput via tree hashing and SIMD.
+    SHA256 = 0x01       # FIPS 180-4.  HW-accelerated on Intel SHA-NI / AMD Zen / ARMv8 CE.
+    SHA512_256 = 0x02   # FIPS 180-4.  Truncated SHA-512 with distinct IVs; fast on 64-bit w/o SHA-NI.
+    OTHER = 0xFF        # Non-standard; interpretation out of scope.

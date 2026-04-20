@@ -1,7 +1,7 @@
 # MemSlicer
 
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.2.6-green)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.2.7-green)](pyproject.toml)
 
 A memory acquisition tool that captures process memory snapshots into the MSL (Memory Slice) binary format. Supports multiple debugger backends (Frida, GDB, LLDB) and targets across Windows, Linux, macOS, Android, and iOS. Designed for forensic analysis, reverse engineering, and security research.
 
@@ -37,7 +37,7 @@ This installs memslicer with all backends (Frida, GDB, LLDB).
 ### From Source
 
 ```bash
-git clone https://github.com/danielbaier/memslicer.git
+git clone git@github.com:MemorySlice/memslicer.git
 cd memslicer
 pip install -e .
 ```
@@ -318,7 +318,7 @@ src/memslicer/
 ### Setup
 
 ```bash
-git clone https://github.com/danielbaier/memslicer.git
+git clone git@github.com:MemorySlice/memslicer.git
 cd memslicer
 pip install -e ".[dev]"
 ```

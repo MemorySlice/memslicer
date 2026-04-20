@@ -6,10 +6,11 @@ Covers the pure-function side of the D7 hybrid build-id extraction:
 """
 from __future__ import annotations
 
-import hashlib
 import struct
 import sys
 from pathlib import Path
+
+import blake3
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -163,7 +164,7 @@ class TestPopulateFromRegions:
         assert mod.native_blob[0] == 20
         assert mod.native_blob[1] == SOURCE_CAPTURED_REGION
         assert mod.native_blob[4:4 + 20] == _KNOWN_BUILD_ID
-        assert mod.disk_hash == hashlib.sha256(_FAKE_ELF[:4096]).digest()
+        assert mod.disk_hash == blake3.blake3(_FAKE_ELF[:4096]).digest()
 
     def test_skips_failed_page(self):
         mod = ModuleEntry(base_addr=0x400000, path="/usr/bin/app")
@@ -230,4 +231,4 @@ class TestPopulateFromRegions:
         populate_from_regions([mod], [region])
         # native_blob: build_id_len=0 + source=CAPTURED_REGION(4) + flags=0 + reserved=0
         assert mod.native_blob == bytes([0, SOURCE_CAPTURED_REGION, 0, 0])
-        assert mod.disk_hash == hashlib.sha256(b"\x00" * 4096).digest()
+        assert mod.disk_hash == blake3.blake3(b"\x00" * 4096).digest()

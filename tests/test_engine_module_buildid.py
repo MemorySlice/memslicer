@@ -7,11 +7,12 @@ cover the engine's contract end-to-end.
 """
 from __future__ import annotations
 
-import hashlib
 import struct
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import blake3
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -95,7 +96,7 @@ class TestPopulateFromBridge:
         populate_from_bridge([entry], self._bridge(_ELF))
 
         # The helper hashes exactly the bytes it read from the bridge.
-        assert entry.disk_hash == hashlib.sha256(_ELF).digest()
+        assert entry.disk_hash == blake3.blake3(_ELF).digest()
 
     def test_bridge_read_exception_leaves_empty(self):
         bridge = MagicMock()
@@ -147,7 +148,7 @@ class TestPopulateFromBridge:
         # native_blob populated with zero-length build-id + hash of the
         # read bytes. No exception.
         assert entry.native_blob == b"\x00\x01\x00\x00"  # len=0, src=bridge
-        assert entry.disk_hash == hashlib.sha256(garbage).digest()
+        assert entry.disk_hash == blake3.blake3(garbage).digest()
 
     def test_multiple_entries_processed(self):
         entries = [

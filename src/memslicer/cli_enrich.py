@@ -58,9 +58,10 @@ from memslicer.msl.constants import (
     HEADER_SIZE,
     BlockType,
     CompAlgo,
+    HashAlgo,
     PageState,
 )
-from memslicer.msl.iterator import iterate_blocks
+from memslicer.msl.iterator import iterate_blocks, read_hash_algo
 from memslicer.msl.types import (
     FileHeader,
     MemoryRegion,
@@ -215,10 +216,10 @@ def _extract_blob_fields(native_blob: bytes) -> tuple[int, int, int, bytes]:
 
 def _load_slice(
     slice_path: Path,
-) -> tuple[list[ModuleEntry], list[MemoryRegion], int]:
-    """Read modules, regions, and the EoC start offset from a slice.
+) -> tuple[list[ModuleEntry], list[MemoryRegion], int, HashAlgo]:
+    """Read modules, regions, the EoC start offset, and hash algo from a slice.
 
-    Returns ``(modules, regions, eoc_start_offset)``. Raises
+    Returns ``(modules, regions, eoc_start_offset, hash_algo)``. Raises
     :class:`FileNotFoundError` / :class:`ValueError` on missing or
     malformed files.
     """
@@ -227,6 +228,7 @@ def _load_slice(
     eoc_start: int | None = None
 
     with open(slice_path, "rb") as f:
+        hash_algo = read_hash_algo(f)
         for block in iterate_blocks(f):
             if block.block_type == BlockType.ModuleEntry:
                 modules.append(_parse_module_entry_minimal(block.payload))
@@ -241,7 +243,7 @@ def _load_slice(
             f"cannot determine where to append the manifest"
         )
 
-    return modules, regions, eoc_start
+    return modules, regions, eoc_start, hash_algo
 
 
 def _build_manifest_rows(modules: list[ModuleEntry]) -> list[ModuleBuildIdRow]:
@@ -359,7 +361,7 @@ def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
         output = slice_path.with_suffix(slice_path.suffix + ".enriched")
 
     try:
-        modules, regions, eoc_start = _load_slice(slice_path)
+        modules, regions, eoc_start, hash_algo = _load_slice(slice_path)
     except ValueError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
@@ -381,6 +383,7 @@ def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
         regions,
         source_id=SOURCE_RETROACTIVE,
         logger=_log,
+        hash_algo=hash_algo,
     )
 
     rows = _build_manifest_rows(unpopulated)

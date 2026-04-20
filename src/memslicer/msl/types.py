@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from memslicer.msl.constants import (
     OSType, ArchType, CompAlgo, PageState, RegionType, BlockType,
-    Endianness, VERSION, HASH_SIZE, ClockSource,
+    Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo,
 )
 
 
@@ -22,6 +22,7 @@ class FileHeader:
     pid: int = 0
     clock_source: ClockSource = ClockSource.Unknown
     block_count: int = 0  # 0 = streaming/unknown
+    hash_algo: HashAlgo = HashAlgo.BLAKE3  # integrity hash algorithm (spec Section 4.4)
 
 
 @dataclass

@@ -17,7 +17,7 @@ from memslicer.acquirer.investigation import InvestigationCollector
 from memslicer.acquirer.os_detail import pack_os_detail, system_info_to_fields
 from memslicer.acquirer.region_filter import RegionFilter
 from memslicer.msl.constants import (
-    CompAlgo, OSType, PageState, RegionType, CapBit,
+    CompAlgo, HashAlgo, OSType, PageState, RegionType, CapBit,
     Endianness, VERSION, HASH_SIZE, FLAG_INVESTIGATION, FLAG_ENCRYPTED,
 )
 from memslicer.msl.types import (
@@ -245,9 +245,11 @@ class AcquisitionEngine(BaseAcquirer):
         collector: InvestigationCollector | None = None,
         *,
         attribution: AttributionConfig | None = None,
+        hash_algo: HashAlgo = HashAlgo.BLAKE3,
     ) -> None:
         self._bridge = bridge
         self._comp_algo = comp_algo
+        self._hash_algo = hash_algo
         self._filter = region_filter or RegionFilter()
         self._os_override = os_override
         self._abort = threading.Event()
@@ -349,13 +351,14 @@ class AcquisitionEngine(BaseAcquirer):
             # ``include_module_build_ids`` — the default acquire path
             # produces lean ModuleEntry blocks without build-ids so
             # that a minimal process-centric slice does not pay for
-            # per-module bridge reads and SHA-256 work. Operators who
+            # per-module bridge reads and hash work. Operators who
             # need build-ids either pass the flag or run
             # ``memslicer-enrich`` on the finished slice (Path C).
             if module_entries and self._attribution.include_module_build_ids:
                 try:
                     populate_from_bridge(
                         module_entries, self._bridge, logger=self._log,
+                        hash_algo=self._hash_algo,
                     )
                 except Exception as exc:  # noqa: BLE001
                     self._log.warning(
@@ -392,6 +395,7 @@ class AcquisitionEngine(BaseAcquirer):
                 os_type=os_type,
                 arch_type=arch_type,
                 pid=pid,
+                hash_algo=self._hash_algo,
             )
 
             with open(output_path, "wb") as f:

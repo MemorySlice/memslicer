@@ -21,12 +21,12 @@ All three paths share the ELF parser in :mod:`memslicer.acquirer.elf_notes`.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from typing import Iterable, Protocol
 
 from memslicer.acquirer.elf_notes import extract_build_id
-from memslicer.msl.constants import PageState
+from memslicer.msl.constants import HashAlgo, PageState
+from memslicer.msl.integrity import make_hasher
 from memslicer.msl.types import MemoryRegion, ModuleEntry
 
 
@@ -110,6 +110,7 @@ def populate_from_bridge(
     entries: list[ModuleEntry],
     bridge: BridgeProtocol,
     logger: logging.Logger | None = None,
+    hash_algo: HashAlgo = HashAlgo.BLAKE3,
 ) -> list[ModuleEntry]:
     """Path A: live extraction via ``bridge.read_memory``.
 
@@ -139,7 +140,7 @@ def populate_from_bridge(
                 entry.path, entry.base_addr,
             )
             continue
-        _apply_extraction(entry, data, source_id=SOURCE_BRIDGE, log=log)
+        _apply_extraction(entry, data, source_id=SOURCE_BRIDGE, log=log, hash_algo=hash_algo)
     return entries
 
 
@@ -148,6 +149,7 @@ def populate_from_regions(
     captured_regions: Iterable[MemoryRegion],
     logger: logging.Logger | None = None,
     source_id: int = SOURCE_CAPTURED_REGION,
+    hash_algo: HashAlgo = HashAlgo.BLAKE3,
 ) -> list[ModuleEntry]:
     """Paths B and C: extract from already-captured ``MemoryRegion`` data.
 
@@ -180,7 +182,7 @@ def populate_from_regions(
                 entry.path, entry.base_addr,
             )
             continue
-        _apply_extraction(entry, data, source_id=source_id, log=log)
+        _apply_extraction(entry, data, source_id=source_id, log=log, hash_algo=hash_algo)
     return entries
 
 
@@ -189,14 +191,16 @@ def _apply_extraction(
     data: bytes,
     source_id: int,
     log: logging.Logger,
+    hash_algo: HashAlgo = HashAlgo.BLAKE3,
 ) -> None:
-    """Run the ELF parser + SHA-256 and populate ``entry`` in place.
+    """Run the ELF parser and populate ``entry`` in place.
 
     ``native_blob`` always ends up set (possibly with a zero-length
     build-id when extraction failed); ``disk_hash`` is always the
-    SHA-256 of the bytes we read, regardless of whether the parser
-    recognised them. Both fields serve as collision-resistant anchors
-    for downstream symbol lookup even when the build-id is missing.
+    hash (using the file's selected ``HashAlgo``) of the bytes we
+    read, regardless of whether the parser recognised them. Both
+    fields serve as collision-resistant anchors for downstream symbol
+    lookup even when the build-id is missing.
     """
     if len(data) < 64:
         return
@@ -212,7 +216,9 @@ def _apply_extraction(
         build_id, _ = result
 
     entry.native_blob = _encode_native_blob(build_id, source_id, flags)
-    entry.disk_hash = hashlib.sha256(data).digest()
+    h = make_hasher(hash_algo)
+    h.update(data)
+    entry.disk_hash = h.digest()
 
 
 __all__ = (

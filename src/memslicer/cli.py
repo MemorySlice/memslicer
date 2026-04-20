@@ -15,7 +15,7 @@ from memslicer.acquirer.identity import (
     validate_attribution,
 )
 from memslicer.acquirer.region_filter import RegionFilter, SKIP_REASON_LABELS
-from memslicer.msl.constants import CompAlgo, OSType
+from memslicer.msl.constants import CompAlgo, HashAlgo, OSType
 from memslicer.utils.protection import parse_protection
 
 
@@ -161,6 +161,7 @@ def _create_acquirer(
     investigation: bool = False,
     passphrase: str | None = None,
     attribution=None,
+    hash_algo: HashAlgo = HashAlgo.BLAKE3,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -246,6 +247,7 @@ def _create_acquirer(
         passphrase=passphrase,
         collector=collector,
         attribution=attribution,
+        hash_algo=hash_algo,
     )
 
 
@@ -267,10 +269,11 @@ def _create_acquirer(
 @click.option("--encrypt", "-E", is_flag=True, default=False, help="Enable AEAD encryption")
 @click.option("--no-encrypt", is_flag=True, default=False, help="Disable encryption (overrides investigation default)")
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
+@click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
 @attribution_options
 def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, max_region_size, investigation,
-        encrypt, no_encrypt, passphrase,
+        encrypt, no_encrypt, passphrase, hash_algo_str,
         examiner, case_ref, hostname_override, domain_override,
         include_serials, include_network_identity, include_fingerprint,
         include_kernel_symbols, include_kernel_modules,
@@ -339,6 +342,10 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
     # Parse compression
     comp_map = {"none": CompAlgo.NONE, "zstd": CompAlgo.ZSTD, "lz4": CompAlgo.LZ4}
     comp_algo = comp_map[comp]
+
+    # Parse hash algorithm
+    hash_algo_map = {"blake3": HashAlgo.BLAKE3, "sha256": HashAlgo.SHA256, "sha512-256": HashAlgo.SHA512_256}
+    hash_algo = hash_algo_map[hash_algo_str]
 
     # Parse OS override
     os_map = {"windows": OSType.Windows, "linux": OSType.Linux, "macos": OSType.macOS, "android": OSType.Android, "ios": OSType.iOS}
@@ -414,6 +421,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         investigation=investigation,
         passphrase=passphrase if use_encryption else None,
         attribution=attribution,
+        hash_algo=hash_algo,
     )
     acquirer.set_progress_callback(progress)
 

@@ -47,7 +47,7 @@ class MSLWriter:
         self._output = output
         self._header = header
         self._comp_algo = comp_algo
-        self._chain = IntegrityChain()
+        self._chain = IntegrityChain(hash_algo=header.hash_algo)
         self._block_index: int = 0
         self._encrypted = bool(encryption_key)
         self._encryption_params = None
@@ -88,7 +88,7 @@ class MSLWriter:
         header_size = ENCRYPTED_HEADER_SIZE if self._encrypted else HEADER_SIZE
 
         base_header = struct.pack(
-            "<8sBBHIQ16sQHHIBI3s",
+            "<8sBBHIQ16sQHHIBIB2s",
             FILE_MAGIC,                          # 8B magic
             h.endianness,                        # 1B
             header_size,                         # 1B header size (64 or 128)
@@ -102,7 +102,8 @@ class MSLWriter:
             h.pid,                               # 4B
             h.clock_source,                      # 1B ClockSource
             h.block_count,                       # 4B BlockCount (0=streaming)
-            b"\x00" * 3,                         # 3B reserved
+            h.hash_algo,                         # 1B HashAlgo (spec Section 4.4)
+            b"\x00" * 2,                         # 2B reserved
         )
         assert len(base_header) == HEADER_SIZE
 

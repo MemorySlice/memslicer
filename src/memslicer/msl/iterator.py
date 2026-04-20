@@ -37,6 +37,7 @@ from memslicer.msl.constants import (
     HEADER_SIZE,
     BlockType,
     CompAlgo,
+    HashAlgo,
 )
 
 
@@ -64,10 +65,10 @@ class BlockRecord:
     end_offset: int
 
 
-def _read_file_header_size(f: BinaryIO) -> int:
-    """Validate the file magic/flags and return the header size.
+def _read_file_header_info(f: BinaryIO) -> tuple[int, HashAlgo]:
+    """Validate the file magic/flags and return (header_size, hash_algo).
 
-    Returns :data:`HEADER_SIZE` (64) for unencrypted slices. Raises
+    Returns ``(HEADER_SIZE, hash_algo)`` for unencrypted slices. Raises
     :class:`ValueError` on bad magic or when the ``FLAG_ENCRYPTED`` bit
     is set (encrypted-read support is P1.8 scope).
     """
@@ -79,19 +80,37 @@ def _read_file_header_size(f: BinaryIO) -> int:
         raise ValueError(
             f"bad MSL file magic: expected {FILE_MAGIC!r}, got {magic!r}"
         )
-    # File header layout (first 16 bytes of the 64-byte header):
-    #   magic(8) + endianness(1) + header_size(1) + version(2) + flags(4)
-    # flags is the 4-byte field at offset 12 (see writer._write_header
-    # pack format "<8sBBHIQ...").
-    f.seek(12)
-    flags_bytes = f.read(4)
-    flags = struct.unpack("<I", flags_bytes)[0]
-    f.seek(pos)
+    # flags is the 4-byte field at offset 0x0C
+    f.seek(0x0C)
+    flags = struct.unpack("<I", f.read(4))[0]
     if flags & FLAG_ENCRYPTED:
+        f.seek(pos)
         raise ValueError(
             "encrypted slices are not yet supported for read — P1.8 scope"
         )
-    return HEADER_SIZE
+    # HashAlgo is the 1-byte field at offset 0x3D (spec Table 3)
+    f.seek(0x3D)
+    hash_algo_byte = struct.unpack("B", f.read(1))[0]
+    try:
+        hash_algo = HashAlgo(hash_algo_byte)
+    except ValueError:
+        f.seek(pos)
+        raise ValueError(
+            f"unsupported HashAlgo code 0x{hash_algo_byte:02X} at offset 0x3D; "
+            f"supported: {', '.join(f'0x{a.value:02X}={a.name}' for a in HashAlgo)}"
+        )
+    f.seek(pos)
+    return HEADER_SIZE, hash_algo
+
+
+def read_hash_algo(f: BinaryIO) -> HashAlgo:
+    """Read and return the ``HashAlgo`` from an open MSL file.
+
+    The file position is restored after reading. Raises
+    :class:`ValueError` for invalid magic or unsupported algorithm codes.
+    """
+    _, hash_algo = _read_file_header_info(f)
+    return hash_algo
 
 
 def iterate_blocks(f: BinaryIO) -> Iterator[BlockRecord]:
@@ -102,7 +121,7 @@ def iterate_blocks(f: BinaryIO) -> Iterator[BlockRecord]:
     stops when an :data:`BlockType.EndOfCapture` block is yielded or
     when EOF is reached; structural errors raise :class:`ValueError`.
     """
-    header_size = _read_file_header_size(f)
+    header_size, _hash_algo = _read_file_header_info(f)
     f.seek(header_size)
 
     while True:
