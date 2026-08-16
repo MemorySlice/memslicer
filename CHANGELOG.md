@@ -136,6 +136,13 @@ All notable changes to this project will be documented in this file.
 - The Yama `ptrace_scope` check is shared by all three backends; the Frida
   bridge gained the check it never had.
 
+
+## [0.2.7] - 2026-04-20
+
+### Changes
+
+- fixes regarding the latest changes in the specification; add now the possibility to change the blake3 hash
+
 ## [0.2.4] - 2026-04-14
 
 ### Changes
