@@ -1,6 +1,6 @@
 """MemSlicer - Memory slice capture and analysis toolkit."""
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 from memslicer.msl.constants import (
     BlockType,
@@ -18,6 +18,13 @@ from memslicer.acquirer.bridge import (
     MemoryRange,
     ModuleInfo,
     PlatformInfo,
+    ReadResult,
+)
+from memslicer.acquirer.errors import (
+    EXIT_PREFLIGHT_REFUSED,
+    AttachError,
+    AttachPreflightError,
+    MemslicerError,
 )
 from memslicer.acquirer.engine import AcquisitionEngine
 from memslicer.msl.types import (
@@ -42,6 +49,11 @@ __all__ = [
     "MemoryRange",
     "ModuleInfo",
     "PlatformInfo",
+    "ReadResult",
+    "MemslicerError",
+    "AttachError",
+    "AttachPreflightError",
+    "EXIT_PREFLIGHT_REFUSED",
     "AcquisitionEngine",
     "SystemContext",
     "KeyHint",

@@ -1,13 +1,19 @@
 """Frida-based DebuggerBridge implementation."""
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import Any
 
-from memslicer.acquirer.bridge import (
-    DebuggerBridge, MemoryRange, ModuleInfo, PlatformInfo,
+from memslicer.acquirer.attach_preflight import (
+    PreflightResult, enforce_attach_preflight,
 )
-from memslicer.acquirer.platform_detect import detect_platform
+from memslicer.acquirer.bridge import (
+    MemoryRange, ModuleInfo, PlatformInfo, ReadResult,
+    parse_fault_addr,
+)
+from memslicer.acquirer.errors import AttachError
+from memslicer.acquirer.platform_detect import detect_platform, parse_maps_text
 
 
 # Frida JS script for RPC exports
@@ -20,8 +26,26 @@ rpc.exports = {
         try {
             return ptr(addr).readByteArray(size);
         } catch (e) {
-            send({type: 'read-error', addr: addr, size: size, error: e.message, stack: e.stack || ''});
-            return null;
+            return {
+                __error: true, addr: addr, size: size,
+                message: e.message || String(e), stack: e.stack || ''
+            };
+        }
+    },
+    readProcMaps: function() {
+        if (Process.platform !== 'linux') return '';
+        try {
+            return File.readAllText('/proc/self/maps');
+        } catch (e) {}
+        try {
+            // /proc/*/maps is a seq_file: a single read() can short-return,
+            // so loop until exhausted.
+            var f = new File('/proc/self/maps', 'r'), out = '', chunk;
+            while ((chunk = f.read(65536)) && chunk.length > 0) out += chunk;
+            f.close();
+            return out;
+        } catch (e) {
+            return '';
         }
     },
     getPageSize: function() {
@@ -79,6 +103,10 @@ class FridaBridge:
         self._api: Any | None = None
         self._platform_info: PlatformInfo | None = None
         self._modules_cache: list[dict] | None = None
+        # Lazily fetched (start, end, name) spans from the target's own maps;
+        # None until the first enumerate_ranges() call.
+        self._map_spans: list[tuple[int, int, str]] | None = None
+        self._preflight: PreflightResult | None = None
 
     @property
     def is_remote(self) -> bool:
@@ -119,7 +147,20 @@ class FridaBridge:
         else:
             self._log.info("Attaching to process '%s'...", self._target)
 
-        session = self._device.attach(self._target)
+        self._preflight = enforce_attach_preflight(
+            self._target if isinstance(self._target, int) else None,
+            is_remote=self.is_remote,
+            logger=self._log,
+        )
+
+        try:
+            session = self._device.attach(self._target)
+        except Exception as e:
+            raise AttachError(
+                f"attach to {self._target} failed: {e}",
+                probable_cause=self._preflight.probable_cause(),
+                cause=e,
+            ) from e
         self._session = session
 
         self._log.info("Loading agent script...")
@@ -170,19 +211,70 @@ class FridaBridge:
             raise RuntimeError("FridaBridge.connect() must be called first")
         return self._platform_info
 
+    def _fetch_target_map_spans(self) -> list[tuple[int, int, str]]:
+        """Return sorted ``(start, end, name)`` spans from the target's maps.
+
+        Frida only reports a path for file-backed ranges, so pseudo-mappings
+        such as ``[vvar]``, ``[heap]`` and ``[stack]`` are invisible to
+        :meth:`enumerate_ranges`. The agent runs inside the target, so reading
+        ``/proc/self/maps`` there recovers those names for local *and* remote
+        devices without needing any host privilege.
+
+        Returns:
+            Named spans sorted by start address, or ``[]`` when unavailable.
+        """
+        fetch = getattr(self._api, "read_proc_maps", None)
+        if fetch is None:
+            return []
+        try:
+            text = fetch()
+        except Exception as e:
+            self._log.debug("readProcMaps RPC failed: %s", e)
+            return []
+        if not isinstance(text, str) or not text:
+            return []
+        return sorted(
+            (r.base, r.base + r.size, r.file_path)
+            for r in parse_maps_text(text) if r.file_path
+        )
+
+    def _lookup_map_name(self, base: int) -> str:
+        """Return the maps name of the span containing *base*, or ``""``."""
+        spans = self._map_spans
+        if not spans:
+            return ""
+        idx = bisect.bisect_right(spans, base, key=lambda span: span[0]) - 1
+        if idx < 0:
+            return ""
+        start, end, name = spans[idx]
+        return name if start <= base < end else ""
+
     def enumerate_ranges(self) -> list[MemoryRange]:
         """Enumerate all memory ranges via Frida RPC."""
+        if self._map_spans is None:
+            self._map_spans = self._fetch_target_map_spans()
+
         raw = self._api.enumerate_ranges("---")
         ranges: list[MemoryRange] = []
+        named = 0
         for r in raw:
             file_info = r.get("file")
             file_path = file_info.get("path", "") if file_info else ""
+            base = _parse_frida_addr(r["base"])
+            if not file_path:
+                file_path = self._lookup_map_name(base)
+                if file_path:
+                    named += 1
             ranges.append(MemoryRange(
-                base=_parse_frida_addr(r["base"]),
+                base=base,
                 size=r["size"],
                 protection=r["protection"],
                 file_path=file_path,
             ))
+        if named:
+            self._log.debug(
+                "maps enrichment: named %d/%d ranges", named, len(ranges),
+            )
         return ranges
 
     def enumerate_modules(self) -> list[ModuleInfo]:
@@ -198,21 +290,52 @@ class FridaBridge:
             for m in raw
         ]
 
-    def read_memory(self, address: int, size: int) -> bytes | None:
-        """Read memory via Frida RPC. Returns None on failure."""
+    def read_memory_ex(self, address: int, size: int) -> ReadResult:
+        """Read memory via Frida RPC, reporting the fault address on failure.
+
+        The agent returns either an ArrayBuffer (marshalled as ``bytes``) or an
+        error descriptor (marshalled as ``dict``), so the two cases are
+        unambiguous without out-of-band messages.
+
+        Args:
+            address: Address to read from.
+            size: Number of bytes to read.
+
+        Returns:
+            A :class:`ReadResult` carrying the data or the failure detail.
+        """
         try:
             data = self._api.read_memory(hex(address), size)
-            if data is None:
-                return None
-            return _ensure_bytes(data)
         except Exception as e:
             self._log.debug(
                 "Read exception at 0x%x size=%d: %s", address, size, e,
             )
-            return None
+            return ReadResult(data=None, error=str(e))
+
+        if isinstance(data, dict) and data.get("__error"):
+            message = str(data.get("message", "unknown"))
+            self._log.debug(
+                "Read failed at 0x%x size=%d: %s", address, size, message,
+            )
+            return ReadResult(
+                data=None,
+                # Frida reports a real CPU fault address, so it is trusted even
+                # when it equals the address asked for: that means the first
+                # page of the span is the dead one.
+                fault_addr=parse_fault_addr(message),
+                error=message,
+            )
+        if data is None:
+            return ReadResult(data=None)
+        return ReadResult(data=_ensure_bytes(data))
+
+    def read_memory(self, address: int, size: int) -> bytes | None:
+        """Read memory via Frida RPC. Returns None on failure."""
+        return self.read_memory_ex(address, size).data
 
     def disconnect(self) -> None:
         """Detach the Frida session."""
+        self._map_spans = None
         session = self._session
         if session is not None:
             try:

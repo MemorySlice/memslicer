@@ -2,7 +2,10 @@
 from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
 from memslicer.cli import cli
-from memslicer.acquirer.base import AcquireResult
+from memslicer.acquirer.base import AcquireResult, UnreadableRange
+from memslicer.acquirer.errors import (
+    EXIT_PREFLIGHT_REFUSED, AttachError, AttachPreflightError,
+)
 
 
 def _mock_acquire_result(**overrides):
@@ -204,10 +207,28 @@ def test_rwx_summary_hidden_when_zero(mock_factory):
 
 
 @patch("memslicer.cli._create_acquirer")
-def test_capture_quality_good(mock_factory):
-    """Quality shows GOOD when capture rate >= 90%."""
+def test_capture_quality_excellent(mock_factory):
+    """Quality shows EXCELLENT when no page failed."""
     mock_acquirer = _make_mock_acquirer(
         regions_captured=9, regions_total=10, regions_skipped=0,
+        pages_captured=100, pages_failed=0,
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "EXCELLENT" in result.output
+    assert "Quality" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_capture_quality_good(mock_factory):
+    """Quality shows GOOD when capture rate >= 95% but pages were lost."""
+    mock_acquirer = _make_mock_acquirer(
+        regions_captured=9, regions_total=10, regions_skipped=0,
+        pages_captured=96, pages_failed=4,
     )
     mock_factory.return_value = mock_acquirer
 
@@ -454,3 +475,281 @@ def test_backend_shown_in_output(mock_factory):
 
     assert result.exit_code == 0
     assert "Backend: frida" in result.output
+
+
+# ---------- Kernel pseudo-mapping reporting ----------
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_expected_unreadable_does_not_spoil_quality(mock_factory):
+    """Pages the kernel refuses by design are excluded, not counted as loss:
+    the capture still reads 100% complete and EXCELLENT."""
+    mock_acquirer = _make_mock_acquirer(
+        regions_captured=120, regions_total=120, regions_skipped=0,
+        pages_captured=3245, pages_failed=0,
+        pages_expected_unreadable=3,
+        bytes_expected_unreadable=3 * 4096,
+        expected_unreadable_regions=["[vvar_vclock]"],
+        bytes_captured=3245 * 4096, bytes_attempted=3248 * 4096,
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "100.0%" in result.output
+    assert "Excluded:" in result.output
+    assert "[vvar_vclock]" in result.output
+    assert "not counted as data loss" in result.output
+    assert "EXCELLENT" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_excluded_line_hidden_when_nothing_expected(mock_factory):
+    """No kernel pseudo-mapping was attempted, so no Excluded: line."""
+    mock_acquirer = _make_mock_acquirer(
+        pages_captured=10, pages_failed=0, pages_expected_unreadable=0,
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "Excluded:" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_byte_percentage_excludes_expected_unreadable_bytes(mock_factory):
+    """The denominator is bytes_attempted - bytes_expected_unreadable."""
+    mock_acquirer = _make_mock_acquirer(
+        pages_captured=8, pages_failed=0,
+        pages_expected_unreadable=2,
+        bytes_captured=24576, bytes_attempted=40960,
+        bytes_expected_unreadable=8192,
+        expected_unreadable_regions=["[vvar]"],
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    # 24,576 / (40,960 - 8,192) = 75.0%, not 24,576 / 40,960 = 60.0%
+    assert "24,576 / 32,768 readable (75.0%)" in result.output
+    assert "60.0%" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_kernel_pseudo_skip_reason_label(mock_factory):
+    """The kernel-pseudo skip reason renders its human-readable label."""
+    mock_acquirer = _make_mock_acquirer(
+        regions_captured=8, regions_total=10, regions_skipped=2,
+        skip_reasons={"kernel-pseudo": 2},
+        pages_captured=100, pages_failed=0,
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "2 kernel pseudo-mapping, unreadable by design" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_skip_kernel_pseudo_flag(mock_factory):
+    """--skip-kernel-pseudo sets skip_kernel_pseudo on the region filter."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--skip-kernel-pseudo"])
+
+    assert result.exit_code == 0
+    rf = mock_factory.call_args[1]["region_filter"]
+    assert rf.skip_kernel_pseudo is True
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_skip_kernel_pseudo_off_by_default(mock_factory):
+    """Without the flag the acquirer still attempts the pseudo-mappings."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    rf = mock_factory.call_args[1]["region_filter"]
+    assert rf.skip_kernel_pseudo is False
+
+
+# ---------- Attach failure rendering ----------
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_preflight_refusal_uses_dedicated_exit_code(mock_factory):
+    """A refusal before the attach exits 3 so scripts can tell it apart."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.acquire.side_effect = AttachPreflightError(
+        "cannot attach to PID 9999: Yama ptrace_scope is 2",
+        remediation=["Run as root, or document the sysctl change"],
+        probable_cause="apparmor profile snap.foo",
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["9999", "-o", "test.msl"])
+
+    assert result.exit_code == EXIT_PREFLIGHT_REFUSED == 3
+    assert "Error:" in result.output
+    assert "Yama ptrace_scope is 2" in result.output
+    assert "→ Run as root" in result.output
+    assert "Probable cause: apparmor profile snap.foo" in result.output
+    assert "test.msl.log" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_attach_error_exits_one_with_the_same_rendering(mock_factory):
+    """A failed attach is a generic failure (exit 1) but reads identically."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.acquire.side_effect = AttachError(
+        "attach to 9999 failed: unable to access process",
+        remediation=["Check that the process still exists"],
+        probable_cause="Yama ptrace_scope is 1",
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["9999", "-o", "test.msl"])
+
+    assert result.exit_code == 1
+    assert "Error: attach to 9999 failed" in result.output
+    assert "→ Check that the process still exists" in result.output
+    assert "Probable cause: Yama ptrace_scope is 1" in result.output
+    assert "test.msl.log" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_generic_exception_rendering_unchanged(mock_factory):
+    """Errors without remediation keep the plain one-line rendering."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.acquire.side_effect = RuntimeError("Process not found")
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["9999", "-o", "test.msl"])
+
+    assert result.exit_code == 1
+    assert "Error: Process not found" in result.output
+    assert "→" not in result.output
+    assert "Probable cause" not in result.output
+
+
+# ---------- Unreadable range reporting ----------
+
+
+from memslicer.cli import _echo_unreadable_ranges
+
+
+def _range(index, *, expected=False, size=4096):
+    """Build an UnreadableRange at a predictable address."""
+    return UnreadableRange(
+        base=0x10000 + index * 0x10000,
+        size=size,
+        region_base=0x10000 + index * 0x10000,
+        file_path="[vvar]" if expected else "",
+        expected=expected,
+    )
+
+
+def test_echo_unreadable_lists_failed_ranges(capsys):
+    result = _mock_acquire_result(unreadable_ranges=[_range(0), _range(1)])
+
+    _echo_unreadable_ranges(result)
+
+    out = capsys.readouterr().out
+    assert "Missing : 2 unreadable range(s)" in out
+    assert "0x10000-0x11000" in out
+    assert "0x20000-0x21000" in out
+    assert "more" not in out
+
+
+def test_echo_unreadable_omits_expected_ranges(capsys):
+    """Kernel pseudo-mappings are summarised on the Excluded: line instead."""
+    result = _mock_acquire_result(unreadable_ranges=[
+        _range(0), _range(1, expected=True), _range(2, expected=True),
+    ])
+
+    _echo_unreadable_ranges(result)
+
+    out = capsys.readouterr().out
+    assert "Missing : 1 unreadable range(s)" in out
+    assert "[vvar]" not in out
+
+
+def test_echo_unreadable_silent_when_all_expected(capsys):
+    result = _mock_acquire_result(unreadable_ranges=[
+        _range(0, expected=True), _range(1, expected=True),
+    ])
+
+    _echo_unreadable_ranges(result)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_echo_unreadable_collapses_beyond_five(capsys):
+    result = _mock_acquire_result(
+        unreadable_ranges=[_range(i) for i in range(8)],
+    )
+
+    _echo_unreadable_ranges(result)
+
+    out = capsys.readouterr().out
+    assert "Missing : 8 unreadable range(s)" in out
+    assert out.count("0x") == 10  # five listed ranges, two addresses each
+    assert "and 3 more — see the log" in out
+
+
+def test_echo_unreadable_counts_truncated_ranges(capsys):
+    """Ranges dropped by the engine's cap are added to the hidden count."""
+    result = _mock_acquire_result(
+        unreadable_ranges=[_range(i) for i in range(6)],
+        unreadable_ranges_truncated=4,
+    )
+
+    _echo_unreadable_ranges(result)
+
+    assert "and 5 more — see the log" in capsys.readouterr().out
+
+
+def test_echo_unreadable_shows_region_name(capsys):
+    result = _mock_acquire_result(unreadable_ranges=[UnreadableRange(
+        base=0x7F00, size=8192, region_base=0x7F00,
+        file_path="/usr/lib/libc.so.6",
+    )])
+
+    _echo_unreadable_ranges(result)
+
+    out = capsys.readouterr().out
+    assert "/usr/lib/libc.so.6" in out
+    assert "(8,192 bytes)" in out
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_unreadable_ranges_shown_in_summary(mock_factory):
+    """The summary names the ranges that were genuinely lost."""
+    mock_acquirer = _make_mock_acquirer(
+        pages_captured=9, pages_failed=1,
+        unreadable_ranges=[_range(0), _range(1, expected=True)],
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "Missing : 1 unreadable range(s)" in result.output
+    assert "0x10000-0x11000" in result.output

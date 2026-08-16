@@ -11,7 +11,29 @@ SKIP_REASON_LABELS = {
     "addr-range": "outside address range filter",
     "path-include": "path did not match include filter",
     "path-exclude": "path matched exclude filter",
+    "kernel-pseudo": "kernel pseudo-mapping, unreadable by design",
 }
+
+
+# Kernel-provided mappings that appear readable in /proc/<pid>/maps but fault
+# on ptrace / process_vm_readv reads.  Linux 6.13 split [vvar] into [vvar] and
+# [vvar_vclock], so both names occur in the wild.
+#
+# [vdso] is deliberately absent: it is genuinely readable and forensically
+# relevant.
+KERNEL_PSEUDO_NAMES = frozenset({"[vvar]", "[vvar_vclock]", "[vsyscall]"})
+
+
+def is_kernel_pseudo_region(file_path: str) -> bool:
+    """Whether *file_path* names a kernel mapping that cannot be read.
+
+    Args:
+        file_path: Region name from ``/proc/<pid>/maps``, e.g. ``[vvar]``.
+
+    Returns:
+        ``True`` for kernel pseudo-mappings, ``False`` otherwise.
+    """
+    return file_path.strip() in KERNEL_PSEUDO_NAMES
 
 
 @dataclass
@@ -25,6 +47,9 @@ class RegionFilter:
                   E.g., 1 = must be readable.
         include_paths: Regex patterns; if non-empty, region file path must match at least one.
         exclude_paths: Regex patterns; region file path must NOT match any.
+        skip_kernel_pseudo: Skip kernel pseudo-mappings outright instead of
+                  attempting them. Off by default so the acquirer still tries
+                  the read and records the kernel's answer.
     """
     addr_ranges: list[tuple[int, int]] = field(default_factory=list)
     min_prot: int = 0
@@ -32,6 +57,7 @@ class RegionFilter:
     exclude_paths: list[str] = field(default_factory=list)
     skip_no_read: bool = True
     max_region_size: int = 0
+    skip_kernel_pseudo: bool = False
 
     def __post_init__(self) -> None:
         self._compiled_includes = [re.compile(p) for p in self.include_paths]
@@ -45,6 +71,8 @@ class RegionFilter:
         """Return the reason a region would be skipped, or None if it passes."""
         if self.skip_no_read and (protection & 1) == 0:
             return "no-read"
+        if self.skip_kernel_pseudo and is_kernel_pseudo_region(file_path):
+            return "kernel-pseudo"
         if self.max_region_size > 0 and size > self.max_region_size:
             return "max-size"
         if self.min_prot and (protection & self.min_prot) != self.min_prot:

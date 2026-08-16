@@ -9,6 +9,12 @@ from pathlib import Path
 
 import click
 
+from memslicer.acquirer.base import AcquireResult
+from memslicer.acquirer.errors import (
+    EXIT_PREFLIGHT_REFUSED,
+    AttachError,
+    AttachPreflightError,
+)
 from memslicer.acquirer.identity import (
     ForensicStringError,
     attribution_options,
@@ -17,6 +23,47 @@ from memslicer.acquirer.identity import (
 from memslicer.acquirer.region_filter import RegionFilter, SKIP_REASON_LABELS
 from memslicer.msl.constants import CompAlgo, HashAlgo, OSType
 from memslicer.utils.protection import parse_protection
+
+# How many unreadable ranges to name on the console before deferring to the log.
+_MAX_SHOWN_UNREADABLE = 5
+
+
+def _render_attach_error(error: AttachError, log_file_path: str) -> None:
+    """Print an attach failure as one actionable block.
+
+    Args:
+        error: The attach error to render.
+        log_file_path: Path of the ``.msl.log`` holding the full record.
+    """
+    click.echo(f"\nError: {error}", err=True)
+    for line in error.remediation:
+        click.echo(f"  → {line}", err=True)
+    if error.probable_cause:
+        click.echo(f"  Probable cause: {error.probable_cause}", err=True)
+    click.echo(f"  Full environment record: {log_file_path}", err=True)
+
+
+def _echo_unreadable_ranges(result: AcquireResult) -> None:
+    """Name the address ranges that could not be captured.
+
+    Only genuinely failed ranges are listed; expected-unreadable kernel
+    mappings are already summarised on the ``Excluded:`` line.
+
+    Args:
+        result: The acquisition result to report on.
+    """
+    failed = [r for r in result.unreadable_ranges if not r.expected]
+    if not failed:
+        return
+    click.echo(f"  Missing : {len(failed)} unreadable range(s)")
+    for r in failed[:_MAX_SHOWN_UNREADABLE]:
+        name = f" {r.file_path}" if r.file_path else ""
+        click.echo(f"            0x{r.base:x}-0x{r.base + r.size:x}"
+                   f" ({r.size:,} bytes){name}")
+    hidden = (max(0, len(failed) - _MAX_SHOWN_UNREADABLE)
+              + result.unreadable_ranges_truncated)
+    if hidden > 0:
+        click.echo(f"            and {hidden} more — see the log")
 
 
 def _parse_target(target: str) -> int | str:
@@ -204,7 +251,10 @@ def _create_acquirer(
     collector = None
     if investigation:
         from memslicer.acquirer.collectors import create_collector
-        is_remote = usb or (remote_addr is not None)
+        # Truthiness, matching the bridges' is_remote and the attribution
+        # below. An empty --remote attaches locally, so treating it as remote
+        # here would pick a remote collector for a local capture.
+        is_remote = bool(usb or remote_addr)
 
         # For remote Frida targets, use FridaRemoteCollector which runs
         # JS on the target device. Note: FridaRemoteCollector needs
@@ -264,6 +314,7 @@ def _create_acquirer(
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose/debug output")
 @click.option("--read-timeout", type=float, default=10.0, help="Per-read timeout in seconds (default: 10)")
 @click.option("--include-unreadable", is_flag=True, help="Include regions with no read permission")
+@click.option("--skip-kernel-pseudo", is_flag=True, help="Skip kernel pseudo-mappings ([vvar], [vsyscall]) instead of attempting them")
 @click.option("--max-region-size", type=int, default=0, help="Skip regions larger than this size (0 = no limit)")
 @click.option("--investigation", "-I", is_flag=True, help="Investigation mode: capture system-wide context (encrypted by default)")
 @click.option("--encrypt", "-E", is_flag=True, default=False, help="Enable AEAD encryption")
@@ -272,7 +323,8 @@ def _create_acquirer(
 @click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
 @attribution_options
 def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filter_prot, filter_addr,
-        verbose, read_timeout, include_unreadable, max_region_size, investigation,
+        verbose, read_timeout, include_unreadable, skip_kernel_pseudo,
+        max_region_size, investigation,
         encrypt, no_encrypt, passphrase, hash_algo_str,
         examiner, case_ref, hostname_override, domain_override,
         include_serials, include_network_identity, include_fingerprint,
@@ -354,6 +406,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
     # Build region filter
     region_filter = RegionFilter(
         skip_no_read=not include_unreadable,
+        skip_kernel_pseudo=skip_kernel_pseudo,
         max_region_size=max_region_size,
     )
     if filter_prot:
@@ -453,13 +506,24 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
             page_pct = result.pages_captured / total_pages * 100
             click.echo(f"  Pages   : {result.pages_captured:,}/{total_pages:,}"
                        f" captured ({page_pct:.1f}%)")
-        if result.bytes_attempted > 0:
-            byte_pct = result.bytes_captured / result.bytes_attempted * 100
+        # Kernel pseudo-mappings are mapped but unreadable by design, so they
+        # are named explicitly rather than folded into the loss figures.
+        if result.pages_expected_unreadable > 0:
+            names = ", ".join(sorted(set(result.expected_unreadable_regions)))
+            click.echo(f"  Excluded: {result.pages_expected_unreadable:,} pages in"
+                       f" kernel pseudo-mappings ({names or 'unnamed'}) —"
+                       f" unreadable by design, not counted as data loss")
+        # Page-aligned exclusion against a raw attempted total, so clamp: an
+        # unaligned trailing region could otherwise push this below zero.
+        readable = max(0, result.bytes_attempted - result.bytes_expected_unreadable)
+        if readable > 0:
+            byte_pct = result.bytes_captured / readable * 100
             click.echo(f"  Bytes   : {result.bytes_captured:,}"
-                       f" / {result.bytes_attempted:,}"
+                       f" / {readable:,}"
                        f" readable ({byte_pct:.1f}%)")
         else:
             click.echo(f"  Bytes   : {result.bytes_captured:,}")
+        _echo_unreadable_ranges(result)
         click.echo(f"  Modules : {result.modules_captured}")
         if result.rwx_regions > 0:
             click.echo(f"  RWX     : {result.rwx_regions} (forensic attention recommended)")
@@ -470,7 +534,9 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         # Multi-level quality assessment
         # Use page-level quality if available, fall back to region-level
         if total_pages > 0:
-            if page_pct >= 95:
+            if result.pages_failed == 0:
+                quality = "EXCELLENT"
+            elif page_pct >= 95:
                 quality = "GOOD"
             elif page_pct >= 80:
                 quality = "FAIR — some pages unreadable"
@@ -490,6 +556,12 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
                 click.echo(f"  Quality : {rate:.1f}% of attempted regions captured ({quality})")
     except KeyboardInterrupt:
         click.echo("\nForce quit.")
+        raise SystemExit(1)
+    except AttachPreflightError as e:
+        _render_attach_error(e, log_file_path)
+        raise SystemExit(EXIT_PREFLIGHT_REFUSED)
+    except AttachError as e:
+        _render_attach_error(e, log_file_path)
         raise SystemExit(1)
     except Exception as e:
         click.echo(f"\nError: {e}", err=True)

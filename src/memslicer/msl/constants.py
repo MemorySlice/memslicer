@@ -17,6 +17,37 @@ BLOCK_HEADER_SIZE: int = 80
 HASH_SIZE: int = 32
 
 # ---------------------------------------------------------------------------
+# Page geometry
+# ---------------------------------------------------------------------------
+# A region header stores only PageSizeLog2, in one byte, and the page-state map
+# is sized to match it. The format therefore admits exactly the page sizes that
+# are powers of two within this range.
+PAGE_SIZE_LOG2_MIN: int = 10
+PAGE_SIZE_LOG2_MAX: int = 40
+
+
+def valid_page_size(value: int) -> bool:
+    """Whether *value* is a page size this format can represent.
+
+    The rule belongs to the format, so it lives here rather than with any one
+    producer. Acquisition backends use it to reject a probe that answered
+    something impossible; :mod:`memslicer.msl.writer` enforces it on the way
+    out. Both consult this function so the two cannot drift -- a widened range
+    that only the writer knew about would leave backends discarding page sizes
+    the format had started accepting.
+
+    Args:
+        value: Candidate page size in bytes.
+
+    Returns:
+        ``True`` when *value* is a power of two whose base-2 logarithm lies in
+        ``[PAGE_SIZE_LOG2_MIN, PAGE_SIZE_LOG2_MAX]``.
+    """
+    if value <= 0 or (value & (value - 1)) != 0:
+        return False
+    return PAGE_SIZE_LOG2_MIN <= value.bit_length() - 1 <= PAGE_SIZE_LOG2_MAX
+
+# ---------------------------------------------------------------------------
 # Block flags
 # ---------------------------------------------------------------------------
 COMPRESSED: int = 0x0001

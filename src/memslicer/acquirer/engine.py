@@ -6,16 +6,21 @@ import os
 import threading
 import time
 import uuid
+from itertools import chain
 from pathlib import Path
 from typing import Callable
 
-from memslicer.acquirer.base import AcquireResult, BaseAcquirer
-from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange
+from memslicer.acquirer.base import (
+    AcquireResult, BaseAcquirer, UnreadableRange,
+)
+from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange, ReadResult
 from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
 from memslicer.acquirer.investigation import InvestigationCollector
 from memslicer.acquirer.os_detail import pack_os_detail, system_info_to_fields
-from memslicer.acquirer.region_filter import RegionFilter
+from memslicer.acquirer.region_filter import (
+    RegionFilter, is_kernel_pseudo_region,
+)
 from memslicer.msl.constants import (
     CompAlgo, HashAlgo, OSType, PageState, RegionType, CapBit,
     Endianness, VERSION, HASH_SIZE, FLAG_INVESTIGATION, FLAG_ENCRYPTED,
@@ -34,6 +39,16 @@ from memslicer.utils.timestamps import now_ns
 
 # Default max chunk size for splitting large regions (same as fridump)
 _DEFAULT_MAX_CHUNK = 20971520  # 20 MB
+
+
+def _page_count(nbytes: int, page_size: int) -> int:
+    """Pages needed to hold *nbytes*."""
+    return (nbytes + page_size - 1) // page_size
+
+
+# Bound on the per-run unreadable-range report so a catastrophic capture
+# cannot grow the result unboundedly.
+_MAX_UNREADABLE_RANGES = 512
 
 
 def _build_target_introspection(proc_info, pid: int) -> TargetIntrospection:
@@ -166,6 +181,56 @@ def _connectivity_table_is_empty(table) -> bool:
     )
 
 
+def _scatter(
+    page_states: list[PageState], first_page: int, states: list[PageState],
+) -> None:
+    """Write *states* into *page_states* at *first_page*, clipped to fit."""
+    start = max(0, first_page)
+    end = min(len(page_states), first_page + len(states))
+    if end > start:
+        page_states[start:end] = states[start - first_page:end - first_page]
+
+
+def coalesce_unreadable(
+    region: MemoryRegion, file_path: str = "",
+) -> list[UnreadableRange]:
+    """Group a region's non-captured pages into contiguous ranges.
+
+    A run is *expected* when its pages are :attr:`PageState.UNMAPPED` — the
+    marker :meth:`AcquisitionEngine._read_region` already applied for kernel
+    pseudo-mappings. Reading the recorded state rather than re-testing the
+    region name keeps this in step with the page-state map that was written.
+
+    Args:
+        region: Region whose ``page_states`` to scan.
+        file_path: Mapped name of the region, carried into each range.
+
+    Returns:
+        One :class:`UnreadableRange` per contiguous run of lost pages.
+    """
+    ranges: list[UnreadableRange] = []
+    page_size = region.page_size
+    states = region.page_states
+    run_start: int | None = None
+
+    # The trailing sentinel closes a run that reaches the end of the region.
+    for index, state in enumerate(chain(states, (PageState.CAPTURED,))):
+        if state != PageState.CAPTURED:
+            if run_start is None:
+                run_start = index
+            continue
+        if run_start is not None:
+            ranges.append(UnreadableRange(
+                base=region.base_addr + run_start * page_size,
+                size=(index - run_start) * page_size,
+                region_base=region.base_addr,
+                file_path=file_path,
+                expected=states[run_start] == PageState.UNMAPPED,
+            ))
+            run_start = None
+    return ranges
+
+
 def classify_region(file_path: str) -> RegionType:
     """Classify a memory region based on its mapped file path."""
     if not file_path:
@@ -248,6 +313,9 @@ class AcquisitionEngine(BaseAcquirer):
         hash_algo: HashAlgo = HashAlgo.BLAKE3,
     ) -> None:
         self._bridge = bridge
+        # Optional ReadMemoryExCapable support, resolved once: this is probed
+        # on every read and there are thousands of them per capture.
+        self._read_ex_fn = getattr(bridge, "read_memory_ex", None)
         self._comp_algo = comp_algo
         self._hash_algo = hash_algo
         self._filter = region_filter or RegionFilter()
@@ -305,6 +373,12 @@ class AcquisitionEngine(BaseAcquirer):
         pages_captured = 0
         pages_failed = 0
         skip_reasons: dict[str, int] = {}
+        pages_expected_unreadable = 0
+        bytes_expected_unreadable = 0
+        expected_unreadable_regions: list[str] = []
+        unreadable_ranges: list[UnreadableRange] = []
+        unreadable_ranges_truncated = 0
+        failed_ranges_kept = 0
 
         try:
             self._log.info("Connecting to target...")
@@ -579,6 +653,15 @@ class AcquisitionEngine(BaseAcquirer):
                         # Surface resolution warnings (e.g. remote
                         # hostname unavailable) in the packed provenance.
                         collector_warnings.extend(identity.warnings)
+
+                        # The bridge's page size shapes every region's
+                        # page-state map, and the finished file cannot show
+                        # that it was a default -- PageSizeLog2 and the map
+                        # agree either way. Record it where the collector
+                        # already records the same doubt about its own.
+                        if platform.page_size_assumed:
+                            collector_warnings.append("page_size_assumed_4k")
+
                         if collector_warnings:
                             fields["collector_warning"] = ",".join(collector_warnings)
 
@@ -703,8 +786,27 @@ class AcquisitionEngine(BaseAcquirer):
                         region_count += 1
                         bytes_captured += data_size
                         captured = region.page_states.count(PageState.CAPTURED)
+                        unmapped = region.page_states.count(PageState.UNMAPPED)
                         pages_captured += captured
-                        pages_failed += len(region.page_states) - captured
+                        pages_failed += len(region.page_states) - captured - unmapped
+                        if unmapped:
+                            pages_expected_unreadable += unmapped
+                            bytes_expected_unreadable += unmapped * page_size
+                            expected_unreadable_regions.append(r.file_path)
+                        if captured != len(region.page_states):
+                            for lost in self._log_unreadable_ranges(
+                                region, r.file_path,
+                            ):
+                                # Expected runs are bounded by the handful of
+                                # kernel pseudo-mappings a process has, so only
+                                # genuine failures are capped and counted.
+                                if lost.expected:
+                                    unreadable_ranges.append(lost)
+                                elif failed_ranges_kept < _MAX_UNREADABLE_RANGES:
+                                    unreadable_ranges.append(lost)
+                                    failed_ranges_kept += 1
+                                else:
+                                    unreadable_ranges_truncated += 1
                         if is_rwx(prot):
                             rwx_regions += 1
 
@@ -747,6 +849,11 @@ class AcquisitionEngine(BaseAcquirer):
             pages_captured=pages_captured,
             pages_failed=pages_failed,
             skip_reasons=skip_reasons,
+            pages_expected_unreadable=pages_expected_unreadable,
+            bytes_expected_unreadable=bytes_expected_unreadable,
+            expected_unreadable_regions=expected_unreadable_regions,
+            unreadable_ranges=unreadable_ranges,
+            unreadable_ranges_truncated=unreadable_ranges_truncated,
         )
 
     def _read_region(
@@ -765,7 +872,7 @@ class AcquisitionEngine(BaseAcquirer):
         - On failure for any chunk, fall back to page-by-page reads
         """
         # Round up to page boundary: spec requires RegionSize to be multiple of PageSize
-        aligned_size = ((size + page_size - 1) // page_size) * page_size
+        aligned_size = _page_count(size, page_size) * page_size
         num_pages = aligned_size // page_size
         page_states: list[PageState] = []
         page_data_chunks: list[bytes] = []
@@ -788,21 +895,32 @@ class AcquisitionEngine(BaseAcquirer):
         max_chunk = self._max_chunk_size
 
         if size <= max_chunk:
-            data = self._bridge.read_memory(base_addr, size)
-            if data is not None:
-                page_states = [PageState.CAPTURED] * num_pages
-                page_data_chunks = [data]
-                data_size = len(data)
+            res = self._read_ex(base_addr, size)
+            if res.data is not None:
+                # Page count comes from what was actually returned: a backend
+                # that answers with fewer bytes than asked for must not have
+                # the shortfall recorded as captured, or the page data would
+                # sit at the wrong offset relative to the page-state map.
+                # Clamped because an over-long answer would otherwise build a
+                # page-state list longer than the region, which the writer
+                # rejects part-way through the file.
+                captured = min(_page_count(len(res.data), page_size), num_pages)
+                page_states = (
+                    [PageState.CAPTURED] * captured
+                    + [PageState.FAILED] * (num_pages - captured)
+                )
+                page_data_chunks = [res.data]
+                data_size = len(res.data)
                 self._log.debug(
                     "Region 0x%x -> read OK (%d bytes)", base_addr, data_size,
                 )
             else:
                 self._log.debug(
-                    "Region 0x%x -> full read FAILED, trying page-by-page fallback",
+                    "Region 0x%x -> full read FAILED, splitting at fault boundary",
                     base_addr,
                 )
-                page_states, page_data_chunks, data_size = self._try_read_pages(
-                    base_addr, size, page_size,
+                page_states, page_data_chunks, data_size = self._read_span_split(
+                    base_addr, size, page_size, first_fault=res.fault_addr,
                 )
         else:
             self._log.debug(
@@ -818,33 +936,40 @@ class AcquisitionEngine(BaseAcquirer):
                 chunk_size = min(max_chunk, size - offset)
                 chunk_addr = base_addr + offset
 
-                data = self._bridge.read_memory(chunk_addr, chunk_size)
-                if data is not None:
-                    page_data_chunks.append(data)
-                    data_size += len(data)
+                res = self._read_ex(chunk_addr, chunk_size)
+                if res.data is not None:
+                    page_data_chunks.append(res.data)
+                    data_size += len(res.data)
 
-                    first_page = offset // page_size
-                    chunk_pages = (chunk_size + page_size - 1) // page_size
-                    for pi in range(first_page, min(first_page + chunk_pages, num_pages)):
-                        page_states[pi] = PageState.CAPTURED
+                    # As above: only the pages actually returned are captured;
+                    # the rest of the chunk stays FAILED.
+                    chunk_pages = _page_count(len(res.data), page_size)
+                    _scatter(page_states, offset // page_size,
+                             [PageState.CAPTURED] * chunk_pages)
                 else:
                     self._log.debug(
-                        "Chunk 0x%x+%d failed, trying page-by-page fallback",
+                        "Chunk 0x%x+%d failed, splitting at fault boundary",
                         base_addr, offset,
                     )
-                    fb_states, fb_chunks, fb_size = self._try_read_pages(
+                    fb_states, fb_chunks, fb_size = self._read_span_split(
                         chunk_addr, chunk_size, page_size,
+                        first_fault=res.fault_addr,
                     )
                     if fb_size > 0:
                         page_data_chunks.extend(fb_chunks)
                         data_size += fb_size
-                        first_page = offset // page_size
-                        for pi_off, st in enumerate(fb_states):
-                            pi = first_page + pi_off
-                            if pi < num_pages:
-                                page_states[pi] = st
+                        _scatter(page_states, offset // page_size, fb_states)
 
                 offset += chunk_size
+
+        # Kernel pseudo-mappings ([vvar] and friends) are mapped but unreadable
+        # by design.  Record the kernel's answer as UNMAPPED rather than FAILED
+        # so the quality metric does not report them as data loss.
+        if is_kernel_pseudo_region(file_path):
+            page_states = [
+                PageState.UNMAPPED if s == PageState.FAILED else s
+                for s in page_states
+            ]
 
         region = MemoryRegion(
             base_addr=base_addr,
@@ -857,6 +982,133 @@ class AcquisitionEngine(BaseAcquirer):
             page_data_chunks=page_data_chunks,
         )
         return region, data_size
+
+    def _log_unreadable_ranges(
+        self, region: MemoryRegion, file_path: str,
+    ) -> list[UnreadableRange]:
+        """Coalesce and log the page runs that could not be captured.
+
+        Derived from page state rather than from backend error messages, so a
+        page that failed without producing one is still accounted for.
+
+        Args:
+            region: The region whose page states to scan.
+            file_path: Mapped name of the region, for the log line.
+
+        Returns:
+            One :class:`UnreadableRange` per contiguous run.
+        """
+        ranges = coalesce_unreadable(region, file_path)
+        for r in ranges:
+            self._log.log(
+                logging.INFO if r.expected else logging.WARNING,
+                "unreadable: 0x%x-0x%x (%d pages) in region 0x%x name=%s expected=%s",
+                r.base, r.base + r.size, r.size // region.page_size,
+                r.region_base, file_path or "?", "yes" if r.expected else "no",
+            )
+        return ranges
+
+    def _read_ex(self, address: int, size: int) -> ReadResult:
+        """Read memory, using fault detail when the bridge can report it.
+
+        Args:
+            address: Address to read from.
+            size: Number of bytes to read.
+
+        Returns:
+            A :class:`ReadResult`; ``fault_addr`` is ``None`` for bridges that
+            do not implement the optional ``read_memory_ex`` capability.
+        """
+        if self._read_ex_fn is None:
+            return ReadResult(data=self._bridge.read_memory(address, size))
+        res = self._read_ex_fn(address, size)
+        if isinstance(res, ReadResult):
+            return res
+        # A bridge that advertises the capability but returns something else
+        # is a programming error; fall back rather than corrupt page states.
+        return ReadResult(data=self._bridge.read_memory(address, size))
+
+    def _read_span_split(
+        self,
+        base_addr: int,
+        size: int,
+        page_size: int,
+        first_fault: int | None = None,
+    ) -> tuple[list[PageState], list[bytes], int]:
+        """Read a span, splitting at reported fault boundaries.
+
+        On a fault the readable prefix is re-read in a single call, the
+        faulting page is marked failed, and reading resumes after it. That
+        costs about two reads per bad page instead of one read per page.
+        Falls back to :meth:`_try_read_pages` whenever the backend cannot say
+        where the fault was.
+
+        Args:
+            base_addr: Start of the span.
+            size: Length of the span in bytes.
+            page_size: Target page size.
+            first_fault: Fault address from the caller's already-failed read,
+                so that read is not repeated.
+
+        Returns:
+            ``(page_states, page_data_chunks, data_size)`` — the same triple as
+            :meth:`_try_read_pages`.
+        """
+        num_pages = _page_count(size, page_size)
+        page_states = [PageState.FAILED] * num_pages
+        page_data_chunks: list[bytes] = []
+        pos = base_addr
+        end = base_addr + size
+        # The caller's read of this span already failed, so the first pass
+        # consumes its outcome instead of repeating it.
+        pending: ReadResult | None = ReadResult(data=None, fault_addr=first_fault)
+
+        def absorb(start: int, states: list[PageState], chunks: list[bytes]) -> None:
+            page_data_chunks.extend(chunks)
+            _scatter(page_states, (start - base_addr) // page_size, states)
+
+        def absorb_read(start: int, data: bytes) -> None:
+            # Page count comes from what was actually returned, so a short
+            # read is never recorded as a fully captured span.
+            captured = _page_count(len(data), page_size)
+            absorb(start, [PageState.CAPTURED] * captured, [data])
+
+        while pos < end:
+            if self._abort.is_set():
+                break
+
+            res, pending = pending or self._read_ex(pos, end - pos), None
+            if res.data is not None:
+                absorb_read(pos, res.data)
+                break
+            fault = res.fault_addr
+
+            if fault is None or not (pos <= fault < end):
+                # Backend could not localise the fault: degrade to page reads.
+                absorb(pos, *self._try_read_pages(pos, end - pos, page_size)[:2])
+                break
+
+            fault_page = fault - (fault % page_size)
+            if fault_page > pos:
+                good = fault_page - pos
+                res = self._read_ex(pos, good)
+                if res.data is not None:
+                    absorb_read(pos, res.data)
+                else:
+                    absorb(pos, *self._try_read_pages(pos, good, page_size)[:2])
+
+            # The faulting page stays FAILED; always advance past it.
+            pos = max(fault_page + page_size, pos + page_size)
+
+        data_size = sum(map(len, page_data_chunks))
+
+        if self._log.isEnabledFor(logging.DEBUG):
+            self._log.debug(
+                "Split read 0x%x: %d/%d pages captured (%d bytes)",
+                base_addr, page_states.count(PageState.CAPTURED),
+                num_pages, data_size,
+            )
+        return page_states, page_data_chunks, data_size
 
     def _perform_startup_test_read(
         self, ranges: list[MemoryRange], page_size: int,
@@ -890,7 +1142,7 @@ class AcquisitionEngine(BaseAcquirer):
 
         Returns (page_states, page_data_chunks, data_size).
         """
-        num_pages = (size + page_size - 1) // page_size
+        num_pages = _page_count(size, page_size)
         page_states: list[PageState] = []
         page_data_chunks: list[bytes] = []
         data_size = 0

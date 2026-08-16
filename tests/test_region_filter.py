@@ -1,5 +1,12 @@
 """Tests for region filtering."""
-from memslicer.acquirer.region_filter import RegionFilter
+import pytest
+
+from memslicer.acquirer.region_filter import (
+    KERNEL_PSEUDO_NAMES,
+    SKIP_REASON_LABELS,
+    RegionFilter,
+    is_kernel_pseudo_region,
+)
 
 
 class TestRegionFilter:
@@ -109,3 +116,61 @@ class TestRegionFilter:
     def test_skip_reason_none_when_passes(self):
         f = RegionFilter()
         assert f.skip_reason(0x1000, 0x1000, 0x07, "/some/path") is None
+
+
+class TestKernelPseudoRegions:
+    """Tests for kernel pseudo-mapping detection and the opt-in skip."""
+
+    @pytest.mark.parametrize("name", ["[vvar]", "[vvar_vclock]", "[vsyscall]"])
+    def test_known_pseudo_names_detected(self, name):
+        assert is_kernel_pseudo_region(name) is True
+
+    def test_vdso_is_not_pseudo(self):
+        """[vdso] is genuinely readable and forensically relevant — it must
+        never be classified as an unreadable kernel pseudo-mapping."""
+        assert is_kernel_pseudo_region("[vdso]") is False
+        assert "[vdso]" not in KERNEL_PSEUDO_NAMES
+
+    @pytest.mark.parametrize(
+        "name",
+        ["[heap]", "[stack]", "", "/usr/lib/libc.so.6"],
+    )
+    def test_ordinary_names_are_not_pseudo(self, name):
+        assert is_kernel_pseudo_region(name) is False
+
+    @pytest.mark.parametrize(
+        "name",
+        ["  [vvar]", "[vvar]  ", "\t[vvar_vclock]\n", " [vsyscall] "],
+    )
+    def test_surrounding_whitespace_tolerated(self, name):
+        assert is_kernel_pseudo_region(name) is True
+
+    def test_default_filter_does_not_skip_pseudo(self):
+        """Off by default: the acquirer still attempts the read and records
+        the kernel's answer."""
+        f = RegionFilter()
+        assert f.skip_reason(0x1000, 0x1000, 0x01, "[vvar]") is None
+        assert f.matches(0x1000, 0x1000, 0x01, "[vvar]")
+
+    def test_skip_kernel_pseudo_reports_reason(self):
+        f = RegionFilter(skip_kernel_pseudo=True)
+        assert f.skip_reason(0x1000, 0x1000, 0x01, "[vvar]") == "kernel-pseudo"
+        assert not f.matches(0x1000, 0x1000, 0x01, "[vvar]")
+
+    def test_skip_kernel_pseudo_leaves_vdso_alone(self):
+        f = RegionFilter(skip_kernel_pseudo=True)
+        assert f.skip_reason(0x1000, 0x1000, 0x01, "[vdso]") is None
+
+    def test_skip_kernel_pseudo_leaves_ordinary_regions_alone(self):
+        f = RegionFilter(skip_kernel_pseudo=True)
+        assert f.skip_reason(0x1000, 0x1000, 0x07, "/lib/libc.so.6") is None
+
+    def test_no_read_still_wins_over_kernel_pseudo(self):
+        """An unreadable pseudo-mapping is reported as no-read, matching the
+        ordering of the checks in skip_reason."""
+        f = RegionFilter(skip_kernel_pseudo=True)
+        assert f.skip_reason(0x1000, 0x1000, 0x00, "[vvar]") == "no-read"
+
+    def test_label_registered(self):
+        assert "kernel-pseudo" in SKIP_REASON_LABELS
+        assert SKIP_REASON_LABELS["kernel-pseudo"]

@@ -1,7 +1,7 @@
 # MemSlicer
 
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.2.7-green)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.3.0-green)](pyproject.toml)
 
 A memory acquisition tool that captures process memory snapshots into the MSL (Memory Slice) binary format. Supports multiple debugger backends (Frida, GDB, LLDB) and targets across Windows, Linux, macOS, Android, and iOS. Designed for forensic analysis, reverse engineering, and security research.
 
@@ -225,6 +225,8 @@ Options:
   -v, --verbose                   Enable verbose/debug output.
   --read-timeout FLOAT            Per-read timeout in seconds. [default: 10]
   --include-unreadable            Include memory regions with no read permission.
+  --skip-kernel-pseudo            Skip kernel pseudo-mappings ([vvar], [vsyscall])
+                                  instead of attempting them.
   --max-region-size INT           Skip regions larger than this size (0 = no limit).
   -I, --investigation             Investigation mode: capture system-wide context.
   -E, --encrypt                   Enable AEAD encryption (AES-256-GCM + Argon2id).
@@ -264,13 +266,39 @@ Progress: [##################################################] 100.00% Complete
   Regions : 2621/4199 (1578 filtered out)
             1578 no read permission (use --include-unreadable to include)
   Pages   : 12,500/12,800 captured (97.7%)
+  Excluded: 3 pages in kernel pseudo-mappings ([vvar], [vvar_vclock]) — unreadable by design, not counted as data loss
   Bytes   : 51,200,000 / 52,428,800 readable (97.7%)
+  Missing : 2 unreadable range(s)
+            0x7f2c00a000-0x7f2c00c000 (8,192 bytes)
   Modules : 142
   Duration: 12.34s
   File    : chrome_1773528836.msl (48,234,567 bytes)
   Log     : chrome_1773528836.msl.log
   Quality : GOOD (page-level: 97.7%)
 ```
+
+`Excluded:` counts kernel-provided mappings (`[vvar]`, `[vvar_vclock]`,
+`[vsyscall]`) that appear readable in `/proc/<pid>/maps` but fault on every
+`ptrace` read. They are not data loss, so they are kept out of the quality
+figure — but they are always named rather than silently dropped. `[vdso]` is
+genuinely readable and is captured normally.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Capture completed. |
+| `1`  | Capture failed, or was aborted. |
+| `2`  | Invalid command-line usage. |
+| `3`  | Attach refused by preflight — the environment forbids this capture and **nothing on the target was touched**. |
+
+Exit code `3` is accompanied by the reason and concrete remediation, for
+example when Yama `ptrace_scope` blocks attaching to a non-child process, when
+the target runs as another user, or when an AppArmor profile denies `ptrace`.
+The full environment record (uid, capabilities, `ptrace_scope`, LSM profile) is
+written to the companion `.msl.log` so the constraint is documented in the case
+file. memslicer never changes `ptrace_scope` itself — it recommends the command
+and leaves the change for the examiner to make and record.
 
 ---
 
@@ -287,6 +315,8 @@ src/memslicer/
     lldb_bridge.py               LLDB Python API backend
     frida_acquirer.py            Backward-compatible Frida wrapper
     investigation.py             InvestigationCollector protocol
+    attach_preflight.py          Linux ptrace preflight diagnosis
+    errors.py                    Error types and exit codes
     platform_detect.py           OS and architecture detection
     region_filter.py             Region filtering logic
     collectors/

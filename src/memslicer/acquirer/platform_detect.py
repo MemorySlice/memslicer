@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 
 from memslicer.acquirer.bridge import MemoryRange
-from memslicer.msl.constants import OSType, ArchType
+# valid_page_size is defined by the MSL format, not here. It is imported rather
+# than restated so the backends' probe filter and the writer's check cannot
+# drift, and re-exported because callers reach for it alongside the probes.
+from memslicer.msl.constants import OSType, ArchType, valid_page_size
 
 
 _ARCH_MAP = {
@@ -134,6 +136,104 @@ def parse_gdb_architecture(arch_output: str) -> ArchType:
     return arch
 
 
+# GDB names the target's OS ABI, which is the only OS answer that holds for a
+# remote target -- the host's ``platform.system()`` describes the wrong machine.
+# Only the ABIs that MSL can represent are listed. GDB really does report
+# "none", "unknown", "SVR4", "GNU/Hurd", "Solaris", "AIX", "DICOS", "DJGPP",
+# "OpenVMS", "LynxOS178", "Newlib", "SDE" and "PikeOS"; their absence here is
+# deliberate, and leaves the caller to fall back rather than record a guess.
+_GDB_OSABI_MAP = {
+    "GNU/Linux": OSType.Linux,
+    "Linux": OSType.Linux,
+    "Darwin": OSType.macOS,
+    "Windows": OSType.Windows,
+    "Windows CE": OSType.Windows,
+    "WindowsCE": OSType.Windows,
+    "Cygwin": OSType.Windows,
+    "FreeBSD": OSType.FreeBSD,
+    "FreeBSD ELF": OSType.FreeBSD,
+    "FreeBSD a.out": OSType.FreeBSD,
+    "NetBSD": OSType.NetBSD,
+    "NetBSD ELF": OSType.NetBSD,
+    "NetBSD a.out": OSType.NetBSD,
+    "OpenBSD": OSType.OpenBSD,
+    "OpenBSD ELF": OSType.OpenBSD,
+    "QNX Neutrino": OSType.QNX,
+    "QNX-Neutrino": OSType.QNX,
+    "Fuchsia": OSType.Fuchsia,
+}
+
+# ``show osabi`` prints the current setting and then the default. Anchoring on
+# "current" ignores the second line, which names the fallback rather than the
+# ABI in force.
+_GDB_OSABI_RE = re.compile(
+    r'The current OS ABI is "auto" \(currently "([^"]+)"\)'
+    r'|'
+    r'The current OS ABI is "([^"]+)"'
+)
+
+
+def parse_gdb_osabi(osabi_output: str) -> OSType | None:
+    """Extract the target OS from GDB ``show osabi`` output.
+
+    Unlike :func:`parse_gdb_architecture` this returns ``None`` instead of
+    raising. An unknown architecture is fatal because nothing else can supply
+    one, whereas the OS has a fallback chain -- and ``none``/``unknown`` are
+    answers GDB gives routinely, for a target whose ABI it has not pinned down.
+    Raising on those would abort captures that are otherwise fine.
+
+    Args:
+        osabi_output: Console output of ``show osabi``.
+
+    Returns:
+        The matching :class:`OSType`, or ``None`` when the output names no ABI
+        or names one that MSL cannot represent.
+    """
+    match = _GDB_OSABI_RE.search(osabi_output or "")
+    if match is None:
+        return None
+
+    # Group 1 is the "auto (currently ...)" variant, group 2 the direct one.
+    osabi = match.group(1) or match.group(2)
+    return _GDB_OSABI_MAP.get(osabi)
+
+
+# ``info auxv`` prints one row per auxiliary vector entry:
+#
+#     6   AT_PAGESZ            System page size               65536
+#
+# The value is the last field. GDB prints it in decimal, but a hex form is
+# accepted too so an unusual build does not silently fall back.
+_GDB_AUXV_PAGESZ_RE = re.compile(
+    r"^\s*\d+\s+AT_PAGESZ\b.*?(0x[0-9a-fA-F]+|\d+)\s*$",
+    re.MULTILINE,
+)
+
+
+def parse_gdb_auxv_page_size(auxv_output: str) -> int | None:
+    """Extract ``AT_PAGESZ`` from GDB ``info auxv`` output.
+
+    This is the target's page size, which GDB serves over the remote protocol
+    (``qXfer:auxv:read``) for Linux targets. The host's ``sysconf`` answers a
+    different machine's question whenever the target is remote.
+
+    Args:
+        auxv_output: Console output of ``info auxv``.
+
+    Returns:
+        The page size, or ``None`` when the output has no usable ``AT_PAGESZ``
+        row. Values that could not describe a real page are rejected -- see
+        :func:`valid_page_size`.
+    """
+    match = _GDB_AUXV_PAGESZ_RE.search(auxv_output or "")
+    if match is None:
+        return None
+
+    text = match.group(1)
+    value = int(text, 16) if text.startswith("0x") else int(text)
+    return value if valid_page_size(value) else None
+
+
 _LLDB_ARCH_MAP = {
     "x86_64": ArchType.x86_64,
     "aarch64": ArchType.ARM64,
@@ -205,6 +305,43 @@ def detect_os_from_maps(maps_content: str) -> OSType:
     return OSType.Linux
 
 
+def parse_maps_text(text: str) -> list[MemoryRange]:
+    """Parse the text of a ``/proc/<pid>/maps`` file into memory ranges.
+
+    Each line in the maps file has the form::
+
+        addr_lo-addr_hi perms offset dev inode [path]
+
+    The *perms* field (e.g. ``rwxp``) is normalised to three characters
+    by replacing the private/shared flag (``p``/``s``) with ``-``.
+    Lines with fewer than five whitespace-separated fields are skipped.
+
+    Args:
+        text: The full text content of a maps file.
+
+    Returns:
+        A list of :class:`MemoryRange` instances in file order.
+    """
+    ranges: list[MemoryRange] = []
+
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        addr_lo, addr_hi = parts[0].split("-")
+        base = int(addr_lo, 16)
+        end = int(addr_hi, 16)
+        prot = parts[1].replace("p", "-").replace("s", "-")[:3]
+        # Known limitation: pathnames containing spaces are truncated at the
+        # first space. Joining parts[5:] would fix that, but it would also
+        # turn "/x.so (deleted)" into a path that no longer classifies as
+        # RegionType.Image, so the single-field semantics are kept as-is.
+        path = parts[5] if len(parts) > 5 else ""
+        ranges.append(MemoryRange(base, end - base, prot, path))
+
+    return ranges
+
+
 def parse_proc_maps(
     pid: int,
     logger: logging.Logger | None = None,
@@ -232,16 +369,7 @@ def parse_proc_maps(
 
     try:
         with open(maps_path) as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) < 5:
-                    continue
-                addr_lo, addr_hi = parts[0].split("-")
-                base = int(addr_lo, 16)
-                end = int(addr_hi, 16)
-                prot = parts[1].replace("p", "-").replace("s", "-")[:3]
-                path = parts[5] if len(parts) > 5 else ""
-                ranges.append(MemoryRange(base, end - base, prot, path))
+            ranges = parse_maps_text(fh.read())
     except FileNotFoundError:
         log.warning("Maps file not found: %s", maps_path)
     except PermissionError:

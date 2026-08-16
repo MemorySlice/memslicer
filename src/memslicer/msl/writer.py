@@ -10,6 +10,7 @@ from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
     BLOCK_HEADER_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
     CONTINUATION, FLAG_ENCRYPTED, BlockType, CompAlgo, PageState,
+    PAGE_SIZE_LOG2_MIN, PAGE_SIZE_LOG2_MAX, valid_page_size,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
@@ -253,9 +254,21 @@ class MSLWriter:
         # (compression is handled by _write_block per spec Section 4.2.1)
         raw_page_data = b"".join(region.page_data_chunks)
 
-        # Validate page_size is a power of 2
-        if region.page_size <= 0 or (region.page_size & (region.page_size - 1)) != 0:
-            raise ValueError(f"page_size must be a power of 2, got {region.page_size}")
+        # Spec Table 13 admits only powers of two, within the range one byte of
+        # PageSizeLog2 can carry. valid_page_size owns that rule, so producers
+        # can reject a bad page size before a capture runs on it rather than
+        # discovering it here. The branch below only picks which diagnostic to
+        # report -- it does not decide whether the value is acceptable.
+        if not valid_page_size(region.page_size):
+            if region.page_size <= 0 or (region.page_size & (region.page_size - 1)):
+                raise ValueError(
+                    f"page_size must be a power of 2, got {region.page_size}"
+                )
+            raise ValueError(
+                f"PageSizeLog2 {region.page_size.bit_length() - 1} outside valid "
+                f"range [{PAGE_SIZE_LOG2_MIN}, {PAGE_SIZE_LOG2_MAX}] "
+                f"(page_size={region.page_size})"
+            )
 
         # Spec Table 13: RegionSize MUST be a multiple of PageSize
         if region.region_size % region.page_size != 0:
@@ -272,13 +285,8 @@ class MSLWriter:
                 f"region_size/page_size ({expected_pages})"
             )
 
+        # Already range-checked by valid_page_size above.
         page_size_log2 = region.page_size.bit_length() - 1
-
-        if not (10 <= page_size_log2 <= 40):
-            raise ValueError(
-                f"PageSizeLog2 {page_size_log2} outside valid range [10, 40] "
-                f"(page_size={region.page_size})"
-            )
 
         payload = struct.pack("<QQ", region.base_addr, region.region_size)
         payload += struct.pack(
