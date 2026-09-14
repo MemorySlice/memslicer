@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Investigation captures put System Context in Block 2, per spec Section 2.1.
+  ModuleEntry children occupied it; they now follow the memory regions.
+- macOS investigation captures no longer abort at the process table. `ps`
+  prints uids signed, and `nobody` (-2) would not fit the uint32 UID field.
+- Encrypted slices can be read back. `iterate_blocks` takes a passphrase and
+  reads HeaderSize from 0x09 instead of assuming 64.
+- Encryption flag conflicts are refused, not silently resolved. `--passphrase`
+  without `-E`/`-I` used to write an unencrypted capture and say nothing.
+- Process Identity is always Block 0. A collector that raised left the
+  `finally` to emit End-of-Capture there instead, silently.
+- Investigation captures set the system-table capability bits (12-14) again.
+  They were OR-ed in after the header had been written, so never reached disk.
+- A command line over 64 KiB no longer aborts the capture. The `uint16`
+  `CmdLineLen` was packed untruncated; long values are now cut and logged.
 - Attach failures now name their cause and the fix, instead of printing
   `unable to access /proc/<PID>/mem: Permission denied`
   ([#2](https://github.com/MemorySlice/memslicer/issues/2)). memslicer never

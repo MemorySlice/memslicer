@@ -753,3 +753,73 @@ def test_unreadable_ranges_shown_in_summary(mock_factory):
     assert result.exit_code == 0
     assert "Missing : 1 unreadable range(s)" in result.output
     assert "0x10000-0x11000" in result.output
+
+
+class TestAcquisitionModeFlags:
+    """The four spec Table 1 modes, and the flag conflicts around them.
+
+    Encryption is the one option where silently doing less than asked is a
+    confidentiality failure, so every contradiction is refused rather than
+    resolved by precedence.
+    """
+
+    def _invoke(self, args):
+        """Run the CLI with the acquirer mocked out; return (result, kwargs)."""
+        with patch("memslicer.cli._create_acquirer") as factory:
+            factory.return_value = _make_mock_acquirer()
+            result = CliRunner().invoke(cli, args)
+        kwargs = factory.call_args[1] if factory.call_args else None
+        return result, kwargs
+
+    # -- the four modes -------------------------------------------------
+
+    def test_analysis_unencrypted_is_the_default(self):
+        _, kw = self._invoke(["123"])
+        assert kw["investigation"] is False
+        assert kw["passphrase"] is None
+
+    def test_analysis_encrypted_via_encrypt_flag(self):
+        _, kw = self._invoke(["123", "-E", "--passphrase", "secret"])
+        assert kw["investigation"] is False
+        assert kw["passphrase"] == "secret"
+
+    def test_investigation_defaults_to_encrypted(self):
+        _, kw = self._invoke(["123", "-I", "--passphrase", "secret"])
+        assert kw["investigation"] is True
+        assert kw["passphrase"] == "secret"
+
+    def test_investigation_unencrypted_via_no_encrypt(self):
+        _, kw = self._invoke(["123", "-I", "--no-encrypt"])
+        assert kw["investigation"] is True
+        assert kw["passphrase"] is None
+
+    # -- contradictions are refused, not silently resolved ---------------
+
+    def test_passphrase_without_encryption_is_refused(self):
+        """Silently writing plaintext here would betray the examiner's intent."""
+        result, kw = self._invoke(["123", "--passphrase", "secret"])
+        assert result.exit_code == 2
+        assert "encryption is off" in result.output
+        assert kw is None, "must not reach the acquirer"
+
+    def test_passphrase_with_no_encrypt_is_refused(self):
+        result, _ = self._invoke(["123", "-I", "--no-encrypt", "--passphrase", "s"])
+        assert result.exit_code == 2
+        assert "encryption is off" in result.output
+
+    def test_encrypt_and_no_encrypt_together_are_refused(self):
+        result, kw = self._invoke(["123", "-E", "--no-encrypt"])
+        assert result.exit_code == 2
+        assert "contradict" in result.output
+        assert kw is None
+
+    def test_empty_passphrase_is_refused(self):
+        result, kw = self._invoke(["123", "-E", "--passphrase", ""])
+        assert result.exit_code == 2
+        assert "must not be empty" in result.output
+        assert kw is None
+
+    def test_whitespace_only_passphrase_is_refused(self):
+        result, _ = self._invoke(["123", "-E", "--passphrase", "   "])
+        assert result.exit_code == 2
+        assert "must not be empty" in result.output

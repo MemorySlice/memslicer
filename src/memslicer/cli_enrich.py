@@ -61,7 +61,7 @@ from memslicer.msl.constants import (
     HashAlgo,
     PageState,
 )
-from memslicer.msl.iterator import iterate_blocks, read_hash_algo
+from memslicer.msl.iterator import is_encrypted, iterate_blocks, read_hash_algo
 from memslicer.msl.types import (
     FileHeader,
     MemoryRegion,
@@ -228,6 +228,17 @@ def _load_slice(
     eoc_start: int | None = None
 
     with open(slice_path, "rb") as f:
+        if is_encrypted(f):
+            # iterate_blocks can decrypt, but enrichment cannot use that:
+            # _write_enriched splices the original bytes at the EndOfCapture
+            # offset, and an encrypted slice has no byte offset that maps to
+            # a plaintext block boundary. Appending would also invalidate the
+            # container's authentication tag, which nothing here can re-seal.
+            raise ValueError(
+                f"slice at {slice_path} is encrypted; enrichment would have to "
+                f"re-seal the container, which is not supported. Re-acquire "
+                f"without encryption to enrich, or enrich before encrypting"
+            )
         hash_algo = read_hash_algo(f)
         for block in iterate_blocks(f):
             if block.block_type == BlockType.ModuleEntry:

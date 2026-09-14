@@ -367,8 +367,22 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
     except ForensicStringError as exc:
         raise click.BadParameter(str(exc))
 
-    # Determine encryption: investigation defaults to encrypted unless --no-encrypt
+    # Determine encryption: investigation defaults to encrypted unless
+    # --no-encrypt. Contradictions are refused rather than silently resolved:
+    # a capture that is not encrypted when the examiner asked for encryption
+    # is a confidentiality failure that no later step can undo.
+    if encrypt and no_encrypt:
+        raise click.UsageError(
+            "--encrypt and --no-encrypt contradict each other; pass only one"
+        )
     use_encryption = encrypt or (investigation and not no_encrypt)
+    if passphrase is not None and not use_encryption:
+        raise click.UsageError(
+            "--passphrase was given but encryption is off; add --encrypt / -E "
+            "(or drop --no-encrypt) to encrypt this capture"
+        )
+    if passphrase is not None and not passphrase.strip():
+        raise click.UsageError("--passphrase must not be empty")
     if use_encryption and passphrase is None:
         passphrase = click.prompt("Encryption passphrase", hide_input=True, confirmation_prompt=True)
 

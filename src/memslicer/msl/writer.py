@@ -1,6 +1,7 @@
 """Streaming MSL file writer."""
 from __future__ import annotations
 
+import logging
 import struct
 import uuid
 import warnings
@@ -21,8 +22,43 @@ from memslicer.msl.types import (
 )
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.compression import compress
-from memslicer.utils.padding import pad_bytes, encode_string
+from memslicer.utils.padding import pad_bytes, encode_string, encode_string_bounded
 from memslicer.utils.timestamps import now_ns
+
+_log = logging.getLogger("memslicer")
+
+
+def _bounded_or_absent(value: str) -> tuple[bytes, int]:
+    """Encode an optional string, or report absence as a zero-length field.
+
+    Returns:
+        ``(b"", 0)`` for an empty value, otherwise the bounded encoding.
+    """
+    if not value:
+        return b"", 0
+    return encode_string_bounded(value)
+
+
+def _warn_if_truncated(field: str, original: str, stored_len: int) -> None:
+    """Log when a string did not fit the length field the format gives it.
+
+    Truncating beats aborting the capture, but it is still evidence lost, so
+    it must never happen quietly -- the examiner has to be able to see in the
+    log that the recorded value is shorter than what the target held.
+
+    Args:
+        field: Field name as the spec calls it, for the log line.
+        original: The string before encoding.
+        stored_len: Pre-padding length actually written, terminator included.
+    """
+    if not original:
+        return
+    raw_len = len(original.encode("utf-8")) + 1
+    if stored_len < raw_len:
+        _log.warning(
+            "%s truncated from %d to %d bytes to fit the format's length field",
+            field, raw_len, stored_len,
+        )
 
 
 class MSLWriter:
@@ -132,19 +168,24 @@ class MSLWriter:
                 f"but block_index={self._block_index}",
                 stacklevel=2,
             )
-        exe_path_raw = proc_id.exe_path.encode("utf-8") + b"\x00" if proc_id.exe_path else b"\x00"
-        cmd_line_raw = proc_id.cmd_line.encode("utf-8") + b"\x00" if proc_id.cmd_line else b""
-
-        exe_path_encoded = encode_string(proc_id.exe_path) if proc_id.exe_path else pad_bytes(b"\x00")
-        cmd_line_encoded = encode_string(proc_id.cmd_line) if proc_id.cmd_line else b""
+        # ExePath is always present -- an unknown path is a lone NUL, so
+        # ExePathLen is never 0. CmdLine is the opposite: spec Table 17 gives
+        # CmdLineLen the value 0 for "unavailable", and then no bytes follow.
+        exe_path_encoded, exe_path_len = encode_string_bounded(proc_id.exe_path)
+        if proc_id.cmd_line:
+            cmd_line_encoded, cmd_line_len = encode_string_bounded(proc_id.cmd_line)
+        else:
+            cmd_line_encoded, cmd_line_len = b"", 0
+        _warn_if_truncated("ExePath", proc_id.exe_path, exe_path_len)
+        _warn_if_truncated("CmdLine", proc_id.cmd_line, cmd_line_len)
 
         payload = struct.pack(
             "<IIQHHI",
             proc_id.ppid,
             proc_id.session_id,
             proc_id.start_time_ns,
-            len(exe_path_raw),
-            len(cmd_line_raw),
+            exe_path_len,
+            cmd_line_len,
             0,  # Reserved
         )
         payload += exe_path_encoded
@@ -310,10 +351,42 @@ class MSLWriter:
     # ------------------------------------------------------------------
 
     def write_module_list(self, modules: list[ModuleEntry]) -> bytes:
-        """Write a ModuleListIndex block with manifest entries and HAS_CHILDREN flag,
-        then individual ModuleEntry blocks as children.
+        """Write a ModuleListIndex block followed immediately by its children.
 
-        Returns the index block's UUID.
+        Convenience wrapper over :meth:`write_module_list_index` and
+        :meth:`write_module_entries` for callers that do not care where the
+        children land. The acquisition engine does care -- spec Section 2.1
+        reserves Block 2 for System Context in investigation mode, so it
+        defers the children until after the memory regions instead.
+
+        Args:
+            modules: Modules to announce and then emit.
+
+        Returns:
+            The index block's UUID.
+        """
+        index_uuid, module_uuids = self.write_module_list_index(modules)
+        self.write_module_entries(modules, index_uuid, module_uuids)
+        return index_uuid
+
+    def write_module_list_index(
+        self, modules: list[ModuleEntry],
+    ) -> tuple[bytes, list[bytes]]:
+        """Write only the ModuleListIndex block, announcing its children.
+
+        The child UUIDs are generated here rather than when the children are
+        written, so the manifest can name blocks that do not exist on disk
+        yet. That is what lets the entries be emitted later in the file.
+
+        Args:
+            modules: Modules to list. May be empty, in which case the block
+                carries a zero count and no HAS_CHILDREN flag -- the block is
+                still written, so Block 1 is a Module List either way and the
+                positions the spec fixes do not shift with module presence.
+
+        Returns:
+            ``(index_uuid, module_uuids)``. Pass both to
+            :meth:`write_module_entries` to emit the children.
         """
         if self._block_index != 1:
             warnings.warn(
@@ -341,14 +414,31 @@ class MSLWriter:
             manifest += path_padded                                 # var Path (pad8)
 
         index_uuid = self._write_block(
-            BlockType.ModuleListIndex, manifest, flags=HAS_CHILDREN,
+            BlockType.ModuleListIndex, manifest,
+            flags=HAS_CHILDREN if modules else 0,
         )
+        return index_uuid, module_uuids
 
-        # Write each module as a child block with pre-assigned UUID
+    def write_module_entries(
+        self,
+        modules: list[ModuleEntry],
+        index_uuid: bytes,
+        module_uuids: list[bytes],
+    ) -> None:
+        """Emit the ModuleEntry children a ModuleListIndex already announced.
+
+        Each child is written with the UUID the manifest promised, so the
+        index stays valid no matter how far downstream this is called.
+
+        Args:
+            modules: The same modules passed to
+                :meth:`write_module_list_index`, in the same order.
+            index_uuid: UUID of the index block, recorded as each child's
+                parent.
+            module_uuids: The child UUIDs that method returned.
+        """
         for mod, mod_uuid in zip(modules, module_uuids):
             self._write_module_entry(mod, parent_uuid=index_uuid, block_uuid=mod_uuid)
-
-        return index_uuid
 
     def _write_module_entry(self, mod: ModuleEntry, parent_uuid: bytes, block_uuid: bytes | None = None) -> bytes:
         """Write a single ModuleEntry block.
@@ -437,34 +527,48 @@ class MSLWriter:
 
     def write_process_table(self, processes: list[ProcessEntry], parent_uuid: bytes) -> bytes:
         """Write ProcessTable block. ParentUUID must reference SystemContext."""
-        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 21
-        payload = struct.pack("<II", len(processes), 0)
+        # Entries are packed first so EntryCount can describe what actually
+        # made it in: a row carrying a value the format cannot represent is
+        # dropped, and the count must not promise it.
+        entries: list[bytes] = []
         for proc in processes:
-            exe_raw = proc.exe_name.encode("utf-8") + b"\x00" if proc.exe_name else b""
-            cmd_raw = proc.cmd_line.encode("utf-8") + b"\x00" if proc.cmd_line else b""
-            user_raw = proc.user.encode("utf-8") + b"\x00" if proc.user else b""
+            # Every one of these is a uint16 length, and cmd_line in
+            # particular is unbounded on Linux. This table covers every
+            # process on the host, so a single outlier must not be able to
+            # abort the capture.
+            exe_enc, exe_len = _bounded_or_absent(proc.exe_name)
+            cmd_enc, cmd_len = _bounded_or_absent(proc.cmd_line)
+            user_enc, user_len = _bounded_or_absent(proc.user)
+            _warn_if_truncated("ProcessTable.CmdLine", proc.cmd_line, cmd_len)
 
-            entry = struct.pack(
-                "<III B3s QQ HHH2s",
-                proc.pid,
-                proc.ppid,
-                proc.uid,
-                0x01 if proc.is_target else 0x00,
-                b"\x00" * 3,           # Reserved
-                proc.start_time,
-                proc.rss,
-                len(exe_raw),
-                len(cmd_raw),
-                len(user_raw),
-                b"\x00" * 2,           # Reserved2
-            )
-            if exe_raw:
-                entry += pad_bytes(exe_raw)
-            if cmd_raw:
-                entry += pad_bytes(cmd_raw)
-            if user_raw:
-                entry += pad_bytes(user_raw)
-            payload += entry
+            try:
+                entry = struct.pack(
+                    "<III B3s QQ HHH2s",
+                    proc.pid,
+                    proc.ppid,
+                    proc.uid,
+                    0x01 if proc.is_target else 0x00,
+                    b"\x00" * 3,           # Reserved
+                    proc.start_time,
+                    proc.rss,
+                    exe_len,
+                    cmd_len,
+                    user_len,
+                    b"\x00" * 2,           # Reserved2
+                )
+            except struct.error as exc:
+                # One unrepresentable row must not cost the whole capture.
+                # Dropping it loses a line of the process table; raising
+                # here loses the memory the examiner actually came for.
+                _log.warning(
+                    "ProcessTable: dropping pid %s (%s): %s",
+                    proc.pid, proc.exe_name or "?", exc,
+                )
+                continue
+            entry += exe_enc + cmd_enc + user_enc
+            entries.append(entry)
+
+        payload = struct.pack("<II", len(entries), 0) + b"".join(entries)
 
         return self._write_block(
             BlockType.ProcessTable, payload, parent_uuid=parent_uuid,
@@ -1006,6 +1110,14 @@ class MSLWriter:
         When encrypted: flushes all buffered blocks as AEAD ciphertext
         and appends the 16-byte authentication tag.
         """
+        if self._block_index == 0:
+            # Nothing was written, so the EoC below is about to land in
+            # Block 0 -- the slot the spec reserves for ProcessIdentity.
+            warnings.warn(
+                "Spec violation: finalizing a capture with no blocks; "
+                "EndOfCapture will occupy Block 0 instead of ProcessIdentity",
+                stacklevel=2,
+            )
         file_hash = self._chain.finalize()
         acq_end_ns = now_ns()
 

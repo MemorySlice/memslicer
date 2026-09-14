@@ -49,6 +49,144 @@ Requires Python >= 3.10. Backend-specific requirements:
 
 ---
 
+## Privileges
+
+Reading another process's address space is a privileged operation on every
+supported OS. A capture needs **either elevated privileges, or a relaxed
+`ptrace` policy** — memslicer cannot grant itself either one.
+
+These are requirements imposed by the operating system, not by memslicer. The
+tool diagnoses them before it touches the target and refuses with
+[exit code 3](#exit-codes) rather than failing halfway.
+
+### Linux
+
+Either of these works:
+
+**1. Run elevated.**
+
+```bash
+sudo memslicer 1234
+```
+
+or grant `CAP_SYS_PTRACE` to the binary, if you would rather not run the whole
+capture as root.
+
+**2. Set Yama `ptrace_scope` to `0`, and run as the user that owns the target.**
+
+```bash
+echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope   # until reboot
+sudo sysctl -w kernel.yama.ptrace_scope=0              # equivalent
+```
+
+Make it survive a reboot with a file in `/etc/sysctl.d/`.
+
+> **`ptrace_scope = 0` is not a substitute for root.** It restores classic
+> same-uid `ptrace` — it does **not** let an unprivileged user attach to a
+> process owned by somebody else. Capturing another user's process still needs
+> root or `CAP_SYS_PTRACE`, whatever the scope is set to.
+
+| `ptrace_scope` | Meaning |
+|---|---|
+| `0` | Classic — any process may attach to another process of the same uid. |
+| `1` | Distro default — only a direct parent, or a `PR_SET_PTRACER` grantee, may attach. |
+| `2` | Admin-only — attaching requires `CAP_SYS_PTRACE`. |
+| `3` | `ptrace` disabled system-wide. **One-way latch**: it cannot be relaxed at runtime. Reboot with `kernel.yama.ptrace_scope` set to 0–2 via `/etc/sysctl.d/`, and record the constraint in the case notes. |
+
+memslicer **never changes `ptrace_scope` itself.** It reports the value it
+found and prints the command to change it; making and documenting that change
+is the examiner's decision. Silently relaxing a kernel security control
+mid-acquisition would be both a forensic and a security problem.
+
+An AppArmor or SELinux profile on the target can deny `ptrace` even for root.
+If an attach fails with `ptrace_scope` at 0 and root in hand, check
+`sudo dmesg | grep -i apparmor` for a `DENIED` line.
+
+The preflight check runs on **Linux, for a numeric PID**. Attaching by process
+name, or to a remote device, skips it — a failure there surfaces from the
+backend instead, without the diagnosis.
+
+### macOS
+
+`task_for_pid` requires root for any process not signed with the
+`com.apple.security.get-task-allow` entitlement:
+
+```bash
+sudo memslicer 1234 -b lldb
+```
+
+With **System Integrity Protection** enabled, Apple-signed and hardened-runtime
+processes cannot be attached at all, root or not. memslicer warns when it
+detects this:
+
+> macOS System Integrity Protection (SIP) is enabled. Attaching to Apple-signed
+> or hardened-runtime processes will fail. Only debug builds with
+> `com.apple.security.get-task-allow` entitlement can be debugged. Disable SIP
+> or use the Frida backend for broader process access.
+
+Check the current state with `csrutil status`.
+
+### Windows
+
+Opening another user's process, or a service, requires **Administrator** —
+`SeDebugPrivilege` is what actually grants it. Run the terminal elevated.
+
+Note that memslicer does **not** request `SeDebugPrivilege` itself; it relies
+on the backend and on the token it inherits. Without elevation the capture may
+still succeed for a process you own, but investigation mode degrades: the
+handle table comes back empty rather than failing the capture.
+
+### Android
+
+`frida-server` must be running **as root** on the device:
+
+```bash
+adb shell "su -c '/data/local/tmp/frida-server &'"
+memslicer com.example.app -U
+```
+
+memslicer probes for root-management markers (Magisk, KernelSU, APatch, Zygisk)
+and records what it finds as forensic metadata. That detection is **advisory
+only** — it never gates a capture, and a rooted device should not be assumed to
+have intact runtime integrity.
+
+The GDB backend is a poor fit here, and memslicer says so: SELinux policy may
+block attachment and `/proc` access, and ART managed-heap data will be opaque.
+Prefer `-b frida -U`.
+
+### iOS
+
+A **jailbroken** device with `frida-server` installed. Stock iOS sandboxing
+blocks the process access memslicer needs, and utilities such as `ps` and
+`lsof` may be missing entirely, which thins out investigation mode.
+
+Using the LLDB backend remotely additionally requires `debugserver` on the
+device. The Frida backend is the more reliable route for iOS.
+
+### Troubleshooting
+
+A refused attach names the cause and the fix, and touches nothing on the
+target:
+
+```
+Error: cannot attach to PID 3145: Yama ptrace_scope is 2 — attaching is admin-only and requires CAP_SYS_PTRACE
+also: target runs as uid 0 while this process runs as euid 501 without CAP_SYS_PTRACE
+  → Yama ptrace_scope is 2 (admin-only): attaching requires CAP_SYS_PTRACE. Run as root, or: sudo sysctl -w kernel.yama.ptrace_scope=0
+  → Run the acquisition as root (sudo), or grant CAP_SYS_PTRACE to the memslicer binary.
+  Full environment record: dump.msl.log
+```
+
+Each `→` line is a remediation for one blocker. A `Probable cause:` line
+appears when something was observed that did not itself block — an AppArmor
+profile on the target, for instance.
+
+The full privilege situation at capture time — uid, capabilities,
+`ptrace_scope`, LSM profile, tracer PID — is written to the companion
+`.msl.log` even when the capture succeeds, so the constraint is documented in
+the case file.
+
+---
+
 ## Usage
 
 ### Basic Examples
@@ -72,6 +210,8 @@ memslicer chrome -o chrome_dump.msl -c zstd
 ```
 
 ### Linux
+
+*Needs root, `CAP_SYS_PTRACE`, or `ptrace_scope = 0` with a same-uid target — see [Privileges](#privileges).*
 
 Dump a local process using Frida (default backend):
 
@@ -100,6 +240,8 @@ memslicer 1234 -I --no-encrypt
 ```
 
 ### Android
+
+*Needs `frida-server` running as root on the device — see [Privileges](#privileges).*
 
 Dump a process on a USB-connected Android device (requires Frida server on device):
 
@@ -133,6 +275,8 @@ memslicer 12345 -U --os android -o app_dump.msl -c zstd
 
 ### macOS / iOS
 
+*macOS needs root unless the target carries `get-task-allow`; iOS needs a jailbroken device — see [Privileges](#privileges).*
+
 Use LLDB backend on macOS (no Frida needed):
 
 ```bash
@@ -146,6 +290,8 @@ memslicer SpringBoard -U --os ios -I
 ```
 
 ### Windows
+
+*Needs Administrator for another user's process or a service — see [Privileges](#privileges).*
 
 Dump a local process on Windows:
 
@@ -292,13 +438,11 @@ genuinely readable and is captured normally.
 | `2`  | Invalid command-line usage. |
 | `3`  | Attach refused by preflight — the environment forbids this capture and **nothing on the target was touched**. |
 
-Exit code `3` is accompanied by the reason and concrete remediation, for
-example when Yama `ptrace_scope` blocks attaching to a non-child process, when
-the target runs as another user, or when an AppArmor profile denies `ptrace`.
-The full environment record (uid, capabilities, `ptrace_scope`, LSM profile) is
+Exit code `3` is accompanied by the reason and concrete remediation, and the
+full environment record (uid, capabilities, `ptrace_scope`, LSM profile) is
 written to the companion `.msl.log` so the constraint is documented in the case
-file. memslicer never changes `ptrace_scope` itself — it recommends the command
-and leaves the change for the examiner to make and record.
+file. See [Privileges](#privileges) for what each refusal means and how to
+resolve it.
 
 ---
 

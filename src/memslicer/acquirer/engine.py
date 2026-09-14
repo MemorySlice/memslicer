@@ -6,9 +6,10 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from memslicer.acquirer.base import (
     AcquireResult, BaseAcquirer, UnreadableRange,
@@ -39,6 +40,15 @@ from memslicer.utils.timestamps import now_ns
 
 # Default max chunk size for splitting large regions (same as fridump)
 _DEFAULT_MAX_CHUNK = 20971520  # 20 MB
+
+
+@dataclass
+class _SystemTables:
+    """The investigation tables whose presence the file header advertises."""
+
+    process_table: list[ProcessEntry]
+    connection_table: list[ConnectionEntry]
+    handle_table: list[HandleEntry]
 
 
 def _page_count(nbytes: int, page_size: int) -> int:
@@ -439,6 +449,20 @@ class AcquisitionEngine(BaseAcquirer):
                         "build-id extraction failed: %s", exc,
                     )
 
+            # Process Identity is Block 0, and the spec admits no other
+            # block there. Collecting it before the output file is opened
+            # keeps a collector failure from producing a file at all -- when
+            # this ran inside the writer's ``try``, a raising collector left
+            # the ``finally`` to emit EndOfCapture as Block 0.
+            proc_info, proc_id = self._build_process_identity(pid)
+
+            # The system tables decide three CapBitmap bits, and the header
+            # carrying that bitmap is written by ``MSLWriter.__init__`` --
+            # fed to the integrity chain and used as AEAD AAD, so it can
+            # never be rewritten afterwards. Collect them first or the bits
+            # are lost.
+            tables = self._collect_system_tables(pid) if self._investigation else None
+
             # Build CapBitmap dynamically based on what will be emitted
             cap_bitmap = (1 << CapBit.MemoryRegions) | (1 << CapBit.ProcessIdentity)
             if module_entries:
@@ -448,6 +472,13 @@ class AcquisitionEngine(BaseAcquirer):
             if self._investigation:
                 flags |= FLAG_INVESTIGATION
                 cap_bitmap |= (1 << CapBit.SystemContext)
+            if tables is not None:
+                if tables.process_table:
+                    cap_bitmap |= (1 << CapBit.SystemProcessTable)
+                if tables.connection_table:
+                    cap_bitmap |= (1 << CapBit.SystemNetworkTable)
+                if tables.handle_table:
+                    cap_bitmap |= (1 << CapBit.SystemHandleTable)
 
             # Encryption setup
             encryption_key = None
@@ -480,54 +511,42 @@ class AcquisitionEngine(BaseAcquirer):
                 )
 
                 try:
-                    # Block 0: Process Identity (MUST be first)
-                    proc_info = None
-                    if self._collector is not None:
-                        proc_info = self._collector.collect_process_identity(
-                            pid,
-                            include_target_introspection=(
-                                self._attribution.include_target_introspection
-                            ),
-                            include_environ=self._attribution.include_environ,
-                        )
-                        proc_id = ProcessIdentity(
-                            ppid=proc_info.ppid,
-                            session_id=proc_info.session_id,
-                            start_time_ns=proc_info.start_time_ns,
-                            exe_path=proc_info.exe_path,
-                            cmd_line=proc_info.cmd_line,
-                        )
-                    else:
-                        proc_id = ProcessIdentity(
-                            ppid=0, session_id=0, start_time_ns=0,
-                            exe_path="", cmd_line="",
-                        )
+                    # Block 0: Process Identity (MUST be first). Already
+                    # collected above, so nothing fallible stands between
+                    # the header and this write.
                     writer.write_process_identity(proc_id)
 
-                    # Block 1: Module list (before memory regions per spec).
+                    # Block 1: Module list index. Written unconditionally --
+                    # an empty list still gets a block, so Block 1 is always
+                    # the Module List and the positions spec Section 2.1
+                    # fixes do not shift with module presence.
+                    #
+                    # Only the index goes here. Its ModuleEntry children are
+                    # deferred until after the memory regions (see below),
+                    # because Section 2.1 reserves Block 2 for System Context
+                    # in investigation mode, and children written here would
+                    # occupy Blocks 2..N+1. Figures 2 and 3 place the entries
+                    # late for the same reason.
+                    #
                     # Note: TargetIntrospection (P1.6.3, Block 0x0058) used
                     # to be emitted here between ProcessIdentity and the
                     # module list, which violated the "ModuleListIndex MUST
                     # be Block 1" rule. It now lands after SystemContext
                     # among the other P1.6 extension blocks.
-                    if module_entries:
-                        writer.write_module_list(module_entries)
+                    module_index_uuid, module_uuids = writer.write_module_list_index(
+                        module_entries,
+                    )
 
                     # Block 2: SystemContext (Investigation mode only)
                     if self._investigation:
                         import getpass
                         import platform as platform_mod
 
-                        # Collect system tables before writing context
-                        # so we can set table_bitmap accurately
-                        if self._collector is not None:
-                            process_table = self._collector.collect_process_table(pid)
-                            connection_table = self._collector.collect_connection_table()
-                            handle_table = self._collector.collect_handle_table(pid)
-                        else:
-                            process_table = self._collect_process_table(pid)
-                            connection_table = self._collect_connection_table()
-                            handle_table = self._collect_handle_table(pid)
+                        # Collected before the header was written, because
+                        # the CapBitmap it carries depends on them.
+                        process_table = tables.process_table
+                        connection_table = tables.connection_table
+                        handle_table = tables.handle_table
 
                         # System-context extension block collection. These
                         # must be materialized BEFORE ``SystemContext`` is
@@ -556,16 +575,16 @@ class AcquisitionEngine(BaseAcquirer):
                         else:
                             persistence_manifest = None
 
+                        # The matching CapBitmap bits were set before the
+                        # header was written; this bitmap rides in the
+                        # SystemContext payload, so it is still built here.
                         table_bitmap = 0
                         if process_table:
                             table_bitmap |= 0x01  # bit 0 = ProcessTable
-                            cap_bitmap |= (1 << CapBit.SystemProcessTable)
                         if connection_table:
                             table_bitmap |= 0x02  # bit 1 = ConnectionTable
-                            cap_bitmap |= (1 << CapBit.SystemNetworkTable)
                         if handle_table:
                             table_bitmap |= 0x04  # bit 2 = HandleTable
-                            cap_bitmap |= (1 << CapBit.SystemHandleTable)
                         # System-context extension-block bits. All
                         # bits are opt-in (default off) to keep the
                         # process-centric acquire path lean.
@@ -599,9 +618,6 @@ class AcquisitionEngine(BaseAcquirer):
                             and self._attribution.include_target_introspection
                         ):
                             table_bitmap |= 0x200  # bit 9 = TargetIntrospection
-
-                        # Update header cap_bitmap before writing tables
-                        header.cap_bitmap = cap_bitmap
 
                         # Operator attribution (CLI-validated).
                         attribution = self._attribution
@@ -814,6 +830,13 @@ class AcquisitionEngine(BaseAcquirer):
                             region_count, total_ranges,
                             bytes_captured, len(module_entries), idx + 1,
                         )
+
+                    # The ModuleEntry children their index announced back at
+                    # Block 1. They land here so Block 2 could be System
+                    # Context, matching Figures 2 and 3.
+                    writer.write_module_entries(
+                        module_entries, module_index_uuid, module_uuids,
+                    )
 
                     self._emit_progress(
                         region_count, total_ranges,
@@ -1211,6 +1234,92 @@ class AcquisitionEngine(BaseAcquirer):
             from memslicer.acquirer.collectors.linux import LinuxCollector
             self._fallback_collector_instance = LinuxCollector(logger=self._log)
         return self._fallback_collector_instance
+
+    def _build_process_identity(self, pid: int) -> tuple[Any, ProcessIdentity]:
+        """Collect the Block 0 payload for *pid*.
+
+        Called before the output file is opened. The spec gives Block 0 to
+        Process Identity and to nothing else, so this must not run anywhere
+        a failure could still leave a partially written file behind.
+
+        Args:
+            pid: Target process id.
+
+        Returns:
+            ``(proc_info, proc_id)``. ``proc_info`` is the collector's full
+            record -- needed later for TargetIntrospection -- and is ``None``
+            when no collector is attached, in which case the identity is
+            zero-filled as the format allows.
+        """
+        if self._collector is None:
+            return None, ProcessIdentity(
+                ppid=0, session_id=0, start_time_ns=0,
+                exe_path="", cmd_line="",
+            )
+        proc_info = self._collector.collect_process_identity(
+            pid,
+            include_target_introspection=(
+                self._attribution.include_target_introspection
+            ),
+            include_environ=self._attribution.include_environ,
+        )
+        return proc_info, ProcessIdentity(
+            ppid=proc_info.ppid,
+            session_id=proc_info.session_id,
+            start_time_ns=proc_info.start_time_ns,
+            exe_path=proc_info.exe_path,
+            cmd_line=proc_info.cmd_line,
+        )
+
+    def _collect_system_tables(self, target_pid: int) -> _SystemTables:
+        """Collect the investigation tables the file header advertises.
+
+        Their emptiness decides CapBitmap bits 12-14, and the header is
+        serialized once in ``MSLWriter.__init__`` with no rewrite path, so
+        this has to happen before the writer is constructed.
+
+        Args:
+            target_pid: Target process id.
+
+        Returns:
+            The three tables, each empty when unavailable.
+        """
+        collector = self._collector
+        if collector is not None:
+            sources = (
+                ("process table", lambda: collector.collect_process_table(target_pid)),
+                ("connection table", collector.collect_connection_table),
+                ("handle table", lambda: collector.collect_handle_table(target_pid)),
+            )
+        else:
+            sources = (
+                ("process table", lambda: self._collect_process_table(target_pid)),
+                ("connection table", self._collect_connection_table),
+                ("handle table", lambda: self._collect_handle_table(target_pid)),
+            )
+        return _SystemTables(*(self._table_or_empty(n, f) for n, f in sources))
+
+    def _table_or_empty(self, name: str, collect: Callable[[], list]) -> list:
+        """Run *collect*, degrading a failure to an empty table.
+
+        These run before the output file exists, so an unguarded collector
+        raising here would cost the whole capture -- including memory that
+        had nothing to do with the failure. A missing table is recorded
+        honestly instead: its CapBitmap bit stays clear, so the slice never
+        claims to hold something it does not.
+
+        Args:
+            name: Table name for the log line.
+            collect: Zero-argument collector call.
+
+        Returns:
+            The collected rows, or ``[]`` when collection failed.
+        """
+        try:
+            return collect()
+        except Exception as exc:  # noqa: BLE001 - collectors span many OS APIs
+            self._log.warning("Failed to collect %s: %s", name, exc)
+            return []
 
     def _collect_process_table(self, target_pid: int) -> list[ProcessEntry]:
         """Collect system-wide process table. Linux only via /proc."""

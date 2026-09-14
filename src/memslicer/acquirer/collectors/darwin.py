@@ -361,7 +361,11 @@ class DarwinCollector:
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
-            uid = int(parts[2])
+            # macOS ps prints uids signed, so `nobody` comes back as -2.
+            # The format stores UID as uint32, where the same identity is
+            # 4294967294, so convert rather than hand the writer a value it
+            # cannot pack -- one such process used to abort the capture.
+            uid = int(parts[2]) & 0xFFFFFFFF
             rss = int(parts[3]) * 1024  # ps reports RSS in KB
             comm = parts[4] if len(parts) >= 5 else ""
             cmd_line = parts[5] if len(parts) >= 6 else ""

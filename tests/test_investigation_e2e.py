@@ -224,18 +224,20 @@ def main() -> int:
                            b1["type"] == BlockType.ModuleListIndex,
                            f"type=0x{b1['type']:04X}")
 
-        # Find SystemContext block — spec requires it at a fixed position
-        # After Block 0 (ProcessIdentity) + Block 1 (ModuleListIndex) + ModuleEntry children
+        # Find SystemContext block — spec Section 2.1 fixes its position:
+        # Block 0 ProcessIdentity, Block 1 ModuleListIndex, Block 2 SystemContext.
+        # The ModuleEntry children are emitted after the memory regions so
+        # they cannot displace it.
         sys_ctx_blocks = [b for b in blocks if b["type"] == BlockType.SystemContext]
         all_pass &= _check("SystemContext block exists", len(sys_ctx_blocks) == 1,
                            f"count={len(sys_ctx_blocks)}")
 
-        # Verify SystemContext appears after module entries (spec Section 6.1)
+        # Investigation mode: Block 2 MUST be System Context (spec Section 2.1)
         if sys_ctx_blocks:
             sc_idx = next(i for i, b in enumerate(blocks)
                           if b["type"] == BlockType.SystemContext)
-            all_pass &= _check("SystemContext after ModuleListIndex",
-                               sc_idx >= 2,
+            all_pass &= _check("Block 2 is SystemContext (0x0050, REQUIRED)",
+                               sc_idx == 2,
                                f"position={sc_idx}")
 
         if sys_ctx_blocks:
