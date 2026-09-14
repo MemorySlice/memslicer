@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+
+## [0.4.0] - 2026-09-14
+
+### Changes
+
+- fixes of memslicer to be aligned with the specification
+
 ## [Unreleased]
 
 ### Bug Fixes
