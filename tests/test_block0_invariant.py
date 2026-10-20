@@ -184,3 +184,78 @@ class TestTableCollectionIsNotFatal:
         assert not cap_bitmap & (1 << CapBit.SystemNetworkTable)
         assert cap_bitmap & (1 << CapBit.SystemProcessTable)
         assert cap_bitmap & (1 << CapBit.SystemHandleTable)
+
+
+class TestExtensionBlockCollectionIsNotFatal:
+    """A failing extension-block collector must cost that block, not the
+    capture. These run while the writer is open, so an unguarded raise
+    used to leave a truncated slice with no EndOfCapture."""
+
+    @staticmethod
+    def _system_context_table_bitmap(path: Path) -> int:
+        from test_engine import _find_block, _parse_blocks
+
+        payload = _find_block(_parse_blocks(path.read_bytes()), BlockType.SystemContext)
+        assert payload is not None, "SystemContext block not found"
+        # boot_time(8) + target_count(1) precede the 4-byte table_bitmap.
+        return struct.unpack_from("<I", payload, 9)[0]
+
+    def _acquire(self, tmp_path: Path, collector, **attribution_kwargs) -> Path:
+        from memslicer.acquirer.identity import AttributionConfig
+
+        output = tmp_path / "dump.msl"
+        engine = AcquisitionEngine(
+            _one_page_bridge(), investigation=True, collector=collector,
+            attribution=AttributionConfig(**attribution_kwargs),
+        )
+        engine.acquire(output)
+        types = _block_types(output)
+        assert types[0] == BlockType.ProcessIdentity
+        assert types[-1] == BlockType.EndOfCapture
+        return output
+
+    def test_raising_connectivity_collector_leaves_bit_3_clear(self, tmp_path: Path):
+        class BadConnectivityCollector(MockCollector):
+            def collect_connectivity_table(self, **kwargs):
+                raise OSError("/proc/net/snmp unreadable")
+
+        output = self._acquire(tmp_path, BadConnectivityCollector())
+
+        assert BlockType.ConnectivityTable not in _block_types(output)
+        assert not self._system_context_table_bitmap(output) & 0x08
+
+    def test_raising_persistence_collector_leaves_bit_6_clear(self, tmp_path: Path):
+        class BadPersistenceCollector(MockCollector):
+            def collect_persistence_manifest(self, **kwargs):
+                raise PermissionError("/etc unreadable")
+
+        output = self._acquire(
+            tmp_path, BadPersistenceCollector(), include_persistence_manifest=True,
+        )
+
+        assert BlockType.PersistenceManifest not in _block_types(output)
+        assert not self._system_context_table_bitmap(output) & 0x40
+
+    def test_collected_empty_persistence_manifest_still_sets_bit_6(self, tmp_path: Path):
+        """The opposite case pins the distinction: an empty manifest that was
+        actually collected is a positive signal and keeps its block."""
+        output = self._acquire(
+            tmp_path, MockCollector(), include_persistence_manifest=True,
+        )
+
+        assert BlockType.PersistenceManifest in _block_types(output)
+        assert self._system_context_table_bitmap(output) & 0x40
+
+    def test_raising_system_info_collector_records_a_warning(self, tmp_path: Path):
+        from memslicer.acquirer.os_detail import parse_os_detail
+        from test_engine import _system_context_os_detail
+
+        class BadSystemInfoCollector(MockCollector):
+            def collect_system_info(self):
+                raise OSError("uname failed")
+
+        output = self._acquire(tmp_path, BadSystemInfoCollector())
+
+        os_detail = parse_os_detail(_system_context_os_detail(output.read_bytes()))
+        warnings = os_detail.get("collector_warning", "").split(",")
+        assert "system_info_collection_failed" in warnings

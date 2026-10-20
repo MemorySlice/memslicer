@@ -76,7 +76,14 @@ def _make_collector(
     """Build the right collector for the target platform.
 
     Isolated in a helper so tests can monkeypatch it.
+
+    A remote target (``-U`` / ``-R``) yields a ``NullCollector``: this
+    command has no bridge to the device, and a host collector would
+    report the acquisition host as if it were the target.
     """
+    if is_remote:
+        return _remote_null_collector(logger)
+
     from memslicer.acquirer.collectors import create_collector
 
     return create_collector(
@@ -84,6 +91,18 @@ def _make_collector(
         is_remote=is_remote,
         logger=logger,
     )
+
+
+def _remote_null_collector(logger: logging.Logger) -> InvestigationCollector:
+    """Warn that remote collection is unsupported and return an empty collector."""
+    from memslicer.acquirer.collectors.fallback import NullCollector
+
+    logger.warning(
+        "memslicer-sysctx cannot reach remote targets; -U/-R only affect "
+        "attribution and nothing is collected from this host. "
+        "Use `memslicer <pid> -I -U` to collect from the device."
+    )
+    return NullCollector(logger=logger)
 
 
 # ---------------------------------------------------------------------------
@@ -428,10 +447,15 @@ def _minimum_set_complete(data: dict[str, Any]) -> bool:
     default=None,
     help="Force target OS type (auto-detected from sys.platform otherwise)",
 )
-@click.option("-U", "--usb", is_flag=True, help="Connect to USB device (Frida)")
+@click.option(
+    "-U", "--usb", is_flag=True,
+    help="Target is a USB device: affects attribution only; nothing is "
+         "collected (use `memslicer <pid> -I -U` to collect on the device)",
+)
 @click.option(
     "-R", "--remote", "remote_addr", default=None,
-    help="Remote server host:port (not implemented for sysctx yet)",
+    help="Target is at host:port: affects attribution only; nothing is "
+         "collected (use `memslicer <pid> -I -R host:port` instead)",
 )
 @click.option(
     "--tables", "tables_opt", default="process,connection,handle",

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import socket
 import subprocess
@@ -18,6 +19,7 @@ from memslicer.acquirer.collectors._io import read_symlink
 from memslicer.acquirer.collectors.constants import (
     AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP,
     HT_UNKNOWN, HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE,
+    FD_NONE,
 )
 
 # Regexes for parsing ioreg output of IOPlatformExpertDevice.
@@ -78,7 +80,9 @@ class DarwinCollector:
         """
         info = TargetProcessInfo()
 
-        # Single ps call for all fields; lstart has spaces so we use careful parsing
+        # Single ps call for all fields; lstart has spaces so we use careful parsing.
+        # lstart is only fixed-format ("Day Mon DD HH:MM:SS YYYY") under LC_ALL=C,
+        # which _run_cmd guarantees; other locales print localized day/month names.
         ps_out = self._run_cmd([
             "ps", "-p", str(pid), "-o", "ppid=,sess=,lstart=,comm=,args=",
         ])
@@ -109,17 +113,71 @@ class DarwinCollector:
         if lstart_match:
             info.start_time_ns = self._parse_lstart(lstart_match.group(1))
             remainder = lstart_match.group(2)
-            # remainder is "comm args..." - comm is the first word
+            # remainder is "comm args..." - comm is the first word.
+            # comm is truncated to 16 chars here and merely duplicates
+            # argv[0], so cmd_line is the args= portion after the first token.
             if remainder:
                 cmd_parts = remainder.split(None, 1)
                 info.exe_path = cmd_parts[0] if cmd_parts else ""
-                info.cmd_line = remainder
+                info.cmd_line = self._strip_comm_token(remainder)
         else:
             # Fallback: no lstart parsed, try to get at least exe_path
             info.exe_path = rest.split()[0] if rest.split() else ""
-            info.cmd_line = rest
+            info.cmd_line = self._strip_comm_token(rest)
+
+        # The combined line is only trusted for ppid/sess/lstart: comm is
+        # truncated to 16 chars and may itself contain spaces, so the exact
+        # exe_path and cmd_line come from dedicated single-column queries.
+        info.exe_path, info.cmd_line = self._read_exe_and_cmd_line(
+            pid, info.exe_path, info.cmd_line,
+        )
 
         return info
+
+    def _read_exe_and_cmd_line(
+        self, pid: int, fallback_exe: str, fallback_cmd_line: str,
+    ) -> tuple[str, str]:
+        """Return (exe_path, cmd_line) from separate ``comm=``/``args=`` calls.
+
+        ``ps -o comm=`` alone prints the untruncated executable path and
+        ``ps -o args=`` alone prints the exact command line, whereas the
+        combined ``comm=,args=`` line truncates comm to 16 chars and cannot
+        be split reliably when comm contains whitespace (``exec -a "my
+        spaced name"`` or ``/Volumes/My Disk/...``). Each value falls back
+        to the token parsed from the combined line when its query is empty.
+        """
+        exe_path = self._read_full_exe_path(pid) or fallback_exe
+        cmd_line = self._run_cmd(["ps", "-p", str(pid), "-o", "args="]).strip()
+        return exe_path, cmd_line or fallback_cmd_line
+
+    @staticmethod
+    def _strip_comm_token(comm_and_args: str) -> str:
+        """Return the args= portion of a "comm args..." ps remainder.
+
+        ``comm`` is truncated to 16 chars when combined with ``args=`` and
+        only repeats argv[0], so the command line must not start with it.
+        Falls back to the input when there is nothing after the first token.
+        """
+        parts = comm_and_args.split(None, 1)
+        if len(parts) == 2:
+            return parts[1]
+        return comm_and_args
+
+    def _read_full_exe_path(self, pid: int) -> str:
+        """Return the untruncated executable path via ``ps -o comm=``.
+
+        On macOS, ``comm=`` prints the full executable path when it is the
+        only text column, but is truncated to 16 characters (MAXCOMLEN)
+        as soon as it is combined with ``args=`` in the same ``-o`` list.
+        The combined call in collect_process_identity therefore yields e.g.
+        "/Users/danielbai" instead of the real path. Returns '' when the
+        lookup fails or does not look like an absolute path, so the caller
+        keeps its first-token fallback.
+        """
+        out = self._run_cmd(["ps", "-p", str(pid), "-o", "comm="]).strip()
+        if out and out.startswith("/"):
+            return out
+        return ""
 
     def collect_system_info(self) -> TargetSystemInfo:
         """Collect system info via sysctl, sw_vers, and ioreg."""
@@ -223,10 +281,19 @@ class DarwinCollector:
     # ------------------------------------------------------------------
 
     def _run_cmd(self, cmd: list[str], timeout: float = 10.0) -> str:
-        """Run a command and return stdout. Returns '' on failure."""
+        """Run a command and return stdout. Returns '' on failure.
+
+        Every command runs under the C locale: ps/lsof/sw_vers print
+        localized dates and words otherwise (e.g. ``ps -o lstart`` gives
+        "Di. 20 Okt. ..." on a German system), and forensic parsing must be
+        locale-independent. The parent environment is kept in full so PATH
+        still resolves /usr/sbin/sysctl, ioreg, etc.
+        """
+        env = dict(os.environ, LC_ALL="C", LANG="C")
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
+                env=env,
             )
             if result.returncode == 0:
                 return result.stdout
@@ -503,7 +570,11 @@ class DarwinCollector:
         if fd_digits:
             fd_num = int(fd_digits.group(1))
         elif fd_str in ("cwd", "rtd", "txt", "mem"):
-            fd_num = -1  # special descriptors
+            # Special descriptors carry no number. The format stores FD as
+            # uint32, so the "no descriptor" marker is the all-ones value;
+            # handing the writer -1 made it drop every such row (and, before
+            # the writer guarded it, aborted the whole capture on macOS).
+            fd_num = FD_NONE
 
         handle_type = self._classify_lsof_type(fd_type)
         return HandleEntry(pid=pid, fd=fd_num, handle_type=handle_type, path=name)

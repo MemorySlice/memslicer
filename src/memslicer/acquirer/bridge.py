@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from memslicer.msl.constants import ArchType, OSType
+
+if TYPE_CHECKING:
+    import logging
+
+    from memslicer.acquirer.investigation import InvestigationCollector
 
 
 @dataclass
@@ -192,6 +197,28 @@ class ReadMemoryExCapable(Protocol):
           the argument; pass those through :func:`fault_addr_from_text`.
 
         Reads never raise: a failure is a ``ReadResult`` with no data.
+        """
+        ...
+
+
+@runtime_checkable
+class RemoteCollectorCapable(Protocol):
+    """Optional bridge capability: bridges that can run investigation
+    collection on the target itself.
+
+    Bridges are not required to implement this. Callers should probe for the
+    method with ``getattr`` and fall back to
+    :class:`~memslicer.acquirer.collectors.fallback.NullCollector`.
+    """
+
+    def create_remote_collector(
+        self, logger: logging.Logger | None = None,
+    ) -> InvestigationCollector | None:
+        """Return a collector that gathers investigation data on the target.
+
+        Returns ``None`` when the bridge is not attached to a remote target,
+        is not connected yet, or the on-target agent could not be loaded.
+        Implementations log the reason and never raise for those cases.
         """
         ...
 

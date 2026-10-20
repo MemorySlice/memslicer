@@ -1328,3 +1328,173 @@ class TestAssumedPageSizeWarning:
         assert "hidepid_active" in warnings
         assert "kallsyms_restricted" in warnings
         assert "page_size_assumed_4k" in warnings
+
+
+# ---------------------------------------------------------------------------
+# Investigation collector selection for remote bridges (GitHub issue #3)
+# ---------------------------------------------------------------------------
+
+
+class RemoteBridge(MockBridge):
+    """A bridge attached to a process on another machine that can collect
+    investigation data there (Frida-like)."""
+
+    is_remote = True
+
+    def __init__(self, *args, remote_collector=None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.remote_collector = remote_collector
+        self.create_remote_collector_calls = 0
+
+    def create_remote_collector(self, logger):
+        self.create_remote_collector_calls += 1
+        return self.remote_collector
+
+
+class RemoteBridgeWithoutCollector(MockBridge):
+    """A remote bridge with no way to collect on the target (GDB-like)."""
+
+    is_remote = True
+
+
+def _one_page_kwargs() -> dict:
+    return dict(
+        ranges=[MemoryRange(base=0x10000, size=4096, protection="rw-", file_path="")],
+        modules=[],
+        memory={0x10000: b"\xaa" * 4096},
+    )
+
+
+def _device_collector() -> MockCollector:
+    """A collector whose hostname proves the data came from the target."""
+    collector = MockCollector()
+    collector.system_info.hostname = "device-host"
+    return collector
+
+
+def _system_context_hostname(raw: bytes) -> str:
+    blocks = _parse_blocks(raw)
+    payload = _find_block(blocks, BlockType.SystemContext)
+    assert payload is not None, "SystemContext block not found"
+    acq_user_len, _hostname_len, _d, _o, _c = struct.unpack_from("<HHHHH", payload, 13)
+    offset = 32
+    if acq_user_len > 0:
+        _acq_user, offset = _read_padded_string(payload, offset)
+    hostname, _offset = _read_padded_string(payload, offset)
+    return hostname
+
+
+class TestRemoteCollectorSelection:
+    """A remote bridge must never be served by a host-local collector."""
+
+    def test_remote_bridge_collector_is_used_for_the_capture(self, tmp_path: Path):
+        sentinel = _device_collector()
+        bridge = RemoteBridge(remote_collector=sentinel, **_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        output = tmp_path / "dump.msl"
+        engine.acquire(output)
+
+        assert engine._collector is sentinel
+        assert bridge.create_remote_collector_calls == 1
+        assert _system_context_hostname(output.read_bytes()) == "device-host"
+        # The host-side LinuxCollector fallback must never be touched.
+        assert not hasattr(engine, "_fallback_collector_instance")
+
+    def test_remote_bridge_without_capability_gets_null_collector(
+        self, tmp_path: Path, caplog,
+    ):
+        from memslicer.acquirer.collectors.fallback import NullCollector
+
+        bridge = RemoteBridgeWithoutCollector(**_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        with caplog.at_level("WARNING", logger="memslicer"):
+            engine.acquire(tmp_path / "dump.msl")
+
+        assert isinstance(engine._collector, NullCollector)
+        assert "remote target" in caplog.text
+        assert "RemoteBridgeWithoutCollector" in caplog.text
+        assert not hasattr(engine, "_fallback_collector_instance")
+
+    def test_remote_factory_returning_none_gets_null_collector(self, tmp_path: Path):
+        from memslicer.acquirer.collectors.fallback import NullCollector
+
+        bridge = RemoteBridge(remote_collector=None, **_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert bridge.create_remote_collector_calls == 1
+        assert isinstance(engine._collector, NullCollector)
+
+    def test_remote_bridge_replaces_host_memslicer_collector(self, tmp_path: Path):
+        from memslicer.acquirer.collectors.linux import LinuxCollector
+
+        sentinel = _device_collector()
+        bridge = RemoteBridge(remote_collector=sentinel, **_one_page_kwargs())
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=LinuxCollector(),
+        )
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert engine._collector is sentinel
+
+    def test_remote_bridge_keeps_user_supplied_collector(self, tmp_path: Path):
+        sentinel = _device_collector()
+        user_collector = MockCollector()
+        bridge = RemoteBridge(remote_collector=sentinel, **_one_page_kwargs())
+        engine = AcquisitionEngine(
+            bridge, investigation=True, collector=user_collector,
+        )
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert engine._collector is user_collector
+        assert bridge.create_remote_collector_calls == 0
+
+    def test_local_bridge_without_collector_keeps_fallback_path(self, tmp_path: Path):
+        bridge = MockBridge(**_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        engine.acquire(tmp_path / "dump.msl")
+
+        assert engine._collector is None
+
+    def test_remote_bridge_without_collector_never_reads_host_tables(self):
+        bridge = RemoteBridgeWithoutCollector(**_one_page_kwargs())
+        engine = AcquisitionEngine(bridge, investigation=True, collector=None)
+
+        tables = engine._collect_system_tables(1234)
+
+        assert tables.process_table == []
+        assert tables.connection_table == []
+        assert tables.handle_table == []
+        assert not hasattr(engine, "_fallback_collector_instance")
+
+
+class TestCollectOrDefault:
+    """Extension-block collection degrades to the caller's default."""
+
+    def _engine(self) -> AcquisitionEngine:
+        return AcquisitionEngine(MockBridge(), investigation=True, collector=None)
+
+    def test_returns_collected_value(self):
+        assert self._engine()._collect_or_default("x", lambda: 42, None) == 42
+
+    def test_returns_default_and_logs_on_failure(self, caplog):
+        def boom():
+            raise OSError("no /proc")
+
+        with caplog.at_level("WARNING", logger="memslicer"):
+            result = self._engine()._collect_or_default("thing", boom, "fallback")
+
+        assert result == "fallback"
+        assert "Failed to collect thing: no /proc" in caplog.text
+
+    def test_table_or_empty_still_returns_empty_list_on_failure(self):
+        def boom():
+            raise RuntimeError("nope")
+
+        assert self._engine()._table_or_empty("table", boom) == []

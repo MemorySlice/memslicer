@@ -9,7 +9,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from memslicer.acquirer.collectors.frida_remote import FridaRemoteCollector
+from memslicer.acquirer.collectors.frida_remote import FridaRemoteCollector, _to_int
 from memslicer.acquirer.investigation import TargetProcessInfo, TargetSystemInfo
 from memslicer.msl.types import ConnectionEntry, HandleEntry
 
@@ -595,3 +595,104 @@ class TestFridaRPCEnvelope:
         }
         info = collector.collect_system_info()
         assert "linux_net_parse:ENOENT" in info.collector_warnings
+
+
+class TestAgentVersionProvenance:
+    """The runtime that answers the RPCs is the target's frida-server, not the
+    host's Frida; the collector records it once so the .msl.log says which one."""
+
+    def _collector_with_logger(self):
+        logger = MagicMock()
+        session = MagicMock()
+        collector = FridaRemoteCollector(session=session, logger=logger)
+        collector._api = MagicMock()
+        return collector, logger
+
+    def test_agent_version_logged_once_from_first_envelope(self):
+        collector, logger = self._collector_with_logger()
+        collector._api.get_system_info.return_value = {
+            "data": {"hostname": "dev"}, "warnings": [], "agent": "16.5.9",
+        }
+        collector.collect_system_info()
+        collector.collect_system_info()
+        version_calls = [
+            c for c in logger.info.call_args_list
+            if "Investigation agent runtime" in c.args[0]
+        ]
+        assert len(version_calls) == 1
+        assert version_calls[0].args[1] == "16.5.9"
+
+    def test_legacy_envelope_without_agent_key_logs_nothing(self):
+        collector, logger = self._collector_with_logger()
+        collector._api.get_system_info.return_value = {
+            "data": {"hostname": "dev"}, "warnings": [],
+        }
+        collector.collect_system_info()
+        assert not [
+            c for c in logger.info.call_args_list
+            if "Investigation agent runtime" in c.args[0]
+        ]
+
+
+# ===========================================================================
+# Tests: integer coercion of BigInt-as-string envelope fields
+# ===========================================================================
+
+class TestToInt:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (0, 0),
+            (1792503749950000000, 1792503749950000000),
+            ("1792503749950000000", 1792503749950000000),
+            (" 42 ", 42),
+            ("-7", -7),
+            (1.0, 1),
+            (1.5, 0),
+            (True, 0),
+            (None, 0),
+            ("", 0),
+            ("abc", 0),
+            ("12abc", 0),
+            ([], 0),
+        ],
+    )
+    def test_coercion(self, value, expected):
+        assert _to_int(value) == expected
+
+
+class TestNanosecondFieldShapes:
+    """The agent sends epoch-ns as a decimal string (BigInt) or a Number."""
+
+    _NS = 1792503749950000000
+
+    @pytest.mark.parametrize("wire", [_NS, str(_NS)])
+    def test_start_time_ns(self, wire):
+        collector, api = _make_collector()
+        api.get_process_info.return_value = {
+            "data": {"ppid": 1, "startTimeNs": wire, "cmdLine": "sleep 100000"},
+            "warnings": [],
+            "agent": "17.24.3",
+        }
+        info = collector.collect_process_identity(18289)
+        assert info.start_time_ns == self._NS
+        assert isinstance(info.start_time_ns, int)
+        assert info.cmd_line == "sleep 100000"
+
+    @pytest.mark.parametrize("wire", [1792334195000000000, "1792334195000000000"])
+    def test_boot_time(self, wire):
+        collector, api = _make_collector()
+        api.get_system_info.return_value = {
+            "data": {"bootTime": wire, "hostname": "localhost"},
+            "warnings": [],
+        }
+        info = collector.collect_system_info()
+        assert info.boot_time == 1792334195000000000
+        assert isinstance(info.boot_time, int)
+
+    def test_garbage_fields_become_zero(self):
+        collector, api = _make_collector()
+        api.get_process_info.return_value = {"data": {"startTimeNs": "n/a"}, "warnings": []}
+        api.get_system_info.return_value = {"data": {"bootTime": None}, "warnings": []}
+        assert collector.collect_process_identity(1).start_time_ns == 0
+        assert collector.collect_system_info().boot_time == 0

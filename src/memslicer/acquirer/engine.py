@@ -17,7 +17,7 @@ from memslicer.acquirer.base import (
 from memslicer.acquirer.bridge import DebuggerBridge, MemoryRange, ReadResult
 from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
-from memslicer.acquirer.investigation import InvestigationCollector
+from memslicer.acquirer.investigation import InvestigationCollector, TargetSystemInfo
 from memslicer.acquirer.os_detail import pack_os_detail, system_info_to_fields
 from memslicer.acquirer.region_filter import (
     RegionFilter, is_kernel_pseudo_region,
@@ -407,11 +407,12 @@ class AcquisitionEngine(BaseAcquirer):
                 os_type.name, arch_type.name, pid, page_size,
             )
 
-            # Refine collector when bridge-detected OS differs from the
-            # initial collector (which was based on host platform).  This
-            # matters for remote targets where host != target OS.
-            if self._investigation and self._collector is not None:
-                self._maybe_refine_collector(os_type)
+            # Select the investigation collector now that the bridge has
+            # told us what the target really is. Remote targets arrive
+            # with no collector at all (the CLI cannot know the device's
+            # platform before attach), so this must also run for ``None``.
+            if self._investigation:
+                self._select_collector(os_type)
 
             # Enumerate modules BEFORE creating the header so we can
             # set the CapBitmap accurately.
@@ -555,7 +556,11 @@ class AcquisitionEngine(BaseAcquirer):
                         # in the slice. Collector calls return empty values
                         # when the platform is not Linux.
                         if self._collector is not None:
-                            connectivity_table = self._collector.collect_connectivity_table()
+                            connectivity_table = self._collect_or_default(
+                                "connectivity table",
+                                self._collector.collect_connectivity_table,
+                                None,
+                            )
                         else:
                             connectivity_table = None
 
@@ -566,12 +571,23 @@ class AcquisitionEngine(BaseAcquirer):
                             self._attribution.include_kernel_modules
                             and self._collector is not None
                         ):
-                            kernel_module_list = self._collector.collect_kernel_module_list()
+                            kernel_module_list = self._collect_or_default(
+                                "kernel module list",
+                                self._collector.collect_kernel_module_list,
+                                None,
+                            )
                         else:
                             kernel_module_list = None
 
+                        # A collection *failure* yields ``None`` so bit 6
+                        # stays clear; only an actually collected (even
+                        # empty) manifest is the positive signal below.
                         if self._attribution.include_persistence_manifest and self._collector is not None:
-                            persistence_manifest = self._collector.collect_persistence_manifest()
+                            persistence_manifest = self._collect_or_default(
+                                "persistence manifest",
+                                self._collector.collect_persistence_manifest,
+                                None,
+                            )
                         else:
                             persistence_manifest = None
 
@@ -627,7 +643,15 @@ class AcquisitionEngine(BaseAcquirer):
                         # Pull raw collector values (or produce empty ones
                         # if no collector is attached).
                         if self._collector is not None:
-                            sys_info = self._collector.collect_system_info()
+                            # On failure the placeholder's warning reaches
+                            # OSDetail, so the empty fields are explained.
+                            sys_info = self._collect_or_default(
+                                "system info",
+                                self._collector.collect_system_info,
+                                TargetSystemInfo(
+                                    collector_warnings=["system_info_collection_failed"],
+                                ),
+                            )
                             boot_time = sys_info.boot_time
                             collector_hostname = sys_info.hostname
                             collector_domain = sys_info.domain
@@ -1196,12 +1220,66 @@ class AcquisitionEngine(BaseAcquirer):
     # Collector management
     # ------------------------------------------------------------------
 
+    def _bridge_is_remote(self) -> bool:
+        """Whether the bridge talks to a process on another machine.
+
+        Probed with ``getattr`` because the bridge protocol does not
+        require the attribute; a bridge that does not say is local.
+        """
+        return bool(getattr(self._bridge, "is_remote", False))
+
+    def _select_collector(self, detected_os: OSType) -> None:
+        """Choose the investigation collector for the attached target.
+
+        A user-supplied collector (anything without the
+        ``_is_memslicer_collector`` marker) is always kept. For a remote
+        bridge the collector must come from the bridge itself, never from
+        the host: a host-local collector would read the acquisition host's
+        ``/proc`` for the device's pid (GitHub issue #3). Local targets keep
+        the existing OS-based refinement.
+        """
+        if self._collector is not None and not getattr(
+            self._collector, "_is_memslicer_collector", False,
+        ):
+            return
+        if self._bridge_is_remote():
+            self._collector = self._remote_collector_or_null()
+            return
+        if self._collector is not None:
+            self._maybe_refine_collector(detected_os)
+
+    def _remote_collector_or_null(self) -> InvestigationCollector:
+        """Obtain a collector that runs on the remote target, or a null one.
+
+        Mirrors the optional-capability probe used for ``read_memory_ex``:
+        a bridge that can collect on the target exposes
+        ``create_remote_collector``; otherwise the system tables stay empty
+        and the log says so. Host data is never substituted -- it would be
+        attributed to the wrong machine.
+        """
+        factory = getattr(self._bridge, "create_remote_collector", None)
+        collector = factory(self._log) if factory is not None else None
+        if collector is not None:
+            self._log.info(
+                "Using %s: investigation data is collected on the target",
+                type(collector).__name__,
+            )
+            return collector
+        from memslicer.acquirer.collectors.fallback import NullCollector
+        self._log.warning(
+            "Investigation data cannot be collected from a remote target "
+            "over %s; system tables will be empty",
+            type(self._bridge).__name__,
+        )
+        return NullCollector(logger=self._log)
+
     def _maybe_refine_collector(self, detected_os: OSType) -> None:
         """Re-select the investigation collector if the bridge-detected OS
         differs from what the current collector was built for.
 
-        This handles remote targets where the host OS (used for initial
-        collector creation) differs from the target OS.  Only replaces
+        Local bridges only: ``_select_collector`` diverts remote bridges to
+        the target-side collector before this runs, because every collector
+        the factory can return reads the acquisition host. Only replaces
         standard collectors (identified by `_is_memslicer_collector`
         marker) — user-provided or mock collectors are left untouched.
         """
@@ -1212,7 +1290,7 @@ class AcquisitionEngine(BaseAcquirer):
 
         current_name = type(self._collector).__name__
         new_collector = create_collector(
-            detected_os, is_remote=self._bridge.is_remote, logger=self._log,
+            detected_os, is_remote=self._bridge_is_remote(), logger=self._log,
         )
         new_name = type(new_collector).__name__
 
@@ -1291,6 +1369,15 @@ class AcquisitionEngine(BaseAcquirer):
                 ("connection table", collector.collect_connection_table),
                 ("handle table", lambda: collector.collect_handle_table(target_pid)),
             )
+        elif self._bridge_is_remote():
+            # Defensive: ``_select_collector`` never leaves a remote bridge
+            # without a collector, but the host fallbacks below read the
+            # host's /proc and must never describe a remote target.
+            self._log.warning(
+                "No investigation collector for remote target; "
+                "system tables will be empty"
+            )
+            return _SystemTables([], [], [])
         else:
             sources = (
                 ("process table", lambda: self._collect_process_table(target_pid)),
@@ -1315,11 +1402,31 @@ class AcquisitionEngine(BaseAcquirer):
         Returns:
             The collected rows, or ``[]`` when collection failed.
         """
+        return self._collect_or_default(name, collect, [])
+
+    def _collect_or_default(
+        self, name: str, collect: Callable[[], Any], default: Any,
+    ) -> Any:
+        """Run *collect*, degrading a failure to *default*.
+
+        The extension-block collectors run while the writer is open, so an
+        unguarded exception would leave a truncated ``.msl`` behind. The
+        caller picks a *default* that keeps the slice honest: ``None`` for
+        a block whose bit must stay clear, an empty list for a table.
+
+        Args:
+            name: Name for the log line.
+            collect: Zero-argument collector call.
+            default: Value returned when collection failed.
+
+        Returns:
+            The collected value, or *default* when collection failed.
+        """
         try:
             return collect()
         except Exception as exc:  # noqa: BLE001 - collectors span many OS APIs
             self._log.warning("Failed to collect %s: %s", name, exc)
-            return []
+            return default
 
     def _collect_process_table(self, target_pid: int) -> list[ProcessEntry]:
         """Collect system-wide process table. Linux only via /proc."""

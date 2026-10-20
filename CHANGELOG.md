@@ -4,8 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `-D/--device <id>` selects a specific Frida device when several are
+  attached (ids as printed by `frida-ls-devices`); `-U` keeps taking the
+  first USB device. `-D` is a Frida-only option and cannot be combined
+  with `-R`.
+
 ### Bug Fixes
 
+- Investigation captures no longer abort with `'Q' format requires 0 <= number …`
+  on Linux hosts ([#3](https://github.com/MemorySlice/memslicer/issues/3)).
+  `/proc/net/snmp` reports `Tcp.MaxConn` as -1 (signed per RFC 2012); it is
+  now stored as two's-complement u64, and a connectivity, connection, handle,
+  kernel-module or persistence row that cannot be packed is dropped and logged
+  instead of ending the capture.
+- Remote Frida targets (`-U`, `-R`) collect investigation data on the device
+  through the Frida agent. The host's `/proc` was being read for the device's
+  PID, which is where the `/proc/<pid>/stat` warnings in #3 came from. GDB and
+  LLDB remote targets record empty system tables with a warning instead of
+  host data.
+- The on-device investigation agent works with Frida 16 and Frida 17
+  frida-servers. It detects the runtime API at load time (`Module` export
+  lookup, bundled `Java`/`ObjC` bridges, `File` reads) rather than assuming
+  one version; on Frida 17 the static `Module` helpers and the bridges are
+  gone, and `File.read` never existed, so every `/proc` read came back empty.
+- macOS investigation captures no longer abort at the handle table. lsof
+  `cwd`/`rtd`/`txt`/`mem` rows have no descriptor number and are written as
+  `0xFFFFFFFF`, not -1.
+- macOS process identity is correct under non-English locales and for long
+  paths. `ps` is now run with `LC_ALL=C` (a localized `lstart` such as
+  `Di. 20 Okt. …` left `exe_path='Di.'` and a zero start time), the executable
+  path comes from a separate `comm=` query (combined with `args=` it is cut to
+  16 characters), and the command line no longer repeats that truncated token.
+- On-device reads of `/proc/<pid>/cmdline` work again: the GumJS text readers
+  reject embedded NUL bytes, so the agent reads bytes and decodes UTF-8 itself.
+  Process start times on Android use bionic's `_SC_CLK_TCK` (6, not glibc's 2).
+  Android package names are derived only for app processes, not native ones.
+- A collector that raises while the slice is being written (connectivity,
+  kernel modules, persistence, system info) no longer leaves a truncated file;
+  the block is skipped and its table bit stays clear.
+- A failed capture writes the traceback to the `.msl.log` and prints the log
+  path; with `-v` the traceback also reaches the console.
+- `memslicer-sysctx -U/-R` no longer reports the acquisition host as the
+  device; it warns and emits an empty context.
 - Investigation captures put System Context in Block 2, per spec Section 2.1.
   ModuleEntry children occupied it; they now follow the memory regions.
 - macOS investigation captures no longer abort at the process table. `ps`

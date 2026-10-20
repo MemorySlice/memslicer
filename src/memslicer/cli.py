@@ -179,10 +179,27 @@ class ProgressAwareHandler(logging.Handler):
             self.handleError(record)
 
 
-def _get_frida_device(usb: bool, remote_addr: str | None):
-    """Create a Frida device based on connection options."""
+# Seconds to wait for a device named by -D to show up before giving up.
+_FRIDA_DEVICE_LOOKUP_TIMEOUT = 5.0
+
+
+def _get_frida_device(usb: bool, remote_addr: str | None, device_id: str | None = None):
+    """Create a Frida device based on connection options.
+
+    ``device_id`` (``-D``) wins over ``usb``: ``-U`` alone takes the first
+    USB device Frida enumerates, which is the wrong one as soon as a second
+    phone or emulator is attached, so ``-D <id>`` names the device explicitly
+    (ids as printed by ``frida-ls-devices``).
+    """
     import frida
 
+    if device_id:
+        try:
+            return frida.get_device(device_id, timeout=_FRIDA_DEVICE_LOOKUP_TIMEOUT)
+        except Exception as exc:
+            raise click.UsageError(
+                f"Frida device '{device_id}' not found; run frida-ls-devices"
+            ) from exc
     if usb:
         return frida.get_usb_device()
     elif remote_addr:
@@ -192,6 +209,53 @@ def _get_frida_device(usb: bool, remote_addr: str | None):
         return manager.add_remote_device(f"{host}:{port_num}")
     else:
         return frida.get_local_device()
+
+
+def _create_investigation_collector(
+    investigation: bool,
+    usb: bool,
+    remote_addr: str | None,
+    os_override: OSType | None,
+    logger: logging.Logger,
+    device_id: str | None = None,
+):
+    """Pick the host-side investigation collector, or defer to the engine.
+
+    Args:
+        investigation: Whether investigation mode (``-I``) is enabled.
+        usb: Whether the target is a USB device.
+        remote_addr: Remote server address, if any.
+        os_override: Target OS forced via ``--os`` (already an ``OSType``).
+        logger: Logger shared with the acquisition engine.
+        device_id: Frida device selected via ``-D``, if any (a remote target).
+
+    Returns:
+        A collector for a local target, or ``None`` when investigation is
+        off or the target is remote. For a remote target the engine picks
+        the collector after attach (``FridaRemoteCollector`` through the
+        bridge, or ``NullCollector`` for gdb/lldb) — host collectors would
+        read the host's ``/proc`` for the device's PID.
+    """
+    if not investigation:
+        return None
+    # Truthiness, matching the bridges' is_remote and the attribution
+    # below. An empty --remote attaches locally, so treating it as remote
+    # here would pick a remote collector for a local capture.
+    is_remote = bool(usb or remote_addr or device_id)
+    if is_remote:
+        logger.info(
+            "Remote target: investigation collector is chosen after attach, "
+            "from the target's platform"
+        )
+        return None
+
+    from memslicer.acquirer.collectors import create_collector
+    from memslicer.acquirer.identity import infer_os_type
+
+    # infer_os_type(None) walks the host sys.platform ladder; the real
+    # target OS is only known after the bridge connects.
+    target_os = os_override if os_override is not None else infer_os_type(None)
+    return create_collector(target_os, is_remote=False, logger=logger)
 
 
 def _create_acquirer(
@@ -209,6 +273,7 @@ def _create_acquirer(
     passphrase: str | None = None,
     attribution=None,
     hash_algo: HashAlgo = HashAlgo.BLAKE3,
+    device_id: str | None = None,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -220,7 +285,7 @@ def _create_acquirer(
             raise click.UsageError(
                 "Frida is not installed. Install with: pip install memslicer[frida]"
             )
-        device = _get_frida_device(usb, remote_addr)
+        device = _get_frida_device(usb, remote_addr, device_id)
         bridge = FridaBridge(
             target=target,
             device=device,
@@ -247,44 +312,14 @@ def _create_acquirer(
     else:
         raise click.UsageError(f"Unknown backend: {backend}")
 
-    # Create investigation collector if investigation mode is enabled
-    collector = None
-    if investigation:
-        from memslicer.acquirer.collectors import create_collector
-        # Truthiness, matching the bridges' is_remote and the attribution
-        # below. An empty --remote attaches locally, so treating it as remote
-        # here would pick a remote collector for a local capture.
-        is_remote = bool(usb or remote_addr)
-
-        # For remote Frida targets, use FridaRemoteCollector which runs
-        # JS on the target device. Note: FridaRemoteCollector needs
-        # the Frida session, which is only available after bridge.connect().
-        # We store the bridge reference so the engine can set up the
-        # remote collector during acquisition. For local targets, we
-        # create a platform-local collector immediately.
-        if backend == "frida" and is_remote:
-            # Remote Frida: store bridge ref for deferred collector setup.
-            # The local collector serves as fallback if remote setup fails.
-            logger.info(
-                "Remote Frida target detected; investigation data will be "
-                "collected from target device when possible"
-            )
-
-        # Determine target OS for collector selection
-        target_os = os_override if os_override is not None else None
-        if target_os is not None:
-            collector = create_collector(target_os, is_remote=is_remote, logger=logger)
-        else:
-            # OS detected after bridge connects; use host platform as fallback
-            import sys as _sys
-            if _sys.platform == "linux":
-                collector = create_collector(OSType.Linux, is_remote=is_remote, logger=logger)
-            elif _sys.platform == "darwin":
-                collector = create_collector(OSType.macOS, is_remote=is_remote, logger=logger)
-            elif _sys.platform == "win32":
-                collector = create_collector(OSType.Windows, is_remote=is_remote, logger=logger)
-            else:
-                collector = create_collector(OSType.Unknown, is_remote=is_remote, logger=logger)
+    collector = _create_investigation_collector(
+        investigation=investigation,
+        usb=usb,
+        remote_addr=remote_addr,
+        os_override=os_override,
+        logger=logger,
+        device_id=device_id,
+    )
 
     return AcquisitionEngine(
         bridge=bridge,
@@ -307,6 +342,7 @@ def _create_acquirer(
 @click.option("-o", "--output", "output_path", default=None, help="Output .msl file path")
 @click.option("-c", "--compress", "comp", type=click.Choice(["none", "zstd", "lz4"]), default="none", help="Compression algorithm")
 @click.option("-U", "--usb", is_flag=True, help="Connect to USB device (Frida backend only)")
+@click.option("-D", "--device", "device_id", default=None, help="Frida device ID as shown by `frida-ls-devices` (Frida backend only; use when several USB devices are attached)")
 @click.option("-R", "--remote", "remote_addr", default=None, help="Remote server host:port (Frida: frida-server, GDB: gdbserver, LLDB: lldb-server)")
 @click.option("--os", "os_override", type=click.Choice(["windows", "linux", "macos", "android", "ios"]), default=None, help="Override OS detection")
 @click.option("--filter-prot", default=None, help="Protection filter (e.g., 'r--', 'rw-')")
@@ -322,7 +358,7 @@ def _create_acquirer(
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
 @click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
 @attribution_options
-def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filter_prot, filter_addr,
+def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, skip_kernel_pseudo,
         max_region_size, investigation,
         encrypt, no_encrypt, passphrase, hash_algo_str,
@@ -343,6 +379,10 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
     # Validate backend-specific options
     if usb and backend != "frida":
         raise click.UsageError("--usb / -U is only supported with --backend frida")
+    if device_id and backend != "frida":
+        raise click.UsageError("--device / -D is only supported with --backend frida")
+    if device_id and remote_addr:
+        raise click.UsageError("--device / -D and --remote / -R select different transports; use one")
 
     # Validate + bundle operator attribution at the CLI boundary.
     # Any ForensicStringError becomes a clean BadParameter message
@@ -353,7 +393,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
             case_ref=case_ref,
             hostname_override=hostname_override,
             domain_override=domain_override,
-            is_remote=bool(usb or remote_addr),
+            is_remote=bool(usb or remote_addr or device_id),
             include_serials=include_serials,
             include_network_identity=include_network_identity,
             include_fingerprint=include_fingerprint,
@@ -445,6 +485,8 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
     # Determine device display string
     if remote_addr:
         device_str = remote_addr
+    elif device_id:
+        device_str = f"{device_id} (USB)"
     elif usb:
         device_str = "USB"
     else:
@@ -487,6 +529,7 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         remote_addr=remote_addr,
         investigation=investigation,
         passphrase=passphrase if use_encryption else None,
+        device_id=device_id,
         attribution=attribution,
         hash_algo=hash_algo,
     )
@@ -578,8 +621,21 @@ def cli(target, backend, output_path, comp, usb, remote_addr, os_override, filte
         _render_attach_error(e, log_file_path)
         raise SystemExit(1)
     except Exception as e:
+        # Restore the console handler first so the traceback reaches the
+        # terminal with -v; the file handler is DEBUG, so it always lands
+        # in the .msl.log.
+        if progress_handler is not None:
+            logger.removeHandler(progress_handler)
+            logger.addHandler(handler)
+        logger.debug("Acquisition failed", exc_info=True)
         click.echo(f"\nError: {e}", err=True)
+        click.echo(f"  Log     : {log_file_path}", err=True)
         raise SystemExit(1)
     finally:
         logger.removeHandler(file_handler)
         file_handler.close()
+        # The "memslicer" logger outlives this command: detach the console
+        # handlers too, or a later run in the same process inherits them.
+        if progress_handler is not None:
+            logger.removeHandler(progress_handler)
+        logger.removeHandler(handler)

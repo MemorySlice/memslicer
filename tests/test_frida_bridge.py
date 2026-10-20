@@ -589,3 +589,101 @@ class TestFridaBridgeFaultTextFalsePositives:
         from memslicer.acquirer.bridge import parse_fault_addr
 
         assert parse_fault_addr(message) == expected
+
+
+# ---------------------------------------------------------------------------
+# Remote investigation collector
+# ---------------------------------------------------------------------------
+
+def _connect_with_two_scripts(bridge, device=None, investigation_script=None):
+    """Connect *bridge* so the bridge and investigation scripts are distinct.
+
+    Returns ``(bridge_script, investigation_script)``; the second is what
+    ``session.create_script`` hands out for the investigation agent.
+    """
+    mock_device = device or MagicMock(type="usb")
+    mock_device_, api = _prepare_device_and_api(bridge, mock_device)
+    session = mock_device_.attach.return_value
+    bridge_script = session.create_script.return_value
+    investigation_script = investigation_script or MagicMock()
+    session.create_script.side_effect = [bridge_script, investigation_script]
+    with patch.dict(sys.modules, {"frida": _prepare_mock_frida_module()}):
+        bridge.connect()
+    return bridge_script, investigation_script
+
+
+class TestFridaBridgeCreateRemoteCollector:
+    """FridaBridge.create_remote_collector loads the agent on remote targets."""
+
+    def test_remote_target_returns_connected_collector(self):
+        from memslicer.acquirer.collectors.frida_remote import FridaRemoteCollector
+
+        bridge = _make_bridge(target=1234)
+        _bridge_script, investigation_script = _connect_with_two_scripts(bridge)
+
+        collector = bridge.create_remote_collector()
+
+        assert isinstance(collector, FridaRemoteCollector)
+        assert bridge._session.create_script.call_count == 2
+        assert collector._api is investigation_script.exports_sync
+        investigation_script.load.assert_called_once()
+
+    def test_local_device_returns_none(self):
+        bridge = _make_bridge(target=1234)
+        _connect_with_two_scripts(bridge, device=MagicMock(type="local"))
+
+        assert bridge.create_remote_collector() is None
+        assert bridge._session.create_script.call_count == 1
+
+    def test_before_connect_returns_none(self):
+        bridge = _make_bridge(target=1234, device=MagicMock(type="usb"))
+
+        assert bridge.create_remote_collector() is None
+
+    def test_script_load_failure_returns_none_and_warns(self):
+        bridge = _make_bridge(target=1234)
+        failing_script = MagicMock()
+        failing_script.load.side_effect = RuntimeError("boom")
+        _connect_with_two_scripts(bridge, investigation_script=failing_script)
+
+        assert bridge.create_remote_collector() is None
+        bridge._log.warning.assert_called_once()
+        fmt, exc = bridge._log.warning.call_args.args
+        assert "Investigation script could not be loaded" in fmt
+        assert "boom" in str(exc)
+
+    def test_create_script_failure_returns_none_and_warns(self):
+        bridge = _make_bridge(target=1234)
+        _connect_with_two_scripts(bridge)
+        bridge._session.create_script.side_effect = RuntimeError("boom")
+
+        assert bridge.create_remote_collector() is None
+        bridge._log.warning.assert_called_once()
+
+    def test_collector_uses_given_logger(self):
+        bridge = _make_bridge(target=1234)
+        _connect_with_two_scripts(bridge)
+        logger = MagicMock()
+
+        collector = bridge.create_remote_collector(logger=logger)
+
+        assert collector._log is logger
+
+    def test_bridge_satisfies_remote_collector_capable(self):
+        from memslicer.acquirer.bridge import RemoteCollectorCapable
+
+        bridge = _make_bridge(target=1234)
+
+        assert isinstance(bridge, RemoteCollectorCapable)
+
+
+class TestFridaScriptProcMapsFallback:
+    """The agent's /proc/self/maps fallback must use the GumJS File API."""
+
+    def test_fallback_reads_with_read_text_not_read(self):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "File.readAllText('/proc/self/maps')" in _FRIDA_SCRIPT
+        assert "f.readText(65536)" in _FRIDA_SCRIPT
+        assert "typeof f.readText !== 'function'" in _FRIDA_SCRIPT
+        assert "f.read(" not in _FRIDA_SCRIPT

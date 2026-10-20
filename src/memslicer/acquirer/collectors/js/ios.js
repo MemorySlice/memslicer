@@ -1,7 +1,9 @@
 /* ios.js - iOS enrichment. Prefer sysctlbyname over MobileGestalt (always
  * readable, no entitlement). ObjC.classes.UIDevice requires UIKit to be
- * loaded — guard with Module.findBaseAddress('UIKit'). On early-attach
- * before UIApplicationMain, UIKit is absent and UIDevice is undefined.
+ * loaded — guard with objcAvailable() && findModuleBase('UIKit'). On
+ * early-attach before UIApplicationMain, UIKit is absent and UIDevice is
+ * undefined; on Frida 17 agents the ObjC bridge itself is absent and the
+ * sysctl values are all we report.
  */
 function iosGetSystemInfo(result, warnings) {
     result.osDetail = '';
@@ -19,9 +21,14 @@ function iosGetSystemInfo(result, warnings) {
         result.kernel = sysctlStr('kern.osrelease');
     } catch(e) { warnings.push('ios_sysctl:' + e.message); }
 
+    /* Hostname without ObjC: kern.hostname is readable from any process. */
+    if (!result.hostname) {
+        try { result.hostname = sysctlStr('kern.hostname'); } catch(e) {}
+    }
+
     /* UIKit-guarded ObjC path — supplement when UIKit is loaded. */
     try {
-        if (ObjC.available && Module.findBaseAddress('UIKit') !== null) {
+        if (objcAvailable() && findModuleBase('UIKit') !== null) {
             var device = ObjC.classes.UIDevice.currentDevice();
             if (!result.osDetail) {
                 result.osDetail = 'iOS ' + device.systemVersion().toString() + ' (' + device.model().toString() + ')';

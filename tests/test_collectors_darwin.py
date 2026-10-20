@@ -1,5 +1,9 @@
 """Tests for DarwinCollector (macOS investigation data collection)."""
+import io
+import os
+import struct
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 import subprocess
@@ -11,9 +15,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.acquirer.collectors.constants import (
     HT_FILE, HT_DIR, HT_SOCKET, HT_PIPE, HT_DEVICE, HT_UNKNOWN,
-    AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP,
+    AF_INET, AF_INET6, PROTO_TCP, PROTO_UDP, FD_NONE,
 )
 from memslicer.acquirer.collectors.darwin import DarwinCollector
+from memslicer.msl.constants import (
+    BLOCK_HEADER_SIZE, BLOCK_MAGIC, HEADER_SIZE, ArchType, BlockType, OSType,
+)
+from memslicer.msl.types import FileHeader
+from memslicer.msl.writer import MSLWriter
+from memslicer.utils.timestamps import now_ns
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +40,20 @@ def _make_completed(stdout="", returncode=0):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
+def _make_header() -> FileHeader:
+    return FileHeader(
+        endianness=1,
+        version=(1, 0),
+        flags=0,
+        cap_bitmap=0,
+        dump_uuid=uuid.uuid4().bytes,
+        timestamp_ns=now_ns(),
+        os_type=OSType.macOS,
+        arch_type=ArchType.ARM64,
+        pid=1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # collect_process_identity
 # ---------------------------------------------------------------------------
@@ -40,16 +64,25 @@ class TestCollectProcessIdentity:
     @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
     def test_basic_identity(self, mock_run, collector):
         """Verify ppid, session_id, start_time, exe_path, cmd_line."""
-        # Single combined ps call returns all fields
+        # Combined ps call returns all fields; the dedicated comm=/args=
+        # queries return their single column, as the real ps does.
         ps_output = "   100  5000 Mon Jan  2 15:04:05 2023 /usr/bin/python3 /usr/bin/python3 script.py --verbose\n"
-        mock_run.return_value = _make_completed(ps_output)
+        by_column = {
+            "ppid=,sess=,lstart=,comm=,args=": ps_output,
+            "comm=": "/usr/bin/python3\n",
+            "args=": "/usr/bin/python3 script.py --verbose\n",
+        }
+        mock_run.side_effect = lambda cmd, **kw: _make_completed(by_column[cmd[-1]])
 
         info = collector.collect_process_identity(1234)
 
         assert info.ppid == 100
         assert info.session_id == 5000
         assert info.exe_path == "/usr/bin/python3"
+        # cmd_line is the args= portion only: the leading comm token is
+        # truncated to 16 chars by ps and merely duplicates argv[0].
         assert "/usr/bin/python3 script.py --verbose" in info.cmd_line
+        assert info.cmd_line == "/usr/bin/python3 script.py --verbose"
         assert info.start_time_ns > 0
 
     @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
@@ -361,8 +394,11 @@ class TestCollectHandleTable:
         entries = collector.collect_handle_table(1234)
 
         assert len(entries) == 3
-        # cwd entry
-        assert entries[0].fd == -1
+        # cwd entry: no descriptor number. FD is uint32 on the wire, so the
+        # marker is FD_NONE (0xFFFFFFFF); the old -1 was unpackable and
+        # aborted every macOS -I capture at the handle table.
+        assert entries[0].fd == FD_NONE
+        assert entries[0].fd == 0xFFFFFFFF
         assert entries[0].handle_type == HT_DIR
         assert entries[0].path == "/Users/user"
         # REG entry
@@ -376,6 +412,40 @@ class TestCollectHandleTable:
     def test_handle_table_empty(self, mock_run, collector):
         mock_run.return_value = _make_completed("", returncode=1)
         assert collector.collect_handle_table(1234) == []
+
+    @pytest.mark.parametrize("fd_str", ["cwd", "rtd", "txt", "mem"])
+    def test_special_descriptors_use_fd_none(self, collector, fd_str):
+        line = f"python3  1234   user  {fd_str}    DIR  1,18      640    2 /Users/user"
+        entry = collector._parse_lsof_handle(line, 1234)
+        assert entry is not None
+        assert entry.fd == FD_NONE
+
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_handle_table_writes_fd_none_to_msl(self, mock_run, collector):
+        """Parse -> write_handle_table -> unpack: the cwd row lands in the
+        block with FD == 0xFFFFFFFF instead of aborting the writer."""
+        lsof_output = (
+            "COMMAND   PID   USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "python3  1234   user  cwd    DIR  1,18      640    2 /Users/user\n"
+            "python3  1234   user    3r   REG  1,18      100  123 /tmp/data.txt\n"
+        )
+        mock_run.return_value = _make_completed(lsof_output)
+        entries = collector.collect_handle_table(1234)
+
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, _make_header())
+        writer.write_handle_table(entries, parent_uuid=uuid.uuid4().bytes)
+        writer.finalize()
+
+        data = buf.getvalue()
+        magic, btype, _flags, block_len = struct.unpack_from("<4sHHI", data, HEADER_SIZE)
+        assert magic == BLOCK_MAGIC
+        assert btype == BlockType.HandleTable
+        payload = data[HEADER_SIZE + BLOCK_HEADER_SIZE:HEADER_SIZE + block_len]
+        entry_count, _ = struct.unpack_from("<II", payload, 0)
+        assert entry_count == 2
+        pid, fd, handle_type = struct.unpack_from("<IIB", payload, 8)
+        assert (pid, fd, handle_type) == (1234, 0xFFFFFFFF, HT_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -472,3 +542,306 @@ class TestRunCmd:
     def test_success_returns_stdout(self, mock_run, collector):
         mock_run.return_value = _make_completed("hello world\n")
         assert collector._run_cmd(["echo"]) == "hello world\n"
+
+
+# ---------------------------------------------------------------------------
+# Locale independence (ps lstart is only fixed-format under LC_ALL=C)
+# ---------------------------------------------------------------------------
+
+# Real output observed on a German-locale Mac (without the fix) vs. LC_ALL=C.
+_PS_LINE_GERMAN = (
+    "    1      0 Di. 20 Okt. 15:40:58 2026    "
+    "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 "
+    "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 -m dexray\n"
+)
+_PS_LINE_C_LOCALE = (
+    "    1      0 Tue Oct 20 15:40:58 2026     "
+    "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 "
+    "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 -m dexray\n"
+)
+_EXPECTED_EXE = "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3"
+
+
+class TestRunCmdLocale:
+    """_run_cmd must force a C locale while keeping the parent environment."""
+
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_run_cmd_forces_c_locale(self, mock_run, collector):
+        mock_run.return_value = _make_completed("out\n")
+        assert collector._run_cmd(["ps"]) == "out\n"
+
+        env = mock_run.call_args.kwargs["env"]
+        assert env["LC_ALL"] == "C"
+        assert env["LANG"] == "C"
+
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_run_cmd_keeps_parent_path(self, mock_run, collector):
+        """PATH must survive so sysctl/ioreg/lsof are still found."""
+        mock_run.return_value = _make_completed("")
+        collector._run_cmd(["sysctl"])
+
+        env = mock_run.call_args.kwargs["env"]
+        assert "PATH" in env
+        assert env["PATH"] == os.environ["PATH"]
+
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_run_cmd_does_not_mutate_os_environ(self, mock_run, collector):
+        mock_run.return_value = _make_completed("")
+        before = dict(os.environ)
+        collector._run_cmd(["ps"])
+        assert dict(os.environ) == before
+
+
+class TestProcessIdentityLocale:
+    """Regression: localized lstart broke exe_path/cmd_line/start_time parsing."""
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_c_locale_line_parses_fully(self, mock_run_cmd, collector):
+        """With LC_ALL=C (what _run_cmd now guarantees) the line parses."""
+        # Calls 2/3 are the comm=/args= lookups; '' keeps the parsed tokens.
+        mock_run_cmd.side_effect = [_PS_LINE_C_LOCALE, "", ""]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.ppid == 1
+        assert info.session_id == 0
+        assert info.start_time_ns > 0
+        assert info.exe_path == _EXPECTED_EXE
+        assert info.exe_path.startswith("/")
+        assert info.cmd_line.startswith(_EXPECTED_EXE)
+
+    @patch("memslicer.acquirer.collectors.darwin.subprocess.run")
+    def test_every_ps_call_forces_c_locale(self, mock_run, collector):
+        """The German line can never reach the parser: every ps invocation
+        made by collect_process_identity runs under LC_ALL=C."""
+        mock_run.return_value = _make_completed(_PS_LINE_C_LOCALE)
+
+        info = collector.collect_process_identity(10577)
+
+        assert mock_run.call_count >= 1
+        for call in mock_run.call_args_list:
+            assert call.args[0][0] == "ps"
+            assert call.kwargs["env"]["LC_ALL"] == "C"
+            assert call.kwargs["env"]["LANG"] == "C"
+        assert info.start_time_ns > 0
+        assert info.ppid == 1
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_german_line_documents_pre_fix_failure(self, mock_run_cmd, collector):
+        """PRE-FIX INPUT ONLY: documents why _run_cmd forces LC_ALL=C.
+
+        A localized lstart ("Di. 20 Okt. ...") is not a fixed-format date,
+        so start_time_ns cannot be recovered. With the fix this line is never
+        produced; the assertion below pins the failure mode, not a contract.
+        """
+        mock_run_cmd.side_effect = [_PS_LINE_GERMAN, "", ""]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.ppid == 1
+        assert info.session_id == 0
+        assert info.start_time_ns == 0  # pre-fix failure mode, see docstring
+
+
+@pytest.mark.requires_darwin
+class TestProcessIdentityLive:
+    """Runs the real ps on this Mac regardless of the user's locale."""
+
+    def test_live_identity_of_own_process(self, collector):
+        info = collector.collect_process_identity(os.getpid())
+
+        assert info.exe_path.startswith("/")
+        assert info.start_time_ns > 0
+        assert info.ppid == os.getppid()
+        # comm truncation regression: the full path must come back.
+        assert len(info.exe_path) > 16
+        assert os.path.exists(info.exe_path)
+        assert os.path.realpath(info.exe_path) == os.path.realpath(sys.executable)
+        # cmd_line must not lead with the truncated comm token.
+        first_token = info.cmd_line.split()[0]
+        assert len(first_token) > 16
+        assert os.path.exists(first_token)
+        assert os.path.realpath(first_token) == os.path.realpath(sys.executable)
+
+
+# ---------------------------------------------------------------------------
+# comm= truncation (16 chars when combined with args=)
+# ---------------------------------------------------------------------------
+
+_PS_LINE_TRUNCATED_COMM = (
+    "    1      0 Tue Oct 20 15:47:25 2026     "
+    "/Users/danielbai "
+    "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 -m dexray\n"
+)
+
+
+class TestProcessIdentityFullExePath:
+    """Regression: ps truncates comm= to 16 chars when combined with args=."""
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_full_path_from_second_comm_call(self, mock_run_cmd, collector):
+        mock_run_cmd.side_effect = [_PS_LINE_TRUNCATED_COMM, _EXPECTED_EXE + "\n", ""]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.exe_path == _EXPECTED_EXE
+        assert info.ppid == 1
+        assert info.start_time_ns > 0
+        # cmd_line is the args= portion: the truncated comm token
+        # ("/Users/danielbai", 16 chars, duplicating argv[0]) is dropped.
+        assert not info.cmd_line.startswith("/Users/danielbai ")
+        assert info.cmd_line == _EXPECTED_EXE + " -m dexray"
+        assert mock_run_cmd.call_count == 3
+        assert mock_run_cmd.call_args_list[1].args[0] == [
+            "ps", "-p", "10577", "-o", "comm=",
+        ]
+        assert mock_run_cmd.call_args_list[2].args[0] == [
+            "ps", "-p", "10577", "-o", "args=",
+        ]
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_empty_comm_output_keeps_fallback(self, mock_run_cmd, collector):
+        mock_run_cmd.side_effect = [_PS_LINE_TRUNCATED_COMM, "", ""]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.exe_path == "/Users/danielbai"
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_non_absolute_comm_output_keeps_fallback(self, mock_run_cmd, collector):
+        """Garbage from the comm= call must not replace the parsed token."""
+        mock_run_cmd.side_effect = [_PS_LINE_TRUNCATED_COMM, "python3\n", ""]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.exe_path == "/Users/danielbai"
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_comm_call_skipped_when_ps_fails(self, mock_run_cmd, collector):
+        mock_run_cmd.return_value = ""
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.exe_path == ""
+        assert mock_run_cmd.call_count == 1
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_read_full_exe_path_strips_whitespace(self, mock_run_cmd, collector):
+        mock_run_cmd.return_value = "  " + _EXPECTED_EXE + "  \n"
+        assert collector._read_full_exe_path(42) == _EXPECTED_EXE
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_read_full_exe_path_rejects_relative(self, mock_run_cmd, collector):
+        mock_run_cmd.return_value = "python3\n"
+        assert collector._read_full_exe_path(42) == ""
+
+
+# ---------------------------------------------------------------------------
+# cmd_line is the args= portion (comm token dropped)
+# ---------------------------------------------------------------------------
+
+class TestProcessIdentityCmdLine:
+    """cmd_line must not start with the 16-char truncated comm token."""
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_cmd_line_from_args_query(self, mock_run_cmd, collector):
+        """cmd_line comes from the dedicated args= call."""
+        mock_run_cmd.side_effect = [
+            _PS_LINE_TRUNCATED_COMM,
+            _EXPECTED_EXE + "\n",
+            _EXPECTED_EXE + " -m dexray\n",
+        ]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.cmd_line == (
+            "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 -m dexray"
+        )
+        assert info.exe_path == _EXPECTED_EXE
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_cmd_line_is_args_portion(self, mock_run_cmd, collector):
+        """When the args= call is empty, the combined line's args portion is used."""
+        mock_run_cmd.side_effect = [_PS_LINE_TRUNCATED_COMM, _EXPECTED_EXE + "\n", ""]
+
+        info = collector.collect_process_identity(10577)
+
+        assert info.cmd_line == (
+            "/Users/danielbaier/.pyenv/versions/dexray-env/bin/python3 -m dexray"
+        )
+        assert info.exe_path == _EXPECTED_EXE
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_spaced_comm_token_preserves_argv0(self, mock_run_cmd, collector):
+        """exec -a "my spaced name" sleep 30: comm contains whitespace, so the
+        combined line cannot be split; args= must supply the full cmd_line."""
+        combined = "  1  0 Tue Oct 20 15:47:25 2026 my spaced name my spaced name 30\n"
+        mock_run_cmd.side_effect = [combined, "", "my spaced name 30\n"]
+
+        info = collector.collect_process_identity(4242)
+
+        assert info.cmd_line == "my spaced name 30"
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_spaced_path_preserves_argv0(self, mock_run_cmd, collector):
+        """A path whose first 16 chars contain a space must not lose argv[0]."""
+        combined = (
+            "  1  0 Tue Oct 20 15:47:25 2026 /Volumes/My Disk "
+            "/Volumes/My Disk/tool --flag\n"
+        )
+        mock_run_cmd.side_effect = [
+            combined, "/Volumes/My Disk/tool\n", "/Volumes/My Disk/tool --flag\n",
+        ]
+
+        info = collector.collect_process_identity(4242)
+
+        assert info.exe_path == "/Volumes/My Disk/tool"
+        assert info.cmd_line == "/Volumes/My Disk/tool --flag"
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_cmd_line_without_args_keeps_comm(self, mock_run_cmd, collector):
+        """A process with no argv beyond comm keeps the single token."""
+        mock_run_cmd.side_effect = ["  1  0 Tue Oct 20 15:47:25 2026 /sbin/launchd\n", "", ""]
+
+        info = collector.collect_process_identity(1)
+
+        assert info.exe_path == "/sbin/launchd"
+        assert info.cmd_line == "/sbin/launchd"
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_no_lstart_fallback_uses_dedicated_queries(self, mock_run_cmd, collector):
+        """When lstart cannot be parsed, exe_path/cmd_line still come from the
+        comm=/args= queries rather than from tokens of the unparsable line."""
+        unparsable = "  1  0 ?????? /usr/bin/foo /usr/bin/foo --x\n"
+        mock_run_cmd.side_effect = [
+            unparsable, "/usr/bin/foo\n", "/usr/bin/foo --x\n",
+        ]
+
+        info = collector.collect_process_identity(7)
+
+        assert info.ppid == 1
+        assert info.start_time_ns == 0
+        assert info.exe_path == "/usr/bin/foo"
+        assert info.cmd_line == "/usr/bin/foo --x"
+
+    @patch.object(DarwinCollector, "_run_cmd")
+    def test_no_lstart_fallback_without_queries_is_best_effort(self, mock_run_cmd, collector):
+        """Last resort: lstart unparsable AND both queries empty.
+
+        Only ppid/sess are reliable here; exe_path/cmd_line are best-effort
+        tokens of the unparsable remainder and are not pinned.
+        """
+        unparsable = "  1  0 ?????? /usr/bin/foo /usr/bin/foo --x\n"
+        mock_run_cmd.side_effect = [unparsable, "", ""]
+
+        info = collector.collect_process_identity(7)
+
+        assert info.ppid == 1
+        assert info.session_id == 0
+        assert info.start_time_ns == 0
+        assert info.cmd_line.endswith("/usr/bin/foo --x")
+
+    def test_strip_comm_token(self, collector):
+        assert collector._strip_comm_token("/Users/danielbai /a/b -x") == "/a/b -x"
+        assert collector._strip_comm_token("/sbin/launchd") == "/sbin/launchd"
+        assert collector._strip_comm_token("") == ""

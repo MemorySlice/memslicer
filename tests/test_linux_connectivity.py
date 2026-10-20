@@ -1,8 +1,11 @@
 """Parser tests for ``linux_connectivity`` (P1.6.5, Block 0x0054)."""
 from __future__ import annotations
 
+import io
 import socket
+import struct
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -17,7 +20,12 @@ from memslicer.acquirer.collectors.frida_remote import FridaRemoteCollector
 from memslicer.acquirer.collectors.ios import IOSCollector
 from memslicer.acquirer.collectors.linux import LinuxCollector
 from memslicer.acquirer.collectors.windows import WindowsCollector
-from memslicer.msl.types import ConnectivityTable
+from memslicer.msl.constants import (
+    BLOCK_HEADER_SIZE, BLOCK_MAGIC, HEADER_SIZE, ArchType, BlockType, OSType,
+)
+from memslicer.msl.types import ConnectivityTable, FileHeader
+from memslicer.msl.writer import MSLWriter
+from memslicer.utils.timestamps import now_ns
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +382,104 @@ def test_android_inherits_linux_connectivity_table(tmp_path):
     assert isinstance(table, ConnectivityTable)
     assert len(table.ipv4_routes) == 1
     assert len(table.arp_entries) == 1
+
+
+# ---------------------------------------------------------------------------
+# GitHub issue #3: Tcp.MaxConn is -1 on every Linux kernel (RFC 2012)
+# ---------------------------------------------------------------------------
+
+
+# Verbatim shape of the Tcp line on a real kernel; the shared fixture above
+# omits ``RtoMax MaxConn`` on purpose (line ~319 pins its row count), so the
+# reproduction gets its own tree.
+SNMP_WITH_MAXCONN = (
+    "Tcp: RtoAlgorithm RtoMin RtoMax MaxConn\n"
+    "Tcp: 1 200 120000 -1\n"
+)
+
+
+def _build_snmp_maxconn_proc_tree(root: Path) -> None:
+    net = root / "net"
+    net.mkdir(parents=True, exist_ok=True)
+    (net / "snmp").write_text(SNMP_WITH_MAXCONN)
+
+
+def _make_header() -> FileHeader:
+    return FileHeader(
+        endianness=1,
+        version=(1, 0),
+        flags=0,
+        cap_bitmap=0,
+        dump_uuid=uuid.uuid4().bytes,
+        timestamp_ns=now_ns(),
+        os_type=OSType.Linux,
+        arch_type=ArchType.x86_64,
+        pid=1,
+    )
+
+
+def _first_block_payload(buf: io.BytesIO) -> tuple[int, bytes]:
+    data = buf.getvalue()
+    magic, btype, _flags, block_len = struct.unpack_from("<4sHHI", data, HEADER_SIZE)
+    assert magic == BLOCK_MAGIC
+    return btype, data[HEADER_SIZE + BLOCK_HEADER_SIZE:HEADER_SIZE + block_len]
+
+
+def _parse_snmp_rows(payload: bytes) -> dict[str, int]:
+    """Return ``{"Mib.Counter": value}`` for every 0x07 row in the payload."""
+    row_count, _ = struct.unpack_from("<II", payload, 0)
+    offset = 8
+    out: dict[str, int] = {}
+    for _ in range(row_count):
+        row_type, row_len = struct.unpack_from("<BH", payload, offset)
+        offset += 3
+        body = payload[offset:offset + row_len]
+        offset += row_len
+        if row_type != 0x07:
+            continue
+        (mib_len,) = struct.unpack_from("<H", body, 0)
+        mib = body[2:2 + mib_len].decode()
+        (ctr_len,) = struct.unpack_from("<H", body, 2 + mib_len)
+        ctr_off = 4 + mib_len
+        counter = body[ctr_off:ctr_off + ctr_len].decode()
+        (value,) = struct.unpack_from("<Q", body, ctr_off + ctr_len)
+        out[f"{mib}.{counter}"] = value
+    return out
+
+
+class TestSnmpMaxConnIssue3:
+    def test_parser_keeps_maxconn_signed(self, tmp_path):
+        p = tmp_path / "snmp"
+        _write(p, SNMP_WITH_MAXCONN)
+        rows = lc.parse_snmp_counters(str(p))
+        by_name = {r.counter: r.value for r in rows if r.mib == "Tcp"}
+        assert by_name["MaxConn"] == -1
+        assert by_name["RtoMax"] == 120000
+
+    def test_collector_keeps_maxconn_signed(self, tmp_path):
+        _build_snmp_maxconn_proc_tree(tmp_path)
+        table = LinuxCollector(proc_root=str(tmp_path)).collect_connectivity_table()
+        by_name = {r.counter: r.value for r in table.snmp_counters}
+        assert by_name["MaxConn"] == -1
+        assert len(table.snmp_counters) == 4
+
+    def test_collect_then_write_connectivity_table_end_to_end(self, tmp_path):
+        """Literal reproduction of issue #3: collect from a /proc tree whose
+        Tcp line carries MaxConn=-1 and write the block. This used to raise
+        ``struct.error: 'Q' format requires 0 <= number <= 18446744073709551615``.
+        """
+        _build_snmp_maxconn_proc_tree(tmp_path)
+        table = LinuxCollector(proc_root=str(tmp_path)).collect_connectivity_table()
+
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, _make_header())
+        writer.write_connectivity_table(table)
+        writer.finalize()
+
+        btype, payload = _first_block_payload(buf)
+        assert btype == BlockType.ConnectivityTable
+        row_count, _ = struct.unpack_from("<II", payload, 0)
+        assert row_count == 4
+        values = _parse_snmp_rows(payload)
+        assert values["Tcp.MaxConn"] == 2**64 - 1
+        assert values["Tcp.RtoMax"] == 120000

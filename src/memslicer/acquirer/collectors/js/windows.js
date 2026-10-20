@@ -3,7 +3,8 @@
  * Registry via advapi32!RegGetValueW, kernel version via ntdll!RtlGetVersion,
  * hostname via kernel32!GetComputerNameExW, memory via
  * kernel32!GlobalMemoryStatusEx. All W-suffix APIs use UTF-16 with the W()
- * helper from common.js.
+ * helper from common.js. Symbols are resolved with getModuleExport (module
+ * instance lookup, identical on Frida 16 and 17).
  *
  * iphlpapi.dll is not always loaded (console apps, services) — resolve
  * GetAdaptersAddresses via maybeLoadModule and skip MACs on failure.
@@ -17,26 +18,26 @@ function ensureWindowsFuncs() {
     if (_regGetValueW !== null) return;
     try {
         _regGetValueW = new NativeFunction(
-            Module.getExportByName('advapi32.dll', 'RegGetValueW'),
+            getModuleExport('advapi32.dll', 'RegGetValueW'),
             'uint32',
             ['pointer', 'pointer', 'pointer', 'uint32', 'pointer', 'pointer', 'pointer']);
     } catch(e) { _regGetValueW = false; }
 
     try {
         _getComputerNameExW = new NativeFunction(
-            Module.getExportByName('kernel32.dll', 'GetComputerNameExW'),
+            getModuleExport('kernel32.dll', 'GetComputerNameExW'),
             'int', ['uint32', 'pointer', 'pointer']);
     } catch(e) { _getComputerNameExW = false; }
 
     try {
         _globalMemoryStatusEx = new NativeFunction(
-            Module.getExportByName('kernel32.dll', 'GlobalMemoryStatusEx'),
+            getModuleExport('kernel32.dll', 'GlobalMemoryStatusEx'),
             'int', ['pointer']);
     } catch(e) { _globalMemoryStatusEx = false; }
 
     try {
         _rtlGetVersion = new NativeFunction(
-            Module.getExportByName('ntdll.dll', 'RtlGetVersion'),
+            getModuleExport('ntdll.dll', 'RtlGetVersion'),
             'uint32', ['pointer']);
     } catch(e) { _rtlGetVersion = false; }
 }

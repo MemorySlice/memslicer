@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import bisect
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from memslicer.acquirer.attach_preflight import (
     PreflightResult, enforce_attach_preflight,
@@ -14,6 +14,9 @@ from memslicer.acquirer.bridge import (
 )
 from memslicer.acquirer.errors import AttachError
 from memslicer.acquirer.platform_detect import detect_platform, parse_maps_text
+
+if TYPE_CHECKING:
+    from memslicer.acquirer.investigation import InvestigationCollector
 
 
 # Frida JS script for RPC exports
@@ -40,8 +43,10 @@ rpc.exports = {
         try {
             // /proc/*/maps is a seq_file: a single read() can short-return,
             // so loop until exhausted.
+            // GumJS File has readText/readBytes/readLine, never read().
             var f = new File('/proc/self/maps', 'r'), out = '', chunk;
-            while ((chunk = f.read(65536)) && chunk.length > 0) out += chunk;
+            if (typeof f.readText !== 'function') { f.close(); return ''; }
+            while ((chunk = f.readText(65536)) !== '') out += chunk;
             f.close();
             return out;
         } catch (e) {
@@ -210,6 +215,42 @@ class FridaBridge:
         if self._platform_info is None:
             raise RuntimeError("FridaBridge.connect() must be called first")
         return self._platform_info
+
+    def create_remote_collector(
+        self, logger: logging.Logger | None = None,
+    ) -> InvestigationCollector | None:
+        """Load the investigation agent on a remote target and return it.
+
+        Implements :class:`~memslicer.acquirer.bridge.RemoteCollectorCapable`.
+        The investigation script lives in the attached session, so its
+        lifetime is the session's: :meth:`disconnect` detaches it along with
+        the bridge script.
+
+        Args:
+            logger: Logger for the collector; defaults to the bridge's own.
+
+        Returns:
+            A connected ``FridaRemoteCollector``, or ``None`` when the target
+            is local, :meth:`connect` has not run, or the agent failed to load
+            (logged as a warning so the capture can fall back to an empty
+            collector instead of aborting).
+        """
+        if not self.is_remote or self._session is None:
+            return None
+        from memslicer.acquirer.collectors.frida_remote import (
+            FridaRemoteCollector,
+        )
+
+        collector = FridaRemoteCollector(self._session, logger=logger or self._log)
+        try:
+            collector.connect()
+        except Exception as exc:  # noqa: BLE001 - frida raises its own hierarchy
+            self._log.warning(
+                "Investigation script could not be loaded on the target: %s", exc,
+            )
+            return None
+        self._log.info("Investigation collector attached to remote target")
+        return collector
 
     def _fetch_target_map_spans(self) -> list[tuple[int, int, str]]:
         """Return sorted ``(start, end, name)`` spans from the target's maps.

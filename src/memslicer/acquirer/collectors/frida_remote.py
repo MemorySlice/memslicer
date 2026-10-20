@@ -54,6 +54,27 @@ def _load_investigation_script() -> str:
 INVESTIGATION_SCRIPT = _load_investigation_script()
 
 
+def _to_int(value: Any) -> int:
+    """Coerce an RPC integer field to ``int``.
+
+    Epoch-nanosecond values exceed 2^53, so the agent sends them as decimal
+    strings when its engine has BigInt and as (rounded) Numbers otherwise.
+    Anything else (None, bool, text) becomes 0.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else 0
+    if isinstance(value, str):
+        text = value.strip()
+        digits = text[1:] if text.startswith("-") else text
+        if digits.isdigit():
+            return int(text)
+    return 0
+
+
 class FridaRemoteCollector:
     """Investigation collector using Frida RPC for remote targets.
 
@@ -71,6 +92,10 @@ class FridaRemoteCollector:
         self._session = session
         self._log = logger or logging.getLogger("memslicer")
         self._api: Any | None = None
+        # The script runs inside the agent injected by the target's
+        # frida-server, so the runtime that answers is the server's, not
+        # the host's. Logged once, from the first RPC envelope, for provenance.
+        self._agent_version_logged = False
 
     def connect(self) -> None:
         """Load the investigation script and obtain RPC exports."""
@@ -99,9 +124,17 @@ class FridaRemoteCollector:
             and "data" in response
             and "warnings" in response
         ):
+            self._log_agent_version(response.get("agent"))
             warnings = response.get("warnings") or []
             return response["data"], list(warnings)
         return response, []
+
+    def _log_agent_version(self, version: Any) -> None:
+        """Record which Frida runtime served the investigation RPCs (once)."""
+        if self._agent_version_logged or not version:
+            return
+        self._agent_version_logged = True
+        self._log.info("Investigation agent runtime: Frida %s on target", version)
 
     def collect_process_identity(
         self,
@@ -136,7 +169,7 @@ class FridaRemoteCollector:
         return TargetProcessInfo(
             ppid=data.get("ppid", 0),
             session_id=data.get("sessionId", 0),
-            start_time_ns=data.get("startTimeNs", 0),
+            start_time_ns=_to_int(data.get("startTimeNs", 0)),
             exe_path=data.get("exePath", ""),
             cmd_line=data.get("cmdLine", ""),
             process_name=data.get("processName", ""),
@@ -159,7 +192,7 @@ class FridaRemoteCollector:
             return TargetSystemInfo()
 
         info = TargetSystemInfo(
-            boot_time=data.get("bootTime", 0),
+            boot_time=_to_int(data.get("bootTime", 0)),
             hostname=data.get("hostname", ""),
             domain=data.get("domain", ""),
             os_detail=data.get("osDetail", ""),

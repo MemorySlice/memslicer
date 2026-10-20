@@ -395,6 +395,11 @@ def _parse_mib_file(
                     value = int(value_str)
                 except ValueError:
                     continue
+                # Negative values are kept signed here on purpose:
+                # Tcp.MaxConn is -1 ("no fixed limit", RFC 2012) on every
+                # Linux kernel, and the sysctx JSON should show what the
+                # kernel said. The writer encodes them two's-complement
+                # for the unsigned Value(8) wire field via _u64_wire.
                 rows.append(SnmpCounterRow(
                     mib=mib,
                     counter=name,

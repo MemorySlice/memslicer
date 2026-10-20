@@ -10,6 +10,7 @@ doesn't land.
 from __future__ import annotations
 
 import io
+import logging
 import struct
 import sys
 import uuid
@@ -1039,3 +1040,131 @@ class TestPersistenceManifestBlock:
         assert parsed[0][2] == big_mtime
         assert parsed[0][3] == 256
         assert parsed[0][4] == 0o100755
+
+
+# ---------------------------------------------------------------------------
+# Sign handling and per-row drop guard (GitHub issue #3)
+# ---------------------------------------------------------------------------
+
+
+def _snmp_value(body: bytes) -> tuple[str, str, int]:
+    mib, off = _read_str_field(body, 0)
+    counter, off = _read_str_field(body, off)
+    (value,) = struct.unpack_from("<Q", body, off)
+    return mib, counter, value
+
+
+class TestConnectivityTableSignGuard:
+    """``/proc/net/snmp`` reports ``Tcp.MaxConn`` as -1 on every Linux
+    kernel (RFC 2012). The writer used to pack it ``<Q`` unguarded and
+    abort every ``-I`` capture with ``'Q' format requires 0 <= number``.
+    """
+
+    def test_snmp_maxconn_minus_one_roundtrips_twos_complement(self, header):
+        row = SnmpCounterRow(mib="Tcp", counter="MaxConn", value=-1)
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        writer.write_connectivity_table(ConnectivityTable(snmp_counters=[row]))
+        writer.finalize()
+        _, payload = _last_block_bytes(buf)
+        row_count, _ = struct.unpack_from("<II", payload, 0)
+        assert row_count == 1
+        parsed = _parse_conntable_rows(payload)
+        rtype, body = parsed[0]
+        assert rtype == 0x07
+        assert _snmp_value(body) == ("Tcp", "MaxConn", 2**64 - 1)
+
+    def test_snmp_negative_value_is_not_logged_as_dropped(self, header, caplog):
+        row = SnmpCounterRow(mib="Tcp", counter="MaxConn", value=-1)
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_connectivity_table(
+                ConnectivityTable(snmp_counters=[row]),
+            )
+        assert "dropping row" not in caplog.text
+
+    def test_snmp_positive_value_unchanged_by_wire_mapping(self, header):
+        row = SnmpCounterRow(mib="Tcp", counter="ActiveOpens", value=12345)
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        writer.write_connectivity_table(ConnectivityTable(snmp_counters=[row]))
+        writer.finalize()
+        _, payload = _last_block_bytes(buf)
+        _, body = _parse_conntable_rows(payload)[0]
+        assert _snmp_value(body) == ("Tcp", "ActiveOpens", 12345)
+
+    def test_unrepresentable_netdev_row_is_dropped_and_logged(self, header, caplog):
+        bad = NetdevStatsRow(iface="eth0", rx_bytes=-1)
+        good = NetdevStatsRow(iface="lo", rx_bytes=7)
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_connectivity_table(
+                ConnectivityTable(netdev_stats=[bad, good]),
+            )
+        writer.finalize()
+        _, payload = _last_block_bytes(buf)
+        row_count, _ = struct.unpack_from("<II", payload, 0)
+        assert row_count == 1
+        parsed = _parse_conntable_rows(payload)
+        assert len(parsed) == 1
+        iface, _ = _read_str_field(parsed[0][1], 0)
+        assert iface == "lo"
+        assert "dropping row" in caplog.text
+        assert "netdev eth0" in caplog.text
+
+    def test_row_count_reflects_drops_across_row_kinds(self, header, caplog):
+        table = ConnectivityTable(
+            ipv4_routes=[IPv4RouteRow(iface="lo", metric=-1)],      # dropped
+            packet_sockets=[PacketSocketRow(pid=1)],                 # kept
+            sockstat_families=[SockstatFamilyRow(family=0x02, mem=-5)],  # dropped
+            snmp_counters=[SnmpCounterRow(mib="Tcp", counter="MaxConn", value=-1)],  # kept
+        )
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_connectivity_table(table)
+        writer.finalize()
+        _, payload = _last_block_bytes(buf)
+        row_count, _ = struct.unpack_from("<II", payload, 0)
+        assert row_count == 2
+        types = [r[0] for r in _parse_conntable_rows(payload)]
+        assert types == [0x04, 0x07]
+        assert caplog.text.count("dropping row") == 2
+
+
+class TestKernelModuleListDropGuard:
+    def test_unrepresentable_row_is_dropped_and_count_matches(self, header, caplog):
+        rows = [
+            KernelModuleRow(name="good", size=10),
+            KernelModuleRow(name="bad", size=-1),
+        ]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_kernel_module_list(KernelModuleList(rows=rows))
+        writer.finalize()
+        _, payload = _last_block_bytes(buf)
+        row_count, _ = struct.unpack_from("<II", payload, 0)
+        assert row_count == 1
+        parsed = _parse_kernel_module_list(payload)
+        assert [r["name"] for r in parsed] == ["good"]
+        assert "KernelModuleList: dropping row module bad" in caplog.text
+
+
+class TestPersistenceManifestDropGuard:
+    def test_unrepresentable_row_is_dropped_and_count_matches(self, header, caplog):
+        rows = [
+            PersistenceRow(source=1, path="/etc/crontab", mtime_ns=1, size=2, mode=0o644),
+            PersistenceRow(source=1, path="/etc/bad", mtime_ns=-1, size=2, mode=0o644),
+        ]
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            writer.write_persistence_manifest(PersistenceManifest(rows=rows))
+        writer.finalize()
+        _, payload = _last_block_bytes(buf)
+        row_count, _ = struct.unpack_from("<II", payload, 0)
+        assert row_count == 1
+        assert "PersistenceManifest: dropping row path /etc/bad" in caplog.text

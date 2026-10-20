@@ -1,43 +1,54 @@
 /* android.js - Android enrichment via SystemProperties JNI (SELinux-safe).
  * Runtime.exec('getprop') is blocked for untrusted_app, so we call
- * android.os.SystemProperties.get() directly via Java.performNow.
- * Falls back to libc!__system_property_get when Java.available is false.
+ * android.os.SystemProperties.get() through the Java bridge when the agent
+ * bundles one (Frida 16, javaAvailable()). Otherwise (Frida 17 agents ship
+ * no Java bridge, or a native process) we fall back to
+ * libc!__system_property_get resolved through the common.js shims.
  */
 var _systemPropertyGet = null;
 function ensureSystemPropertyGet() {
     if (_systemPropertyGet !== null) return;
     try {
-        _systemPropertyGet = new NativeFunction(
-            Module.getExportByName('libc.so', '__system_property_get'),
-            'int', ['pointer', 'pointer']);
+        var sym = findGlobalExport('__system_property_get');
+        if (!sym) sym = getModuleExport('libc.so', '__system_property_get');
+        _systemPropertyGet = new NativeFunction(sym, 'int', ['pointer', 'pointer']);
     } catch(e) {
         _systemPropertyGet = false;  /* sentinel: unavailable */
     }
 }
 
-function androidGetProp(key) {
-    /* Preferred: Java SystemProperties. */
-    if (Java.available) {
-        try {
-            var value = '';
-            Java.performNow(function() {
-                var SP = Java.use('android.os.SystemProperties');
-                value = SP.get(key, '');
-            });
-            if (value) return value;
-        } catch(e) {}
-    }
-    /* Fallback: libc __system_property_get (PROP_VALUE_MAX = 92). */
+function androidGetPropJava(key) {
+    var value = '';
+    Java.performNow(function() {
+        var SP = Java.use('android.os.SystemProperties');
+        value = SP.get(key, '');
+    });
+    return value ? String(value) : '';
+}
+
+function androidGetPropNative(key) {
     ensureSystemPropertyGet();
-    if (_systemPropertyGet) {
-        try {
-            var keyBuf = Memory.allocUtf8String(key);
-            var valBuf = Memory.alloc(128);
-            var len = _systemPropertyGet(keyBuf, valBuf);
-            if (len > 0) return valBuf.readUtf8String(len);
-        } catch(e) {}
-    }
+    if (!_systemPropertyGet) return '';
+    try {
+        /* PROP_VALUE_MAX = 92 */
+        var keyBuf = Memory.allocUtf8String(key);
+        var valBuf = Memory.alloc(128);
+        var len = _systemPropertyGet(keyBuf, valBuf);
+        if (len > 0) return valBuf.readUtf8String(len);
+    } catch(e) {}
     return '';
+}
+
+function androidGetProp(key) {
+    /* Preferred: Java SystemProperties (only when a Java bridge is bundled). */
+    try {
+        if (javaAvailable()) {
+            var value = androidGetPropJava(key);
+            if (value) return value;
+        }
+    } catch(e) {}
+    /* Fallback: libc __system_property_get. */
+    return androidGetPropNative(key);
 }
 
 function androidGetSystemInfo(result, warnings) {
@@ -54,6 +65,8 @@ function androidGetSystemInfo(result, warnings) {
         var btype   = androidGetProp('ro.build.type');
         var ctype   = androidGetProp('ro.crypto.type');
         var qemu    = androidGetProp('ro.kernel.qemu');
+
+        if (!release && !fp) warnings.push('android_getprop:no properties readable');
 
         /* Populate fields the Python side projects into TargetSystemInfo. */
         result.fingerprint      = fp;

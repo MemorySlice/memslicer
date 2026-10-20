@@ -22,9 +22,13 @@ def create_collector(
 
     Args:
         os_type: Target OS type (from platform detection).
-        is_remote: True when target is a remote device (e.g., Frida USB/ADB).
-                   For remote targets, a FridaRemoteCollector should be used
-                   instead — see CLI wiring for dispatch logic.
+        is_remote: Forwarded to ``AndroidCollector`` only (it tunes its
+                   ``/proc`` reads); every other collector ignores it.
+                   This factory always returns a *host* collector. Remote
+                   targets are not selected here: the engine asks the
+                   bridge's ``create_remote_collector`` after attach
+                   (``FridaRemoteCollector`` runs on the device) and falls
+                   back to ``NullCollector`` when the bridge has none.
         logger: Optional logger instance.
 
     Returns:

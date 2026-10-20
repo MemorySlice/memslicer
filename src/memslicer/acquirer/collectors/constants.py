@@ -18,3 +18,8 @@ HT_PIPE = 0x04
 HT_DEVICE = 0x05
 HT_REGISTRY = 0x06
 HT_OTHER = 0xFF
+
+# HandleTable FD when the entry has no descriptor number: lsof cwd/rtd/txt/mem.
+# The format stores FD as uint32, so the sentinel is the all-ones value, not -1
+# (which the writer cannot pack and would otherwise drop the row for).
+FD_NONE = 0xFFFFFFFF

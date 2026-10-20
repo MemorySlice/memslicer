@@ -1,7 +1,14 @@
 """Tests for CLI interface."""
-from unittest.mock import patch, MagicMock
+import logging
+import struct
+from pathlib import Path as _Path
+from unittest.mock import patch, MagicMock, ANY
+
+import pytest
 from click.testing import CliRunner
-from memslicer.cli import cli
+from memslicer.cli import cli, _create_acquirer
+from memslicer.acquirer.region_filter import RegionFilter as _RegionFilter
+from memslicer.msl.constants import CompAlgo as _CompAlgo, OSType as _OSType
 from memslicer.acquirer.base import AcquireResult, UnreadableRange
 from memslicer.acquirer.errors import (
     EXIT_PREFLIGHT_REFUSED, AttachError, AttachPreflightError,
@@ -823,3 +830,345 @@ class TestAcquisitionModeFlags:
         result, _ = self._invoke(["123", "-E", "--passphrase", "   "])
         assert result.exit_code == 2
         assert "must not be empty" in result.output
+
+
+# ---------- Investigation collector selection (issue #3) ----------
+
+
+def _build_engine(*, usb=False, remote_addr=None, investigation=True, os_override=None):
+    """Call the real factory with a frida backend and a mocked device."""
+    return _create_acquirer(
+        backend="frida",
+        target=1234,
+        comp_algo=_CompAlgo.NONE,
+        region_filter=_RegionFilter(),
+        os_override=os_override,
+        logger=logging.getLogger("memslicer.test_cli"),
+        read_timeout=1.0,
+        usb=usb,
+        remote_addr=remote_addr,
+        investigation=investigation,
+    )
+
+
+@patch("memslicer.acquirer.collectors.create_collector")
+@patch("memslicer.cli._get_frida_device")
+def test_remote_usb_investigation_defers_collector_to_engine(mock_device, mock_factory):
+    """-I -U leaves the collector to the engine; no host collector is built."""
+    mock_device.return_value = MagicMock(type="usb")
+
+    engine = _build_engine(usb=True, investigation=True)
+
+    assert engine._collector is None
+    mock_factory.assert_not_called()
+
+
+@patch("memslicer.acquirer.collectors.create_collector")
+@patch("memslicer.cli._get_frida_device")
+def test_remote_addr_investigation_defers_collector_to_engine(mock_device, mock_factory):
+    """-I -R behaves like -U: collector chosen after attach."""
+    mock_device.return_value = MagicMock(type="remote")
+
+    engine = _build_engine(remote_addr="192.168.1.5:27042", investigation=True)
+
+    assert engine._collector is None
+    mock_factory.assert_not_called()
+
+
+@patch("memslicer.acquirer.collectors.create_collector")
+@patch("memslicer.cli._get_frida_device")
+def test_local_investigation_uses_host_collector(mock_device, mock_factory):
+    """Local -I builds a host collector from the host platform, never remote."""
+    mock_device.return_value = MagicMock(type="local")
+    sentinel = MagicMock(name="host_collector")
+    mock_factory.return_value = sentinel
+
+    engine = _build_engine(usb=False, remote_addr=None, investigation=True)
+
+    assert engine._collector is sentinel
+    mock_factory.assert_called_once()
+    assert mock_factory.call_args.kwargs["is_remote"] is False
+
+
+@patch("memslicer.acquirer.collectors.create_collector")
+@patch("memslicer.cli._get_frida_device")
+def test_local_investigation_honours_os_override(mock_device, mock_factory):
+    """--os android on a local target is forwarded to the factory."""
+    mock_device.return_value = MagicMock(type="local")
+
+    _build_engine(investigation=True, os_override=_OSType.Android)
+
+    os_arg = mock_factory.call_args.args[0]
+    assert os_arg == _OSType.Android
+    assert mock_factory.call_args.kwargs["is_remote"] is False
+
+
+@patch("memslicer.acquirer.collectors.create_collector")
+@patch("memslicer.cli._get_frida_device")
+def test_no_investigation_builds_no_collector(mock_device, mock_factory):
+    """Without -I there is nothing to collect, so no collector is built."""
+    mock_device.return_value = MagicMock(type="usb")
+
+    engine = _build_engine(usb=True, investigation=False)
+
+    assert engine._collector is None
+    mock_factory.assert_not_called()
+
+
+# ---------- Traceback diagnostics on failure (Step 7) ----------
+
+
+_STRUCT_ERROR_TEXT = "'Q' format requires 0 <= number <= 18446744073709551615"
+
+
+def _invoke_failing_acquire(mock_factory, args):
+    """Run the CLI with an acquirer that raises the issue #3 struct.error."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.acquire.side_effect = struct.error(_STRUCT_ERROR_TEXT)
+    mock_factory.return_value = mock_acquirer
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli, args)
+        log_text = _Path("test.msl.log").read_text(encoding="utf-8")
+    return result, log_text
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_failure_traceback_lands_in_log_file(mock_factory):
+    """A failed capture writes the traceback to the .msl.log and names it."""
+    result, log_text = _invoke_failing_acquire(mock_factory, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert _STRUCT_ERROR_TEXT in result.output
+    assert "test.msl.log" in result.output
+    assert "Traceback" in log_text
+    assert "Acquisition failed" in log_text
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_failure_traceback_hidden_from_console_without_verbose(mock_factory):
+    """Without -v the console shows only the one-line error."""
+    result, _ = _invoke_failing_acquire(mock_factory, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_failure_traceback_shown_on_console_with_verbose(mock_factory):
+    """With -v the traceback also reaches the console."""
+    result, log_text = _invoke_failing_acquire(mock_factory, ["1234", "-o", "test.msl", "-v"])
+
+    assert result.exit_code == 1
+    assert "Traceback" in result.output
+    assert "Traceback" in log_text
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_console_handlers_detached_after_run(mock_factory):
+    """Each run detaches its console handlers from the shared logger.
+
+    Otherwise a later run in the same process (or test) inherits a DEBUG
+    handler from an earlier ``-v`` run and prints debug output unasked.
+    """
+    mock_factory.return_value = _make_mock_acquirer()
+    shared = logging.getLogger("memslicer")
+    before = list(shared.handlers)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        assert runner.invoke(cli, ["1234", "-o", "test.msl", "-v"]).exit_code == 0
+        mock_factory.return_value.acquire.side_effect = RuntimeError("boom")
+        assert runner.invoke(cli, ["1234", "-o", "test.msl", "-v"]).exit_code == 1
+
+    assert shared.handlers == before
+
+
+# ---------- -D/--device: explicit Frida device selection ----------
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_device_id_passed_to_factory(mock_factory):
+    """-D emu hands device_id="emu" to _create_acquirer."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "-D", "emu"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args.kwargs["device_id"] == "emu"
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_device_id_defaults_to_none(mock_factory):
+    """Without -D the factory receives device_id=None, so -U/-R behave as before."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "-U"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args.kwargs["device_id"] is None
+    assert mock_factory.call_args.kwargs["usb"] is True
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_device_id_with_usb_is_allowed(mock_factory):
+    """-U -D <id> is the issue-#3 invocation plus a selector; both are forwarded."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "-U", "-D", "emulator-5556"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args.kwargs["usb"] is True
+    assert mock_factory.call_args.kwargs["device_id"] == "emulator-5556"
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_device_id_shown_in_banner(mock_factory):
+    """The startup banner names the selected device."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "-D", "emulator-5556"])
+
+    assert result.exit_code == 0
+    assert "Device: emulator-5556 (USB)" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_device_id_rejected_with_remote(mock_factory):
+    """-D and -R name two different transports: UsageError, exit 2."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "-D", "emu", "-R", "host:27042"])
+
+    assert result.exit_code == 2
+    assert "--device" in result.output or "-D" in result.output
+    mock_factory.assert_not_called()
+
+
+def test_device_id_rejected_for_gdb():
+    """--backend gdb -D should fail with UsageError, like -U does."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--backend", "gdb", "-D", "emu"])
+
+    assert result.exit_code == 2
+    assert "--device" in result.output or "-D" in result.output
+
+
+def test_device_id_rejected_for_lldb():
+    """--backend lldb -D should fail with UsageError, like -U does."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--backend", "lldb", "-D", "emu"])
+
+    assert result.exit_code == 2
+    assert "--device" in result.output or "-D" in result.output
+
+
+def _patched_frida():
+    """Patch the lazily imported ``frida`` module seen by _get_frida_device."""
+    return patch.dict("sys.modules", {"frida": MagicMock()})
+
+
+def test_get_frida_device_uses_get_device_for_device_id():
+    """_get_frida_device(False, None, "emu") resolves the id via frida.get_device."""
+    from memslicer.cli import _get_frida_device
+
+    with _patched_frida():
+        import sys
+        fake_frida = sys.modules["frida"]
+        sentinel = MagicMock(name="device")
+        fake_frida.get_device.return_value = sentinel
+
+        device = _get_frida_device(False, None, "emu")
+
+    assert device is sentinel
+    fake_frida.get_device.assert_called_once_with("emu", timeout=ANY)
+    assert fake_frida.get_device.call_args.kwargs["timeout"] > 0
+    fake_frida.get_usb_device.assert_not_called()
+    fake_frida.get_local_device.assert_not_called()
+
+
+def test_get_frida_device_id_wins_over_usb():
+    """-U -D <id>: the explicit id is used, not the first USB device."""
+    from memslicer.cli import _get_frida_device
+
+    with _patched_frida():
+        import sys
+        fake_frida = sys.modules["frida"]
+
+        _get_frida_device(True, None, "emu")
+
+    fake_frida.get_device.assert_called_once()
+    fake_frida.get_usb_device.assert_not_called()
+
+
+def test_get_frida_device_lookup_failure_is_usage_error():
+    """An unknown id becomes a UsageError pointing at frida-ls-devices."""
+    import click
+    from memslicer.cli import _get_frida_device
+
+    with _patched_frida():
+        import sys
+        sys.modules["frida"].get_device.side_effect = RuntimeError("timeout")
+
+        with pytest.raises(click.UsageError) as excinfo:
+            _get_frida_device(False, None, "nope")
+
+    assert "nope" in str(excinfo.value)
+    assert "frida-ls-devices" in str(excinfo.value)
+
+
+def test_get_frida_device_without_device_id_is_unchanged():
+    """No -D: -U still takes the first USB device and no id lookup happens."""
+    from memslicer.cli import _get_frida_device
+
+    with _patched_frida():
+        import sys
+        fake_frida = sys.modules["frida"]
+
+        _get_frida_device(True, None)
+
+    fake_frida.get_usb_device.assert_called_once_with()
+    fake_frida.get_device.assert_not_called()
+
+
+@patch("memslicer.acquirer.collectors.create_collector")
+@patch("memslicer.cli._get_frida_device")
+def test_device_id_investigation_defers_collector_to_engine(mock_device, mock_factory):
+    """-I -D <id> is a remote target: no host collector is built."""
+    mock_device.return_value = MagicMock(type="usb")
+
+    engine = _create_acquirer(
+        backend="frida",
+        target=1234,
+        comp_algo=_CompAlgo.NONE,
+        region_filter=_RegionFilter(),
+        os_override=None,
+        logger=logging.getLogger("memslicer.test_cli"),
+        read_timeout=1.0,
+        usb=False,
+        remote_addr=None,
+        investigation=True,
+        device_id="emulator-5556",
+    )
+
+    assert engine._collector is None
+    mock_factory.assert_not_called()
+    mock_device.assert_called_once_with(False, None, "emulator-5556")
+
+
+@patch("memslicer.cli.validate_attribution")
+@patch("memslicer.cli._create_acquirer")
+def test_device_id_marks_attribution_remote(mock_factory, mock_validate):
+    """-D alone makes the attribution is_remote=True."""
+    mock_factory.return_value = _make_mock_acquirer()
+    mock_validate.return_value = MagicMock(name="attribution")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "-D", "emu"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_validate.call_args.kwargs["is_remote"] is True

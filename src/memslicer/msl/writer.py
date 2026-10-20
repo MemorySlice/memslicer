@@ -5,7 +5,7 @@ import logging
 import struct
 import uuid
 import warnings
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
@@ -26,6 +26,58 @@ from memslicer.utils.padding import pad_bytes, encode_string, encode_string_boun
 from memslicer.utils.timestamps import now_ns
 
 _log = logging.getLogger("memslicer")
+
+_U64_MASK = (1 << 64) - 1
+
+
+def _u64_wire(value: int) -> int:
+    """Map a signed Python int onto the unsigned 64-bit wire field.
+
+    Some counters the kernel exposes are signed by definition even though
+    the format stores them in an unsigned ``Value(8)`` field.  The standing
+    example is ``/proc/net/snmp`` ``Tcp.MaxConn``: RFC 2012 defines
+    ``tcpMaxConn`` as an INTEGER where ``-1`` means "no fixed limit", and
+    every Linux kernel reports exactly that -- so every investigation
+    capture on a Linux host carried a value ``struct.pack("<Q")`` refuses.
+
+    Two's complement keeps the evidence intact: ``-1`` becomes
+    ``0xFFFFFFFFFFFFFFFF`` on the wire and a reader that knows the counter
+    is signed recovers ``-1`` exactly.  Saturating or dropping the row
+    would record something the target never said.
+
+    Args:
+        value: Any Python int, possibly negative.
+
+    Returns:
+        ``value`` reduced modulo 2**64, always packable as ``<Q``.
+    """
+    return value & _U64_MASK
+
+
+def _packed_or_none(
+    table: str, label: str, pack: Callable[[], bytes],
+) -> bytes | None:
+    """Run a row packer, turning an unrepresentable value into a logged drop.
+
+    One row carrying a value outside its field's range must not cost the
+    whole capture: raising here loses the memory the examiner actually
+    came for, dropping the row loses one line of a system table.  The
+    drop is logged so the examiner can see in the ``.msl.log`` that the
+    recorded table is shorter than what the target held.
+
+    Args:
+        table: Table name as the spec calls it, for the log line.
+        label: Short identification of the row (pid, iface, counter ...).
+        pack: Zero-argument callable producing the packed row.
+
+    Returns:
+        The packed row, or ``None`` when ``struct`` rejected a value.
+    """
+    try:
+        return pack()
+    except struct.error as exc:
+        _log.warning("%s: dropping row %s (%s)", table, label, exc)
+        return None
 
 
 def _bounded_or_absent(value: str) -> tuple[bytes, int]:
@@ -580,24 +632,35 @@ class MSLWriter:
 
     def write_connection_table(self, connections: list[ConnectionEntry], parent_uuid: bytes) -> bytes:
         """Write ConnectionTable block. ParentUUID must reference SystemContext."""
-        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 22
-        payload = struct.pack("<II", len(connections), 0)
+        # Entries are packed first so EntryCount describes what actually made
+        # it in (same rule as write_process_table): a row the format cannot
+        # represent is dropped and logged, never promised by the count.
+        entries: list[bytes] = []
         for conn in connections:
-            entry = struct.pack(
-                "<IBBB1s 16s H2s 16s H2s",
-                conn.pid,
-                conn.family,
-                conn.protocol,
-                conn.state,
-                b"\x00",               # Reserved
-                conn.local_addr,
-                conn.local_port,
-                b"\x00" * 2,           # Reserved2
-                conn.remote_addr,
-                conn.remote_port,
-                b"\x00" * 2,           # Reserved3
+            entry = _packed_or_none(
+                "ConnectionTable",
+                f"pid {conn.pid} local_port {conn.local_port}",
+                lambda: struct.pack(
+                    "<IBBB1s 16s H2s 16s H2s",
+                    conn.pid,
+                    conn.family,
+                    conn.protocol,
+                    conn.state,
+                    b"\x00",               # Reserved
+                    conn.local_addr,
+                    conn.local_port,
+                    b"\x00" * 2,           # Reserved2
+                    conn.remote_addr,
+                    conn.remote_port,
+                    b"\x00" * 2,           # Reserved3
+                ),
             )
-            payload += entry
+            if entry is None:
+                continue
+            entries.append(entry)
+
+        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 22
+        payload = struct.pack("<II", len(entries), 0) + b"".join(entries)
 
         return self._write_block(
             BlockType.ConnectionTable, payload, parent_uuid=parent_uuid,
@@ -608,23 +671,39 @@ class MSLWriter:
     # ------------------------------------------------------------------
 
     def write_handle_table(self, handles: list[HandleEntry], parent_uuid: bytes) -> bytes:
-        """Write HandleTable block. ParentUUID must reference SystemContext."""
-        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 23
-        payload = struct.pack("<II", len(handles), 0)
+        """Write HandleTable block. ParentUUID must reference SystemContext.
+
+        ``FD`` is a uint32; a collector that has no descriptor number for a
+        row (lsof ``cwd``/``txt``/``mem`` on macOS) must hand over
+        ``0xFFFFFFFF``, not ``-1``.  A negative fd is unrepresentable and
+        the row is dropped and logged rather than aborting the capture.
+        """
+        # Entries are packed first so EntryCount describes what actually made
+        # it in (same rule as write_process_table).
+        entries: list[bytes] = []
         for h in handles:
             path_raw = h.path.encode("utf-8") + b"\x00" if h.path else b""
-            entry = struct.pack(
-                "<IIB1sH4s",
-                h.pid,
-                h.fd,
-                h.handle_type,
-                b"\x00",               # Reserved
-                len(path_raw),
-                b"\x00" * 4,           # Reserved2
+            entry = _packed_or_none(
+                "HandleTable",
+                f"pid {h.pid} fd {h.fd}",
+                lambda: struct.pack(
+                    "<IIB1sH4s",
+                    h.pid,
+                    h.fd,
+                    h.handle_type,
+                    b"\x00",               # Reserved
+                    len(path_raw),
+                    b"\x00" * 4,           # Reserved2
+                ),
             )
+            if entry is None:
+                continue
             if path_raw:
                 entry += pad_bytes(path_raw)
-            payload += entry
+            entries.append(entry)
+
+        # Preamble: EntryCount(4B) + Reserved(4B) per spec Table 23
+        payload = struct.pack("<II", len(entries), 0) + b"".join(entries)
 
         return self._write_block(
             BlockType.HandleTable, payload, parent_uuid=parent_uuid,
@@ -818,6 +897,17 @@ class MSLWriter:
 
         Row bodies pack tight; no internal padding. Unknown row_types
         are skippable via ``row_len``.
+
+        Row 0x07 (SNMP counter) stores ``Value`` as an unsigned 8-byte
+        field, but the kernel reports some MIB entries signed --
+        ``Tcp.MaxConn`` is ``-1`` ("no fixed limit", RFC 2012) on every
+        Linux kernel.  Such values are written two's-complement
+        (``-1`` -> ``0xFFFFFFFFFFFFFFFF``) via :func:`_u64_wire`, so the
+        evidence survives verbatim and a reader aware of the counter's
+        signedness recovers it exactly.
+
+        Any other row whose value the format cannot hold is dropped and
+        logged; ``row_count`` is computed from the rows actually packed.
         """
         rows: list[bytes] = []
 
@@ -825,71 +915,71 @@ class MSLWriter:
             encoded = s.encode("utf-8")
             return struct.pack("<H", len(encoded)) + encoded
 
+        def _append_row(row_type: int, label: str, build_body: Callable[[], bytes]) -> None:
+            # One bad row must not cost the whole capture (see _packed_or_none).
+            body = _packed_or_none("ConnectivityTable", label, build_body)
+            if body is None:
+                return
+            rows.append(struct.pack("<BH", row_type, len(body)) + body)
+
         for r in table.ipv4_routes:
-            body = (
+            _append_row(0x01, f"ipv4_route {r.iface}", lambda: (
                 _str_field(r.iface)
                 + r.dest + r.gateway + r.mask
                 + struct.pack("<HII", r.flags, r.metric, r.mtu)
-            )
-            rows.append(struct.pack("<BH", 0x01, len(body)) + body)
+            ))
 
         for r in table.ipv6_routes:
-            body = (
+            _append_row(0x02, f"ipv6_route {r.iface}", lambda: (
                 _str_field(r.iface)
                 + r.dest
                 + struct.pack("<B", r.dest_prefix)
                 + r.next_hop
                 + struct.pack("<II", r.metric, r.flags)
-            )
-            rows.append(struct.pack("<BH", 0x02, len(body)) + body)
+            ))
 
         for r in table.arp_entries:
-            body = (
+            _append_row(0x03, f"arp {r.iface}", lambda: (
                 struct.pack("<B", r.family)
                 + r.ip
                 + struct.pack("<HH", r.hw_type, r.flags)
                 + r.hw_addr
                 + _str_field(r.iface)
-            )
-            rows.append(struct.pack("<BH", 0x03, len(body)) + body)
+            ))
 
         for r in table.packet_sockets:
-            body = struct.pack(
+            _append_row(0x04, f"packet socket inode {r.inode}", lambda: struct.pack(
                 "<IQHIIQ",
                 r.pid, r.inode, r.proto, r.iface_index, r.user, r.rmem,
-            )
-            rows.append(struct.pack("<BH", 0x04, len(body)) + body)
+            ))
 
         for r in table.netdev_stats:
-            body = (
+            _append_row(0x05, f"netdev {r.iface}", lambda: (
                 _str_field(r.iface)
                 + struct.pack(
                     "<QQQQQQQQ",
                     r.rx_bytes, r.rx_packets, r.rx_errs, r.rx_drop,
                     r.tx_bytes, r.tx_packets, r.tx_errs, r.tx_drop,
                 )
-            )
-            rows.append(struct.pack("<BH", 0x05, len(body)) + body)
+            ))
 
         for r in table.sockstat_families:
-            body = struct.pack("<BIIQ", r.family, r.in_use, r.alloc, r.mem)
-            rows.append(struct.pack("<BH", 0x06, len(body)) + body)
+            _append_row(0x06, f"sockstat family {r.family}", lambda: struct.pack(
+                "<BIIQ", r.family, r.in_use, r.alloc, r.mem,
+            ))
 
         for r in table.snmp_counters:
-            body = (
+            # Signed MIB values (Tcp.MaxConn = -1) go on the wire as
+            # two's complement; see the docstring and _u64_wire.
+            _append_row(0x07, f"snmp {r.mib}.{r.counter}", lambda: (
                 _str_field(r.mib)
                 + _str_field(r.counter)
-                + struct.pack("<Q", r.value)
-            )
-            rows.append(struct.pack("<BH", 0x07, len(body)) + body)
+                + struct.pack("<Q", _u64_wire(r.value))
+            ))
 
-        total_rows = (
-            len(table.ipv4_routes) + len(table.ipv6_routes)
-            + len(table.arp_entries) + len(table.packet_sockets)
-            + len(table.netdev_stats) + len(table.sockstat_families)
-            + len(table.snmp_counters)
-        )
-        payload = struct.pack("<II", total_rows, 0) + b"".join(rows)
+        # Count what was actually packed, not what was offered: a dropped
+        # row must not be promised by the preamble.
+        payload = struct.pack("<II", len(rows), 0) + b"".join(rows)
         return self._write_block(BlockType.ConnectivityTable, payload)
 
     # ------------------------------------------------------------------
@@ -901,7 +991,7 @@ class MSLWriter:
         rows_bytes: list[bytes] = []
         for r in table.rows:
             name_bytes = r.name.encode("utf-8")
-            row = (
+            row = _packed_or_none("KernelModuleList", f"module {r.name}", lambda: (
                 struct.pack("<H", len(name_bytes))
                 + name_bytes
                 + struct.pack(
@@ -909,9 +999,12 @@ class MSLWriter:
                     r.size, r.refcount, r.state, r.taint,
                     r.base, r.flags, 0,
                 )
-            )
+            ))
+            if row is None:
+                continue
             rows_bytes.append(row)
-        payload = struct.pack("<II", len(table.rows), 0) + b"".join(rows_bytes)
+        # Count the rows actually packed, so a dropped row is never promised.
+        payload = struct.pack("<II", len(rows_bytes), 0) + b"".join(rows_bytes)
         return self._write_block(BlockType.KernelModuleList, payload)
 
     # ------------------------------------------------------------------
@@ -1088,14 +1181,17 @@ class MSLWriter:
         rows_bytes: list[bytes] = []
         for r in manifest.rows:
             path_bytes = r.path.encode("utf-8")
-            row = (
+            row = _packed_or_none("PersistenceManifest", f"path {r.path}", lambda: (
                 struct.pack("<BBH", r.source, 0, len(path_bytes))
                 + path_bytes
                 + struct.pack("<QQI", r.mtime_ns, r.size, r.mode)
-            )
+            ))
+            if row is None:
+                continue
             rows_bytes.append(row)
+        # Count the rows actually packed, so a dropped row is never promised.
         payload = (
-            struct.pack("<II", len(manifest.rows), 0)
+            struct.pack("<II", len(rows_bytes), 0)
             + b"".join(rows_bytes)
         )
         return self._write_block(BlockType.PersistenceManifest, payload)
