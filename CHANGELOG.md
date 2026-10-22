@@ -13,6 +13,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Every capture now ends with a VAS Map block (0x1001) before EndOfCapture:
+  one entry per enumerated range (captured, filter-skipped, or not reached
+  after an abort), sorted by base, carrying protection, the region type its
+  MemoryRegion block would have and the full mapping name. Readers such as
+  MemDiver can classify Android regions (zygote space, boot image, scudo,
+  stack_and_tls, ...) by name. The payload is byte-identical to MemDiver's
+  `add_vas_map` encoding; names containing NUL or longer than 65534 bytes are
+  stored empty. New `MSLWriter.write_vas_map`, `parse_vas_map` and
+  `VasEntry`.
+- `tests/tools/make_android_fixture.py` generates a small Android `.msl`
+  fixture, and `tests/data/region_name_vectors.json` holds the region-name
+  vectors shared with MemDiver.
+
 - `-D/--device <id>` selects a specific Frida device when several are
   attached (ids as printed by `frida-ls-devices`); `-U` keeps taking the
   first USB device. `-D` is a Frida-only option and cannot be combined

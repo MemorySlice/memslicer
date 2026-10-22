@@ -391,6 +391,10 @@ MemSlicer writes memory snapshots to the MSL (Memory Slice) binary format. Each 
 - Process identity block (ppid, session ID, start time, executable path, command line)
 - Module list with base addresses, sizes, and paths
 - Per-region records with base address, size, protection flags, and page-level data
+- A VAS Map block (0x1001) listing every enumerated mapping -- captured, filter-skipped or
+  left unread by an abort -- sorted by base address, with protection, region type and the
+  full mapping name (e.g. `[anon:dalvik-main space (region space)]`, `[anon:scudo:primary]`).
+  A VAS entry without a matching region record is a range whose bytes were not stored.
 - BLAKE3 integrity chain across all blocks
 - Optional compressed data blocks (zstd or lz4)
 - Optional AEAD encryption (AES-256-GCM + Argon2id)
@@ -510,6 +514,13 @@ With coverage:
 ```bash
 pytest --cov=memslicer --cov-report=term-missing
 ```
+
+`tests/tools/make_android_fixture.py [OUTPUT.msl]` writes a small Android-style `.msl`
+(Dalvik/ART, scudo, libc_malloc, stack_and_tls, cfi shadow, vdso mappings plus a
+planted 32-byte key in a scudo region) for downstream reader tests. Without an
+argument it writes MemDiver's `tests/fixtures/android/memslicer_android.msl`.
+`tests/data/region_name_vectors.json` is shared byte-identically with MemDiver's
+`tests/fixtures/region_name_vectors.json`.
 
 ### Linting
 

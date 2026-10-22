@@ -1,0 +1,835 @@
+[
+  {
+    "name": "",
+    "memslicer_category": "ANON",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "unnamed anonymous mapping"
+  },
+  {
+    "name": "[heap]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "glibc/bionic brk heap"
+  },
+  {
+    "name": "[stack]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "main thread stack"
+  },
+  {
+    "name": "[stack:1234]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "old-kernel per-thread stack name"
+  },
+  {
+    "name": "[vdso]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "kernel vDSO"
+  },
+  {
+    "name": "[vvar]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "kernel vvar page"
+  },
+  {
+    "name": "[vvar_vclock]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "kernel vclock page"
+  },
+  {
+    "name": "[vsyscall]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "x86_64 legacy vsyscall page"
+  },
+  {
+    "name": "[vectors]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "arm32 vectors page"
+  },
+  {
+    "name": "[sigpage]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "arm32 signal trampoline page"
+  },
+  {
+    "name": "[uprobes]",
+    "memslicer_category": "KERNEL",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "uprobes XOL area"
+  },
+  {
+    "name": "[anon:libc_malloc]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "bionic jemalloc/legacy malloc arena"
+  },
+  {
+    "name": "[anon:scudo:primary]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "scudo primary allocator"
+  },
+  {
+    "name": "[anon:scudo:secondary]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "scudo secondary allocator"
+  },
+  {
+    "name": "[anon:scudo:primary_reserve]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "scudo primary reserve"
+  },
+  {
+    "name": "[anon:jemalloc]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "jemalloc arena"
+  },
+  {
+    "name": "[anon:GWP-ASan Guard Page]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "GWP-ASan guarded allocation pool"
+  },
+  {
+    "name": "[anon:GWP-ASan Metadata]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "GWP-ASan metadata"
+  },
+  {
+    "name": "[anon:bionic_alloc_small_objects]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "bionic small-object allocator"
+  },
+  {
+    "name": "[anon:bionic_alloc_lob]",
+    "memslicer_category": "HEAP_NATIVE",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "bionic large-object allocator"
+  },
+  {
+    "name": "[anon:partition_alloc]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "heap",
+    "note": "Chromium PartitionAlloc (MemDiver-only heap rule)"
+  },
+  {
+    "name": "[anon:dalvik-main space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART main space"
+  },
+  {
+    "name": "[anon:dalvik-main space 1]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART second main space"
+  },
+  {
+    "name": "[anon:dalvik-main space (region space)]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART region space (CC collector)"
+  },
+  {
+    "name": "[anon:dalvik-region space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART region space"
+  },
+  {
+    "name": "[anon:dalvik-large object space allocation]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART large object allocation"
+  },
+  {
+    "name": "[anon:dalvik-free list large object space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART free-list large object space"
+  },
+  {
+    "name": "[anon:dalvik-non moving space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART non-moving space (post-fork allocations)"
+  },
+  {
+    "name": "[anon:dalvik-alloc space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART alloc space"
+  },
+  {
+    "name": "[anon:dalvik-rosalloc space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "ART rosalloc space"
+  },
+  {
+    "name": "[anon:dalvik-zygote space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "zygote-inherited ART space: runtime, not heap"
+  },
+  {
+    "name": "[anon:dalvik-/data/app/~~Zx1==/com.example.app-Ab2==/oat/arm64/base.art]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "app image: heap"
+  },
+  {
+    "name": "[anon:dalvik-/system/framework/boot.art]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "boot image heap"
+  },
+  {
+    "name": "[anon:dalvik-/system/framework/boot-framework.art]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "boot image heap (framework)"
+  },
+  {
+    "name": "[anon:dalvik-/apex/com.android.art/javalib/boot.art]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "boot image heap (ART apex)"
+  },
+  {
+    "name": "[anon:dalvik-/data/dalvik-cache/arm64/system@framework@boot.art]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "boot image compiled into dalvik-cache"
+  },
+  {
+    "name": "[anon:dalvik-/data/misc/apexdata/com.android.art/dalvik-cache/boot.art]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "odrefresh boot image"
+  },
+  {
+    "name": "[anon:dalvik-main space (region space) live bitmap]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC live bitmap"
+  },
+  {
+    "name": "[anon:dalvik-region space live bitmap]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC live bitmap"
+  },
+  {
+    "name": "[anon:dalvik-allocspace zygote / non moving space live-bitmap 0]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC bitmap"
+  },
+  {
+    "name": "[anon:dalvik-allocspace zygote / non moving space mark-bitmap 0]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC bitmap"
+  },
+  {
+    "name": "[anon:dalvik-card table]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC card table"
+  },
+  {
+    "name": "[anon:dalvik-concurrent copying gc mark stack]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC mark stack"
+  },
+  {
+    "name": "[anon:dalvik-live stack]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC live stack"
+  },
+  {
+    "name": "[anon:dalvik-allocation stack]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "GC allocation stack"
+  },
+  {
+    "name": "[anon:dalvik-LinearAlloc]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "ART LinearAlloc (class metadata)"
+  },
+  {
+    "name": "[anon:dalvik-indirect ref table]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "JNI indirect reference table"
+  },
+  {
+    "name": "[anon:dalvik-jit-code-cache]",
+    "memslicer_category": "JIT_CODE",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "ART JIT code cache"
+  },
+  {
+    "name": "[anon:dalvik-data-code-cache]",
+    "memslicer_category": "JIT_CODE",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "ART JIT data cache"
+  },
+  {
+    "name": "[anon:dalvik-zygote-jit-code-cache]",
+    "memslicer_category": "JIT_CODE",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "zygote JIT code cache"
+  },
+  {
+    "name": "[anon:dalvik-CompilerMetadata]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "ART compiler metadata"
+  },
+  {
+    "name": "[anon:dalvik-Sentinel fault page]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "ART sentinel page"
+  },
+  {
+    "name": "[anon:stack_and_tls:12345]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "bionic pthread stack + TLS"
+  },
+  {
+    "name": "[anon:stack_and_tls:main]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "bionic main thread TLS"
+  },
+  {
+    "name": "[anon:thread signal stack]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "sigaltstack"
+  },
+  {
+    "name": "[anon:thread signal stack guard]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "sigaltstack guard"
+  },
+  {
+    "name": "[anon:bionic TLS]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "bionic static TLS"
+  },
+  {
+    "name": "[anon:bionic TLS guard]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "bionic TLS guard"
+  },
+  {
+    "name": "[anon:thread stack guard]",
+    "memslicer_category": "STACK",
+    "memslicer_region_type": "Stack",
+    "memdiver_category": "stack",
+    "note": "thread stack guard page"
+  },
+  {
+    "name": "[anon:.bss]",
+    "memslicer_category": "BSS",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "native .bss: deliberately no override (app globals)"
+  },
+  {
+    "name": "[anon:cfi shadow]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "CFI shadow"
+  },
+  {
+    "name": "[anon:linker_alloc]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "dynamic linker allocator"
+  },
+  {
+    "name": "[anon:linker_alloc_small_objects]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "dynamic linker small objects"
+  },
+  {
+    "name": "[anon:linker_alloc_vector]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "dynamic linker vectors"
+  },
+  {
+    "name": "[anon:System property context nodes]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "property service metadata"
+  },
+  {
+    "name": "[anon:atexit handlers]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "unknown [anon:X]: no override"
+  },
+  {
+    "name": "[anon:arc4random data]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "unknown [anon:X]: no override"
+  },
+  {
+    "name": "[anon:some_app_label]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "unknown app label: no override"
+  },
+  {
+    "name": "[anon_shmem:dalvik-zygote space]",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "anon shmem dalvik label"
+  },
+  {
+    "name": "[anon_shmem:some_label]",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "anon shmem, unknown label"
+  },
+  {
+    "name": "/dev/ashmem/dalvik-main space (deleted)",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "heap",
+    "note": "pre-Q ashmem ART main space"
+  },
+  {
+    "name": "/dev/ashmem/dalvik-zygote space (deleted)",
+    "memslicer_category": "HEAP_MANAGED",
+    "memslicer_region_type": "Heap",
+    "memdiver_category": "runtime",
+    "note": "pre-Q ashmem zygote space"
+  },
+  {
+    "name": "/dev/ashmem/dalvik-jit-code-cache (deleted)",
+    "memslicer_category": "SHARED_MEM",
+    "memslicer_region_type": "SharedMem",
+    "memdiver_category": "runtime",
+    "note": "pre-Q ashmem JIT cache"
+  },
+  {
+    "name": "/dev/ashmem/dalvik-card table (deleted)",
+    "memslicer_category": "SHARED_MEM",
+    "memslicer_region_type": "SharedMem",
+    "memdiver_category": "runtime",
+    "note": "pre-Q ashmem card table"
+  },
+  {
+    "name": "/dev/ashmem/CursorWindow: /data/user/0/com.example.app/databases/x.db (deleted)",
+    "memslicer_category": "SHARED_MEM",
+    "memslicer_region_type": "SharedMem",
+    "memdiver_category": null,
+    "note": "non-dalvik ashmem: no override"
+  },
+  {
+    "name": "/memfd:jit-cache (deleted)",
+    "memslicer_category": "JIT_CODE",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "JIT memfd"
+  },
+  {
+    "name": "/memfd:jit-zygote-cache (deleted)",
+    "memslicer_category": "JIT_CODE",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": "runtime",
+    "note": "zygote JIT memfd"
+  },
+  {
+    "name": "/memfd:wayland-cursor (deleted)",
+    "memslicer_category": "SHARED_MEM",
+    "memslicer_region_type": "SharedMem",
+    "memdiver_category": null,
+    "note": "other memfd: no override"
+  },
+  {
+    "name": "/dev/binder",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": null,
+    "note": "binder: no override"
+  },
+  {
+    "name": "/dev/hwbinder",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": null,
+    "note": "hwbinder: no override"
+  },
+  {
+    "name": "/dev/binderfs/binder",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": null,
+    "note": "binderfs: no override"
+  },
+  {
+    "name": "/dev/shm/pulse-shm-123",
+    "memslicer_category": "SHARED_MEM",
+    "memslicer_region_type": "SharedMem",
+    "memdiver_category": null,
+    "note": "POSIX shm: no override"
+  },
+  {
+    "name": "/dev/zero (deleted)",
+    "memslicer_category": "SHARED_MEM",
+    "memslicer_region_type": "SharedMem",
+    "memdiver_category": null,
+    "note": "shared /dev/zero mapping: no override"
+  },
+  {
+    "name": "/dev/__properties__/u:object_r:default_prop:s0",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "system properties area"
+  },
+  {
+    "name": "/dev/__properties__/property_info",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "system properties info"
+  },
+  {
+    "name": "/dev/kgsl-3d0",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "Adreno GPU device"
+  },
+  {
+    "name": "/dev/mali0",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "Mali GPU device"
+  },
+  {
+    "name": "/dev/dri/renderD128",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "DRM render node"
+  },
+  {
+    "name": "/dmabuf:",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "dma-buf"
+  },
+  {
+    "name": "anon_inode:dmabuf",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "dma-buf anon inode"
+  },
+  {
+    "name": "anon_inode:[perf_event]",
+    "memslicer_category": "DEVICE",
+    "memslicer_region_type": "Other",
+    "memdiver_category": "runtime",
+    "note": "perf ring buffer"
+  },
+  {
+    "name": "/system/framework/arm64/boot.oat",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": "runtime",
+    "note": "boot image code"
+  },
+  {
+    "name": "/system/framework/arm64/boot-framework.vdex",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": "runtime",
+    "note": "boot image vdex"
+  },
+  {
+    "name": "/system/framework/arm64/boot.art",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": "runtime",
+    "note": "boot image file"
+  },
+  {
+    "name": "/apex/com.android.art/javalib/arm64/boot.oat",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": "runtime",
+    "note": "ART apex boot code"
+  },
+  {
+    "name": "/data/dalvik-cache/arm64/system@framework@services.jar@classes.odex",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": "runtime",
+    "note": "dalvik-cache odex"
+  },
+  {
+    "name": "/data/misc/apexdata/com.android.art/dalvik-cache/arm64/boot.oat",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": "runtime",
+    "note": "odrefresh boot code"
+  },
+  {
+    "name": "/system/usr/icu/icudt66l.dat",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": "runtime",
+    "note": "ICU data"
+  },
+  {
+    "name": "/apex/com.android.i18n/etc/icu/icudt72l.dat",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": "runtime",
+    "note": "ICU data (i18n apex)"
+  },
+  {
+    "name": "/system/framework/framework.jar",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "boot classpath jar: no override"
+  },
+  {
+    "name": "/system/lib64/libc.so",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "system library: no override"
+  },
+  {
+    "name": "/apex/com.android.runtime/lib64/bionic/libc.so",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "bionic libc: no override"
+  },
+  {
+    "name": "/system/bin/linker64",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "dynamic linker: no override"
+  },
+  {
+    "name": "/system/bin/app_process64",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "zygote executable: no override"
+  },
+  {
+    "name": "/data/app/~~Zx1==/com.example.app-Ab2==/base.apk",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "app apk: no override"
+  },
+  {
+    "name": "/data/app/~~Zx1==/com.example.app-Ab2==/oat/arm64/base.odex",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "app odex: no override"
+  },
+  {
+    "name": "/data/app/~~Zx1==/com.example.app-Ab2==/lib/arm64/libnative.so",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "app native lib: no override"
+  },
+  {
+    "name": "/data/data/com.example.app/files/cache.bin",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "app data file: no override"
+  },
+  {
+    "name": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "Linux libc: no override"
+  },
+  {
+    "name": "/usr/lib/x86_64-linux-gnu/libssl.so.3 (deleted)",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "deleted Linux library: no override"
+  },
+  {
+    "name": "/usr/bin/python3.11",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "Linux executable: no override"
+  },
+  {
+    "name": "/home/user/data.bin",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "Linux mapped file: no override"
+  },
+  {
+    "name": "/usr/lib/dyld",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "macOS dyld: no override"
+  },
+  {
+    "name": "/System/Library/Frameworks/Security.framework/Versions/A/Security",
+    "memslicer_category": "MAPPED_FILE",
+    "memslicer_region_type": "MappedFile",
+    "memdiver_category": null,
+    "note": "macOS framework: no override"
+  },
+  {
+    "name": "/usr/lib/libSystem.B.dylib",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "macOS dylib: no override"
+  },
+  {
+    "name": "MALLOC_TINY",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "macOS vmmap tag (bare token): no override"
+  },
+  {
+    "name": "MALLOC_NANO",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "macOS vmmap tag (bare token): no override"
+  },
+  {
+    "name": "Stack",
+    "memslicer_category": "ANON_NAMED",
+    "memslicer_region_type": "Anon",
+    "memdiver_category": null,
+    "note": "macOS vmmap tag (bare token): no override"
+  },
+  {
+    "name": "C:\\Windows\\System32\\ntdll.dll",
+    "memslicer_category": "IMAGE",
+    "memslicer_region_type": "Image",
+    "memdiver_category": null,
+    "note": "Windows system DLL: no override"
+  }
+]

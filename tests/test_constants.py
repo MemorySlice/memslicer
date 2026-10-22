@@ -3,7 +3,7 @@ from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, BLOCK_HEADER_SIZE, VERSION,
     COMPRESSED, COMPALGO_MASK, HAS_KEY_HINTS, HAS_CHILDREN, CONTINUATION,
     Endianness, OSType, ArchType, BlockType, CompAlgo, PageState,
-    RegionType, CapBit, ClockSource,
+    RegionType, CapBit, ClockSource, OmissionReason,
 )
 
 
@@ -94,6 +94,13 @@ def test_block_type_values():
     assert BlockType.PointerGraph == 0x1003
 
 
+def test_extension_block_type_values():
+    """Non-spec extension blocks sit just above the 0x0054-0x0058 spec range."""
+    assert BlockType.PhysicalMemoryMap == 0x0059
+    assert BlockType.ModuleBuildIdManifest == 0x005A
+    assert BlockType.RegionOmissionManifest == 0x005B
+
+
 def test_comp_algo_values():
     assert CompAlgo.NONE == 0
     assert CompAlgo.ZSTD == 1
@@ -104,6 +111,19 @@ def test_page_state_values():
     assert PageState.CAPTURED == 0
     assert PageState.FAILED == 1
     assert PageState.UNMAPPED == 2
+    assert PageState.NOT_RESIDENT == 3
+
+
+def test_page_state_fits_two_bit_map():
+    """Every state must be encodable in the 2-bit PageStateMap."""
+    assert {int(s) for s in PageState} == {0, 1, 2, 3}
+    assert PageState(3) is PageState.NOT_RESIDENT
+
+
+def test_omission_reason_values():
+    assert OmissionReason.MODULE_EXCLUDE == 1
+    assert OmissionReason.SCOPE == 2
+    assert len(OmissionReason) == 2  # 3+ reserved
 
 
 def test_region_type_values():

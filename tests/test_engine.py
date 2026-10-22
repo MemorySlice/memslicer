@@ -60,6 +60,51 @@ class TestClassifyRegion:
     def test_unknown_path(self):
         assert classify_region("something") == RegionType.Unknown
 
+    def test_deleted_shared_library_still_image(self):
+        assert classify_region("/x.so (deleted)") == RegionType.Image
+
+    def test_versioned_shared_library_is_image(self):
+        assert classify_region("/usr/lib/x86_64-linux-gnu/libc.so.6") == RegionType.Image
+
+    def test_scudo_anon_label_is_heap(self):
+        assert classify_region("[anon:scudo:primary]") == RegionType.Heap
+
+    def test_libc_malloc_anon_label_is_heap(self):
+        assert classify_region("[anon:libc_malloc]") == RegionType.Heap
+
+    def test_dalvik_main_space_is_heap(self):
+        assert classify_region("[anon:dalvik-main space]") == RegionType.Heap
+
+    def test_stack_and_tls_anon_label_is_stack(self):
+        assert classify_region("[anon:stack_and_tls:123]") == RegionType.Stack
+
+    def test_numbered_stack_is_stack(self):
+        assert classify_region("[stack:4242]") == RegionType.Stack
+
+    def test_dalvik_linear_alloc_is_anon(self):
+        assert classify_region("[anon:dalvik-LinearAlloc]") == RegionType.Anon
+
+    def test_memfd_jit_cache_is_anon(self):
+        assert classify_region("/memfd:jit-cache (deleted)") == RegionType.Anon
+
+    def test_anon_shmem_jit_code_cache_is_anon(self):
+        assert classify_region("[anon_shmem:dalvik-jit-code-cache]") == RegionType.Anon
+
+    def test_memfd_other_is_shared_mem(self):
+        assert classify_region("/memfd:foo (deleted)") == RegionType.SharedMem
+
+    def test_ashmem_is_shared_mem(self):
+        assert classify_region("/dev/ashmem/foo (deleted)") == RegionType.SharedMem
+
+    def test_device_node_is_other(self):
+        assert classify_region("/dev/kgsl-3d0") == RegionType.Other
+
+    def test_anon_inode_is_other(self):
+        assert classify_region("anon_inode:[eventfd]") == RegionType.Other
+
+    def test_vdso_is_other(self):
+        assert classify_region("[vdso]") == RegionType.Other
+
 
 class TestVolatilityKeyOrdering:
     """Tests for volatility_key ensuring correct priority ordering."""
@@ -95,6 +140,35 @@ class TestVolatilityKeyOrdering:
         r1 = MemoryRange(base=0x1000, size=4096, protection="rw-", file_path="")
         r2 = MemoryRange(base=0x2000, size=4096, protection="rw-", file_path="")
         assert volatility_key(r1) < volatility_key(r2)
+
+    def test_rw_dalvik_main_space_priority_zero(self):
+        managed = MemoryRange(
+            base=0x1000, size=4096, protection="rw-",
+            file_path="[anon:dalvik-main space]",
+        )
+        assert volatility_key(managed)[0] == 0
+
+    def test_rw_scudo_primary_priority_zero(self):
+        scudo = MemoryRange(
+            base=0x1000, size=4096, protection="rw-",
+            file_path="[anon:scudo:primary]",
+        )
+        assert volatility_key(scudo)[0] == 0
+
+    def test_rw_named_heaps_sort_before_ro_files(self):
+        managed = MemoryRange(
+            base=0x9000, size=4096, protection="rw-",
+            file_path="[anon:dalvik-main space]",
+        )
+        scudo = MemoryRange(
+            base=0x8000, size=4096, protection="rw-",
+            file_path="[anon:scudo:primary]",
+        )
+        ro_file = MemoryRange(
+            base=0x1000, size=4096, protection="r--", file_path="/data/file",
+        )
+        assert volatility_key(managed) < volatility_key(ro_file)
+        assert volatility_key(scudo) < volatility_key(ro_file)
 
 
 # ---------------------------------------------------------------------------
@@ -1498,3 +1572,101 @@ class TestCollectOrDefault:
             raise RuntimeError("nope")
 
         assert self._engine()._table_or_empty("table", boom) == []
+
+
+# ---------------------------------------------------------------------------
+# VAS Map (0x1001) written by the engine
+# ---------------------------------------------------------------------------
+
+
+_ANDROID_RANGES = [
+    ("[anon:dalvik-main space (region space)]", 0x12c00000, "rw-"),
+    ("[anon:dalvik-zygote space]", 0x70000000, "rw-"),
+    ("[anon:dalvik-/system/framework/boot.art]", 0x70100000, "rw-"),
+    ("[anon:dalvik-card table]", 0x70200000, "rw-"),
+    ("[anon:scudo:primary]", 0x7a0000000, "rw-"),
+    ("[anon:libc_malloc]", 0x7a1000000, "rw-"),
+    ("[anon:stack_and_tls:4242]", 0x7a2000000, "rw-"),
+    ("[anon:cfi shadow]", 0x7a3000000, "r--"),
+    ("/data/app/~~x==/com.example-1/lib/arm64/libapp.so", 0x7a4000000, "r-x"),
+    ("[vdso]", 0x7a5000000, "r-x"),
+    ("[stack]", 0x7ff000000, "rw-"),
+]
+
+
+def _android_bridge() -> MockBridge:
+    ranges = [MemoryRange(base=b, size=4096, protection=p, file_path=n)
+              for n, b, p in _ANDROID_RANGES]
+    return MockBridge(
+        ranges=ranges,
+        platform_info=PlatformInfo(arch=ArchType.ARM64, os=OSType.Android,
+                                   pid=4242, page_size=4096),
+        memory={r.base: b"\x5a" * 4096 for r in ranges},
+    )
+
+
+def _read_vas(path: Path):
+    from memslicer.msl.iterator import iterate_blocks
+    from memslicer.msl.writer import parse_vas_map
+    with path.open("rb") as f:
+        blocks = [b for b in iterate_blocks(f) if b.block_type == BlockType.VASMap]
+    assert len(blocks) == 1
+    return parse_vas_map(blocks[0].payload)
+
+
+class TestEngineVasMap:
+    """Every enumerated range lands in the VAS Map with its full name."""
+
+    def test_spaced_android_names_complete_including_skipped(self, tmp_path: Path):
+        # min_prot=3 (rw) skips the r-- and r-x ranges.
+        engine = AcquisitionEngine(
+            _android_bridge(), region_filter=RegionFilter(min_prot=3),
+        )
+        output = tmp_path / "android.msl"
+        result = engine.acquire(output)
+        assert result.regions_skipped == 3
+
+        vas = _read_vas(output)
+        want = sorted(_ANDROID_RANGES, key=lambda t: t[1])
+        assert [(e.mapped_path, e.base_addr) for e in vas] == [(n, b) for n, b, _ in want]
+        by_name = {e.mapped_path: e for e in vas}
+        assert by_name["[anon:dalvik-main space (region space)]"].region_type == RegionType.Heap
+        assert by_name["[anon:scudo:primary]"].region_type == RegionType.Heap
+        assert by_name["[anon:stack_and_tls:4242]"].region_type == RegionType.Stack
+        assert by_name["[anon:cfi shadow]"].protection == 1  # skipped, still recorded
+        for e in vas:
+            assert e.region_type == classify_region(e.mapped_path)
+
+    def test_header_os_type_is_android(self, tmp_path: Path):
+        output = tmp_path / "android.msl"
+        AcquisitionEngine(_android_bridge()).acquire(output)
+        raw = output.read_bytes()[:HEADER_SIZE]
+        os_type = struct.unpack_from("<H", raw, 0x30)[0]
+        assert os_type == OSType.Android
+
+    def test_aborted_capture_still_lists_unvisited_ranges(self, tmp_path: Path):
+        bridge = _android_bridge()
+        engine = AcquisitionEngine(bridge)
+
+        def progress_cb(regions_captured, *_):
+            if regions_captured >= 1:
+                engine.request_abort()
+
+        engine.set_progress_callback(progress_cb)
+        output = tmp_path / "aborted.msl"
+        result = engine.acquire(output)
+        assert result.aborted is True
+        assert result.regions_captured < len(_ANDROID_RANGES)
+        assert len(_read_vas(output)) == len(_ANDROID_RANGES)
+
+    def test_vas_region_type_matches_memory_region_blocks(self, tmp_path: Path):
+        from memslicer.msl.iterator import iterate_blocks
+        output = tmp_path / "android.msl"
+        AcquisitionEngine(_android_bridge()).acquire(output)
+        with output.open("rb") as f:
+            stored = {
+                struct.unpack_from("<Q", b.payload, 0)[0]: b.payload[0x11]
+                for b in iterate_blocks(f) if b.block_type == BlockType.MemoryRegion
+            }
+        vas = {e.base_addr: int(e.region_type) for e in _read_vas(output)}
+        assert stored and all(vas[base] == rtype for base, rtype in stored.items())

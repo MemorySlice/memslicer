@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from memslicer.msl.constants import (
     OSType, ArchType, CompAlgo, PageState, RegionType, BlockType,
-    Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo,
+    Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo, OmissionReason,
 )
 
 
@@ -37,6 +37,23 @@ class MemoryRegion:
     page_states: list[PageState] = field(default_factory=list)
     page_data_chunks: list[bytes] = field(default_factory=list)
     # page_data_chunks contains data ONLY for CAPTURED pages
+
+
+@dataclass
+class VasEntry:
+    """One enumerated address range in a VAS Map block (0x1001).
+
+    Recorded for every range the target reported, whether its bytes were
+    captured or not; a VAS entry without a matching MemoryRegion block is a
+    range whose bytes were not stored. ``mapped_path`` carries the full
+    mapping name (file path or pseudo name such as
+    ``[anon:dalvik-main space (region space)]``); empty for anonymous ranges.
+    """
+    base_addr: int = 0
+    region_size: int = 0
+    protection: int = 0  # bit0=R, bit1=W, bit2=X
+    region_type: RegionType = RegionType.Unknown
+    mapped_path: str = ""
 
 
 @dataclass
@@ -335,6 +352,30 @@ class ModuleBuildIdManifest:
     original bytes untouched.
     """
     rows: list[ModuleBuildIdRow] = field(default_factory=list)
+
+
+@dataclass
+class RegionOmissionRow:
+    """One deliberately skipped region (Block 0x005B)."""
+    base_addr: int
+    size: int
+    protection: int          # bit0=R, bit1=W, bit2=X
+    region_type: RegionType
+    reason: OmissionReason
+    name: str = ""           # backing path / module name, if known
+
+
+@dataclass
+class RegionOmissionManifest:
+    """Block 0x005B — non-spec extension.
+
+    Lists memory regions that the acquirer deliberately did not capture
+    (scope / module exclusion), so a reader can tell a partial dump from
+    an incomplete one. Written only when at least one region was omitted.
+    """
+    scope: str = "full"
+    exclude_patterns: list[str] = field(default_factory=list)
+    rows: list[RegionOmissionRow] = field(default_factory=list)
 
 
 @dataclass

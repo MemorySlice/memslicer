@@ -9,10 +9,11 @@ import pytest
 from memslicer.msl.constants import (
     BLOCK_MAGIC, BLOCK_HEADER_SIZE, HEADER_SIZE,
     HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
-    BlockType, CompAlgo, PageState,
+    BlockType, CompAlgo, PageState, RegionType, OmissionReason,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity,
+    RegionOmissionManifest, RegionOmissionRow,
 )
 from memslicer.msl.writer import MSLWriter
 
@@ -73,6 +74,16 @@ def _create_msl(comp_algo: CompAlgo) -> bytes:
     )
     writer.write_module_list([mod])
 
+    # RegionOmissionManifest (0x005B, non-spec extension) -- metadata,
+    # must never pick up the compression flags.
+    writer.write_region_omission_manifest(RegionOmissionManifest(
+        scope="modules",
+        rows=[RegionOmissionRow(
+            base_addr=0x7000, size=4096, protection=0x01,
+            region_type=RegionType.Anon, reason=OmissionReason.SCOPE,
+        )],
+    ))
+
     # End of capture
     writer.finalize()
 
@@ -94,6 +105,7 @@ class TestBlockFlagsWithNoCompression:
             "MemoryRegion",
             "ModuleListIndex",
             "ModuleEntry",
+            "RegionOmissionManifest",
             "EndOfCapture",
         ]
 
@@ -120,8 +132,13 @@ class TestBlockFlagsWithNoCompression:
         assert blk["block_type"] == BlockType.ModuleEntry
         assert blk["flags"] == 0x0000, f"Expected 0x0000, got 0x{blk['flags']:04X}"
 
-    def test_end_of_capture_flags(self):
+    def test_region_omission_manifest_flags(self):
         blk = self.blocks[4]
+        assert blk["block_type"] == BlockType.RegionOmissionManifest
+        assert blk["flags"] == 0x0000, f"Expected 0x0000, got 0x{blk['flags']:04X}"
+
+    def test_end_of_capture_flags(self):
+        blk = self.blocks[5]
         assert blk["block_type"] == BlockType.EndOfCapture
         assert blk["flags"] == 0x0000, f"Expected 0x0000, got 0x{blk['flags']:04X}"
 
@@ -168,8 +185,15 @@ class TestBlockFlagsWithZSTD:
             f"ModuleEntry should NOT be compressed, got 0x{blk['flags']:04X}"
         )
 
-    def test_end_of_capture_not_compressed(self):
+    def test_region_omission_manifest_not_compressed(self):
         blk = self.blocks[4]
+        assert blk["block_type"] == BlockType.RegionOmissionManifest
+        assert blk["flags"] == 0x0000, (
+            f"RegionOmissionManifest should NOT be compressed, got 0x{blk['flags']:04X}"
+        )
+
+    def test_end_of_capture_not_compressed(self):
+        blk = self.blocks[5]
         assert blk["block_type"] == BlockType.EndOfCapture
         assert blk["flags"] == 0x0000, (
             f"EndOfCapture should NOT be compressed, got 0x{blk['flags']:04X}"

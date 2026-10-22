@@ -12,17 +12,19 @@ from memslicer.msl.constants import (
     BLOCK_HEADER_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
     CONTINUATION, FLAG_ENCRYPTED, BlockType, CompAlgo, PageState,
     PAGE_SIZE_LOG2_MIN, PAGE_SIZE_LOG2_MAX, valid_page_size,
+    RegionType, OmissionReason,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, KeyHint, ImportProvenance,
     RelatedDump, KernelSymbolBundle, PhysicalMemoryMap, ConnectivityTable,
     KernelModuleList, ModuleBuildIdManifest, TargetIntrospection,
-    PersistenceManifest,
+    PersistenceManifest, RegionOmissionManifest, RegionOmissionRow,
+    VasEntry,
 )
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.compression import compress
-from memslicer.utils.padding import pad_bytes, encode_string, encode_string_bounded
+from memslicer.utils.padding import pad8, pad_bytes, encode_string, encode_string_bounded
 from memslicer.utils.timestamps import now_ns
 
 _log = logging.getLogger("memslicer")
@@ -54,6 +56,107 @@ def _u64_wire(value: int) -> int:
     return value & _U64_MASK
 
 
+_OMISSION_STR_MAX = 0xFFFF
+_OMISSION_ROW_HEAD = struct.Struct("<QQBBBBHH")
+
+
+def _encode_omission_string(value: str, field_name: str) -> bytes:
+    """UTF-8 encode a RegionOmissionManifest string field.
+
+    The on-disk length field is a u16 and the string carries no NUL
+    terminator, so an embedded NUL or an oversized value is refused
+    instead of silently corrupting the row boundary.
+
+    Args:
+        value: The string to encode.
+        field_name: Used in the error message only.
+
+    Returns:
+        The raw UTF-8 bytes, not yet padded.
+
+    Raises:
+        ValueError: if *value* contains NUL or exceeds 65535 bytes.
+    """
+    if "\x00" in value:
+        raise ValueError(f"RegionOmissionManifest {field_name} contains NUL")
+    raw = value.encode("utf-8")
+    if len(raw) > _OMISSION_STR_MAX:
+        raise ValueError(
+            f"RegionOmissionManifest {field_name} too long: "
+            f"{len(raw)} > {_OMISSION_STR_MAX}"
+        )
+    return raw
+
+
+def parse_region_omission_manifest(payload: bytes) -> RegionOmissionManifest:
+    """Parse a RegionOmissionManifest (0x005B) block payload.
+
+    Inverse of :meth:`MSLWriter.write_region_omission_manifest`; see
+    that method for the on-disk layout. Unknown ``region_type`` or
+    ``reason`` values are kept as plain ints so a newer writer's rows
+    survive an older reader.
+
+    Args:
+        payload: Decompressed block payload (as yielded by
+            :func:`memslicer.msl.iterator.iterate_blocks`).
+
+    Returns:
+        The reconstructed manifest.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < 16:
+        raise ValueError("RegionOmissionManifest payload truncated")
+    row_count, _reserved = struct.unpack_from("<II", payload, 0)
+    scope_len, patterns_len, _reserved2 = struct.unpack_from("<HHI", payload, 8)
+    offset = 16
+    scope, offset = _read_omission_string(payload, offset, scope_len)
+    patterns_raw, offset = _read_omission_string(payload, offset, patterns_len)
+    patterns = patterns_raw.split("\n") if patterns_raw else []
+    rows: list[RegionOmissionRow] = []
+    for _ in range(row_count):
+        row, offset = _read_omission_row(payload, offset)
+        rows.append(row)
+    return RegionOmissionManifest(scope=scope, exclude_patterns=patterns, rows=rows)
+
+
+def _read_omission_string(
+    payload: bytes, offset: int, length: int,
+) -> tuple[str, int]:
+    """Read a pad8 UTF-8 field; return ``(text, offset_after_padding)``."""
+    end = offset + length
+    if end > len(payload):
+        raise ValueError("RegionOmissionManifest string field truncated")
+    text = payload[offset:end].decode("utf-8")
+    return text, offset + pad8(length)
+
+
+def _read_omission_row(payload: bytes, offset: int) -> tuple[RegionOmissionRow, int]:
+    """Read one row at *offset*; return ``(row, offset_after_row)``."""
+    if offset + _OMISSION_ROW_HEAD.size > len(payload):
+        raise ValueError("RegionOmissionManifest row truncated")
+    (base_addr, size, protection, region_type, reason, _r1,
+     name_len, _r2) = _OMISSION_ROW_HEAD.unpack_from(payload, offset)
+    offset += _OMISSION_ROW_HEAD.size
+    name, offset = _read_omission_string(payload, offset, name_len)
+    row = RegionOmissionRow(
+        base_addr=base_addr, size=size, protection=protection,
+        region_type=_enum_or_int(RegionType, region_type),
+        reason=_enum_or_int(OmissionReason, reason),
+        name=name,
+    )
+    return row, offset
+
+
+def _enum_or_int(enum_cls, value: int):
+    """Return ``enum_cls(value)``, or the bare int for an unknown value."""
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return value
+
+
 def _packed_or_none(
     table: str, label: str, pack: Callable[[], bytes],
 ) -> bytes | None:
@@ -78,6 +181,80 @@ def _packed_or_none(
     except struct.error as exc:
         _log.warning("%s: dropping row %s (%s)", table, label, exc)
         return None
+
+
+_VAS_PATH_MAX = 0xFFFF
+_VAS_ENTRY_HEAD = struct.Struct("<QQBBH4x")
+
+
+def _vas_path_bytes(name: str) -> bytes:
+    """Return the NUL-terminated UTF-8 VAS path, or ``b""`` if unusable.
+
+    Unusable means empty, containing a NUL, not UTF-8 encodable, or longer
+    than the u16 ``path_len`` allows once the terminator is added.
+    """
+    if not name or "\x00" in name:
+        return b""
+    try:
+        raw = name.encode("utf-8") + b"\x00"
+    except UnicodeEncodeError:
+        return b""
+    return raw if len(raw) <= _VAS_PATH_MAX else b""
+
+
+def _pack_vas_entry(entry: VasEntry) -> bytes | None:
+    """Pack one :class:`VasEntry` (24-byte head + padded NUL-terminated path).
+
+    Returns ``None`` (logged) when an address or size does not fit u64.
+    """
+    path = _vas_path_bytes(entry.mapped_path)
+    head = _packed_or_none("VASMap", f"base 0x{entry.base_addr:x}", lambda: (
+        _VAS_ENTRY_HEAD.pack(
+            entry.base_addr, entry.region_size,
+            int(entry.protection) & 0xFF, int(entry.region_type) & 0xFF,
+            len(path),
+        )
+    ))
+    return None if head is None else head + pad_bytes(path)
+
+
+def parse_vas_map(payload: bytes) -> list[VasEntry]:
+    """Parse a VAS Map (0x1001) block payload.
+
+    Inverse of :meth:`MSLWriter.write_vas_map`. Honours a non-zero
+    ``entry_size`` (fixed-stride entries) as the spec allows. Unknown
+    ``region_type`` values are kept as plain ints.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < 8:
+        raise ValueError("VASMap payload truncated")
+    count, entry_size = struct.unpack_from("<II", payload, 0)
+    offset = 8
+    entries: list[VasEntry] = []
+    for _ in range(count):
+        entry, advance = _read_vas_entry(payload, offset)
+        entries.append(entry)
+        offset += entry_size if entry_size else advance
+    return entries
+
+
+def _read_vas_entry(payload: bytes, offset: int) -> tuple[VasEntry, int]:
+    """Read one entry at *offset*; return ``(entry, bytes_consumed)``."""
+    if offset + _VAS_ENTRY_HEAD.size > len(payload):
+        raise ValueError("VASMap entry truncated")
+    base, size, prot, rtype, path_len = _VAS_ENTRY_HEAD.unpack_from(payload, offset)
+    start = offset + _VAS_ENTRY_HEAD.size
+    if start + path_len > len(payload):
+        raise ValueError("VASMap entry path truncated")
+    raw = payload[start:start + path_len].split(b"\x00", 1)[0]
+    entry = VasEntry(
+        base_addr=base, region_size=size, protection=prot,
+        region_type=_enum_or_int(RegionType, rtype),
+        mapped_path=raw.decode("utf-8", errors="replace"),
+    )
+    return entry, _VAS_ENTRY_HEAD.size + pad8(path_len)
 
 
 def _bounded_or_absent(value: str) -> tuple[bytes, int]:
@@ -1138,6 +1315,104 @@ class MSLWriter:
         )
         return self._write_block(
             BlockType.ModuleBuildIdManifest, payload,
+        )
+
+    # ------------------------------------------------------------------
+    # RegionOmissionManifest (Block 0x005B — non-spec extension)
+    # ------------------------------------------------------------------
+
+    def write_region_omission_manifest(
+        self, manifest: RegionOmissionManifest,
+    ) -> bytes:
+        """Write a RegionOmissionManifest block (0x005B). Returns block UUID.
+
+        Lists regions the acquirer deliberately skipped so a reader can
+        tell a partial dump from an incomplete one. Little-endian; all
+        strings UTF-8 without NUL terminator, each padded to 8 bytes.
+
+        .. code-block:: text
+
+            Payload header:
+                row_count:    u32
+                reserved:     u32
+                scope_len:    u16
+                patterns_len: u16
+                reserved:     u32
+                scope:        bytes[scope_len]     pad8
+                patterns:     bytes[patterns_len]  pad8  (joined with "\\n")
+            Row:
+                base_addr:   u64
+                size:        u64
+                protection:  u8
+                region_type: u8
+                reason:      u8
+                reserved:    u8
+                name_len:    u16
+                reserved:    u16
+                name:        bytes[name_len]  pad8
+
+        Raises:
+            ValueError: if a string does not fit its u16 length field.
+        """
+        scope_bytes = _encode_omission_string(manifest.scope, "scope")
+        patterns_bytes = _encode_omission_string(
+            "\n".join(manifest.exclude_patterns), "exclude_patterns",
+        )
+        rows_bytes = [self._pack_omission_row(r) for r in manifest.rows]
+        payload = (
+            struct.pack("<II", len(rows_bytes), 0)
+            + struct.pack("<HHI", len(scope_bytes), len(patterns_bytes), 0)
+            + pad_bytes(scope_bytes)
+            + pad_bytes(patterns_bytes)
+            + b"".join(rows_bytes)
+        )
+        return self._write_block(BlockType.RegionOmissionManifest, payload)
+
+    @staticmethod
+    def _pack_omission_row(row: RegionOmissionRow) -> bytes:
+        """Pack one :class:`RegionOmissionRow` (fixed 24-byte head + name)."""
+        name_bytes = _encode_omission_string(row.name, "name")
+        head = struct.pack(
+            "<QQBBBBHH",
+            row.base_addr, row.size,
+            row.protection, int(row.region_type), int(row.reason), 0,
+            len(name_bytes), 0,
+        )
+        return head + pad_bytes(name_bytes)
+
+    # ------------------------------------------------------------------
+    # VAS Map (Block 0x1001)
+    # ------------------------------------------------------------------
+
+    def write_vas_map(self, entries: list[VasEntry]) -> bytes:
+        """Write a VAS Map block (0x1001): the full address-space layout.
+
+        Uses the writer's normal compression flags. Returns the block UUID.
+
+        .. code-block:: text
+
+            Payload header:
+                entry_count: u32
+                entry_size:  u32      # 0 = variable-length entries
+            Entry:
+                base_addr:   u64
+                region_size: u64
+                protection:  u8
+                region_type: u8
+                path_len:    u16      # incl. NUL; 0 when no path
+                reserved:    4 bytes
+                path:        bytes[path_len]  NUL-terminated, pad8
+
+        A name that contains a NUL, is not encodable as UTF-8 or does not
+        fit the u16 length (NUL included) is dropped -- the entry is kept
+        with an empty path, never failing the capture.
+        """
+        packed = [_pack_vas_entry(e) for e in entries]
+        rows = [p for p in packed if p is not None]
+        # Count the entries actually packed, so a dropped one is never promised.
+        payload = struct.pack("<II", len(rows), 0) + b"".join(rows)
+        return self._write_block(
+            BlockType.VASMap, payload, flags=self._comp_flags,
         )
 
     # ------------------------------------------------------------------

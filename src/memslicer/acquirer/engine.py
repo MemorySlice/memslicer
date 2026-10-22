@@ -19,6 +19,9 @@ from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
 from memslicer.acquirer.investigation import InvestigationCollector, TargetSystemInfo
 from memslicer.acquirer.os_detail import pack_os_detail, system_info_to_fields
+from memslicer.acquirer.region_classify import (
+    RegionCategory, classify_name, region_type_for_category, strip_deleted,
+)
 from memslicer.acquirer.region_filter import (
     RegionFilter, is_kernel_pseudo_region,
 )
@@ -29,7 +32,7 @@ from memslicer.msl.constants import (
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, TargetIntrospection,
-    KernelSymbolBundle,
+    KernelSymbolBundle, VasEntry,
 )
 from memslicer.msl.writer import MSLWriter
 from memslicer.utils.protection import (
@@ -241,19 +244,48 @@ def coalesce_unreadable(
     return ranges
 
 
+def _is_bare_token(name: str) -> bool:
+    """True for names that are neither a path nor a bracketed pseudo name."""
+    return not name.startswith("[") and "/" not in name and "\\" not in name
+
+
 def classify_region(file_path: str) -> RegionType:
-    """Classify a memory region based on its mapped file path."""
-    if not file_path:
-        return RegionType.Anon
-    if "[heap]" in file_path:
-        return RegionType.Heap
-    if "[stack]" in file_path:
-        return RegionType.Stack
-    if file_path.endswith((".so", ".dylib", ".dll", ".exe")):
-        return RegionType.Image
-    if "/" in file_path or "\\" in file_path:
-        return RegionType.MappedFile
-    return RegionType.Unknown
+    """Classify a memory region based on its mapped file path.
+
+    Delegates the name rules to :func:`region_classify.classify_name` so
+    that ``[anon:...]`` labels, ``" (deleted)"`` suffixes, memfd/ashmem and
+    device mappings are recognised. A bare token that is neither a path nor
+    a bracketed pseudo name (e.g. ``"something"``) stays
+    :attr:`RegionType.Unknown`.
+    """
+    name = strip_deleted(file_path)
+    category = classify_name(name)
+    if category is RegionCategory.ANON_NAMED and _is_bare_token(name):
+        return RegionType.Unknown
+    return region_type_for_category(category)
+
+
+def build_vas_entries(
+    ranges: list[MemoryRange], page_size: int,
+) -> list[VasEntry]:
+    """Describe every enumerated range for the VAS Map block, sorted by base.
+
+    Covers captured, filter-skipped and abort-unvisited ranges alike, with
+    the full mapping name and the region type a MemoryRegion block for the
+    range would carry. Sizes are page-rounded exactly like the region blocks.
+    """
+    entries = [
+        VasEntry(
+            base_addr=r.base,
+            region_size=_page_count(r.size, page_size) * page_size,
+            protection=parse_protection(r.protection),
+            region_type=classify_region(r.file_path),
+            mapped_path=r.file_path or "",
+        )
+        for r in ranges
+    ]
+    entries.sort(key=lambda e: e.base_addr)
+    return entries
 
 
 def volatility_key(r: MemoryRange) -> tuple[int, int]:
@@ -861,6 +893,11 @@ class AcquisitionEngine(BaseAcquirer):
                     writer.write_module_entries(
                         module_entries, module_index_uuid, module_uuids,
                     )
+
+                    # VAS Map (0x1001): every enumerated range with its full
+                    # mapping name, captured or not, so a reader can classify
+                    # by name and tell skipped ranges from absent ones.
+                    writer.write_vas_map(build_vas_entries(ranges, page_size))
 
                     self._emit_progress(
                         region_count, total_ranges,

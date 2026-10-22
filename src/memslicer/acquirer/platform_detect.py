@@ -332,11 +332,12 @@ def parse_maps_text(text: str) -> list[MemoryRange]:
         base = int(addr_lo, 16)
         end = int(addr_hi, 16)
         prot = parts[1].replace("p", "-").replace("s", "-")[:3]
-        # Known limitation: pathnames containing spaces are truncated at the
-        # first space. Joining parts[5:] would fix that, but it would also
-        # turn "/x.so (deleted)" into a path that no longer classifies as
-        # RegionType.Image, so the single-field semantics are kept as-is.
-        path = parts[5] if len(parts) > 5 else ""
+        # The pathname is everything after the inode field and may itself
+        # contain spaces ("[anon:dalvik-main space]", "/x.so (deleted)"), so
+        # the remaining fields are re-joined with single spaces. Runs of
+        # whitespace inside a name collapse to one space; classification
+        # strips the " (deleted)" marker itself (see region_classify).
+        path = " ".join(parts[5:])
         ranges.append(MemoryRange(base, end - base, prot, path))
 
     return ranges

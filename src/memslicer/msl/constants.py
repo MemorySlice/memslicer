@@ -141,6 +141,7 @@ class BlockType(IntEnum):
     # Non-spec extension blocks (outside the 0x0054-0x0058 spec range).
     PhysicalMemoryMap = 0x0059
     ModuleBuildIdManifest = 0x005A
+    RegionOmissionManifest = 0x005B
     EndOfCapture = 0x0FFF
     VASMap = 0x1001
     PointerGraph = 0x1003
@@ -160,6 +161,21 @@ class PageState(IntEnum):
     CAPTURED = 0
     FAILED = 1
     UNMAPPED = 2
+    # Mapped anonymous page that was never touched at read time: its
+    # content is zero and it contributes 0 bytes of PageData, exactly
+    # like FAILED / UNMAPPED. Spec Table 24 amendment pending; readers
+    # MUST treat this value as a 0-byte state rather than reject it.
+    NOT_RESIDENT = 3
+
+
+class OmissionReason(IntEnum):
+    """Why the acquirer deliberately skipped a region (Block 0x005B).
+
+    Values 3 and above are reserved for future reasons.
+    """
+
+    MODULE_EXCLUDE = 1
+    SCOPE = 2
 
 
 class RegionType(IntEnum):

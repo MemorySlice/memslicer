@@ -196,6 +196,27 @@ class TestParseMapsText:
         assert len(ranges) == 1
         assert ranges[0].file_path == "[heap]"
 
+    def test_path_with_spaces_kept_whole(self):
+        line = "12c00000-12e00000 rw-p 00000000 00:00 0 [anon:dalvik-main space]"
+        assert parse_maps_text(line)[0].file_path == "[anon:dalvik-main space]"
+
+    def test_multi_word_anon_label_kept_whole(self):
+        line = (
+            "7a00000000-7a00100000 rw-p 00000000 00:00 0 "
+            "[anon:dalvik-free list large object space]"
+        )
+        assert parse_maps_text(line)[0].file_path == (
+            "[anon:dalvik-free list large object space]"
+        )
+
+    def test_deleted_suffix_preserved(self):
+        line = "7f00000000-7f00001000 r-xp 00000000 fd:00 42 /x.so (deleted)"
+        assert parse_maps_text(line)[0].file_path == "/x.so (deleted)"
+
+    def test_memfd_deleted_suffix_preserved(self):
+        line = "7f00000000-7f00001000 r-xp 00000000 00:05 42 /memfd:jit-cache (deleted)"
+        assert parse_maps_text(line)[0].file_path == "/memfd:jit-cache (deleted)"
+
 
 class TestParseProcMaps:
     """Tests for parse_proc_maps() -- the I/O wrapper around parse_maps_text()."""

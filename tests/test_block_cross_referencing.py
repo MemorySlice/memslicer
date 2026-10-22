@@ -252,8 +252,13 @@ class TestBlockCrossReferencing:
     # --- Summary: block type counts ---
 
     def test_expected_block_count(self, msl_blocks: list[dict]):
-        """Verify the total number of blocks: 1 PI + 1 MLI + 3 ME + 2 MR + 1 EoC = 8."""
-        assert len(msl_blocks) == 8, (
-            f"Expected 8 blocks total, got {len(msl_blocks)}: "
+        """Verify the total number of blocks: 1 PI + 1 MLI + 3 ME + 2 MR + 1 VAS + 1 EoC = 9."""
+        assert len(msl_blocks) == 9, (
+            f"Expected 9 blocks total, got {len(msl_blocks)}: "
             + ", ".join(b["block_type_name"] for b in msl_blocks)
         )
+
+    def test_vas_map_precedes_end_of_capture(self, msl_blocks: list[dict]):
+        """The VAS Map is the last block before EndOfCapture, with no parent."""
+        assert msl_blocks[-2]["block_type"] == BlockType.VASMap
+        assert msl_blocks[-2]["parent_uuid"] == b"\x00" * 16

@@ -224,6 +224,55 @@ class RemoteCollectorCapable(Protocol):
 
 
 @runtime_checkable
+class ResidencyCapable(Protocol):
+    """Optional bridge capability: which pages of a span the target has touched.
+
+    Bridges are not required to implement this. Callers should probe for the
+    methods with ``isinstance`` and treat an absent capability exactly like
+    :meth:`residency_method` answering ``"none"``: read everything.
+    """
+
+    def query_residency(self, address: int, size: int) -> bytes | None:
+        """Residency mask for ``[address, address + size)``.
+
+        Returns:
+            One byte per target page covering the span: ``1`` when the page is
+            present in RAM or swapped out (either way it holds data that must
+            be read), ``0`` when the page was never touched and reading it
+            would only produce zeros. ``None`` when the answer is unknown or
+            the method is unsupported, in which case the caller must read the
+            whole span. Implementations never raise.
+        """
+        ...
+
+    def residency_method(self) -> str:
+        """How residency is determined: ``"pagemap"``, ``"mincore"`` or ``"none"``.
+
+        ``"mincore"`` cannot see swapped pages, so bridges only report it when
+        the target has nothing in swap; ``"none"`` means
+        :meth:`query_residency` always answers ``None``.
+        """
+        ...
+
+
+@runtime_checkable
+class ThreadStackCapable(Protocol):
+    """Optional bridge capability: the current stack pointer of every thread.
+
+    Lets the caller rank the live part of each stack above the rest. Bridges
+    are not required to implement this.
+    """
+
+    def enumerate_stack_pointers(self) -> list[int]:
+        """Current SP of every thread in the target, ``[]`` when unavailable.
+
+        Implementations never raise; a thread whose SP cannot be read is left
+        out rather than reported as zero.
+        """
+        ...
+
+
+@runtime_checkable
 class DebuggerBridge(Protocol):
     """Protocol for debugger backends.
 
