@@ -14,7 +14,7 @@ import pytest
 from memslicer.acquirer.bridge import MemoryRange
 from memslicer.acquirer.engine import build_vas_entries
 from memslicer.msl.constants import (
-    COMPRESSED, ArchType, BlockType, CompAlgo, OSType, RegionType,
+    COMPRESSED, ArchType, BlockType, CompAlgo, OSType, RegionType, VasNameSource,
 )
 from memslicer.msl.iterator import iterate_blocks
 from memslicer.msl.types import FileHeader, ProcessIdentity, VasEntry
@@ -25,8 +25,9 @@ from memslicer.utils.timestamps import now_ns
 
 SAMPLE_ENTRIES = [
     VasEntry(0x12c00000, 0x2000000, 3, RegionType.Heap,
-             "[anon:dalvik-main space (region space)]"),
-    VasEntry(0x70000000, 0x1000, 3, RegionType.Anon, "[anon:dalvik-zygote space]"),
+             "[anon:dalvik-main space (region space)]", VasNameSource.LIVE),
+    VasEntry(0x70000000, 0x1000, 3, RegionType.Anon, "[anon:dalvik-zygote space]",
+             name_source=VasNameSource.SYNTHESIZED),
     VasEntry(0x7f0000000000, 0x21000, 3, RegionType.Heap, "[anon:scudo:primary]"),
     VasEntry(0x7f1000000000, 0x1000, 5, RegionType.Image,
              "/apex/com.android.runtime/lib64/bionic/libc.so"),
@@ -87,15 +88,29 @@ class TestVasPathBytes:
 
 class TestPackVasEntry:
     def test_exact_layout(self):
-        e = VasEntry(0x1122334455667788, 0x2000, 5, RegionType.Image, "/lib/a.so")
+        e = VasEntry(0x1122334455667788, 0x2000, 5, RegionType.Image, "/lib/a.so",
+                     VasNameSource.LIVE)
         raw = _pack_vas_entry(e)
-        assert raw[:24] == struct.pack("<QQBBH4x", 0x1122334455667788, 0x2000, 5, 3, 10)
+        assert raw[:24] == struct.pack("<QQBBHB3x", 0x1122334455667788, 0x2000, 5, 3, 10, 1)
         assert raw[24:] == b"/lib/a.so\x00" + b"\x00" * 6
         assert len(raw) % 8 == 0
 
+    def test_name_source_at_offset_0x14(self):
+        """NameSource occupies the first former reserved byte (spec Section 5.8)."""
+        for source in VasNameSource:
+            raw = _pack_vas_entry(VasEntry(0x1000, 0x1000, 3, RegionType.Anon, "", source))
+            assert raw[0x14] == int(source)
+            assert raw[0x15:0x18] == b"\x00" * 3
+
+    def test_default_name_source_is_unspecified(self):
+        """Positional 5-argument construction still works and writes 0."""
+        raw = _pack_vas_entry(VasEntry(0x1000, 0x1000, 3, RegionType.Anon, ""))
+        assert raw[0x14] == 0
+        assert raw == struct.pack("<QQBBH4x", 0x1000, 0x1000, 3, 5, 0)  # 1.0 bytes
+
     def test_no_path_has_zero_len_and_no_tail(self):
         raw = _pack_vas_entry(VasEntry(0x1000, 0x1000, 3, RegionType.Anon, ""))
-        assert raw == struct.pack("<QQBBH4x", 0x1000, 0x1000, 3, 5, 0)
+        assert raw == struct.pack("<QQBBHB3x", 0x1000, 0x1000, 3, 5, 0, 0)
 
     def test_exact_multiple_of_eight_gets_full_pad_word(self):
         raw = _pack_vas_entry(VasEntry(0, 0, 0, RegionType.Unknown, "y" * 8))
@@ -109,7 +124,12 @@ class TestPackVasEntry:
         raw = _pack_vas_entry(e)
         got, consumed = _read_vas_entry(raw, 0)
         assert got == e
+        assert got.name_source is VasNameSource.LIVE
         assert consumed == len(raw)
+
+    def test_read_unknown_name_source_kept_as_int(self):
+        raw = struct.pack("<QQBBHB3x", 0x1000, 0x1000, 3, 5, 0, 0x7E)
+        assert _read_vas_entry(raw, 0)[0].name_source == 0x7E
 
     def test_read_truncated_raises(self):
         with pytest.raises(ValueError):
@@ -130,7 +150,7 @@ class TestParseVasMap:
         assert parse_vas_map(payload) == [e, e]
 
     def test_unknown_region_type_kept_as_int(self):
-        payload = struct.pack("<II", 1, 0) + struct.pack("<QQBBH4x", 0, 0, 0, 0x42, 0)
+        payload = struct.pack("<II", 1, 0) + struct.pack("<QQBBHB3x", 0, 0, 0, 0x42, 0, 0)
         assert parse_vas_map(payload)[0].region_type == 0x42
 
 
@@ -179,9 +199,11 @@ class TestMemDiverDecoderCompat:
         payload = _vas_blocks(_write(SAMPLE_ENTRIES, comp))[0].payload
         vas = decoders.decode_vas_map(None, payload, "<")
         assert vas.entry_count == len(SAMPLE_ENTRIES)
-        got = [(e.base_addr, e.region_size, e.protection, e.region_type, e.mapped_path)
+        got = [(e.base_addr, e.region_size, e.protection, e.region_type, e.mapped_path,
+                e.name_source)
                for e in vas.entries]
-        want = [(e.base_addr, e.region_size, e.protection, int(e.region_type), e.mapped_path)
+        want = [(e.base_addr, e.region_size, e.protection, int(e.region_type), e.mapped_path,
+                 int(e.name_source))
                 for e in SAMPLE_ENTRIES]
         assert got == want
 
@@ -190,7 +212,8 @@ class TestMemDiverDecoderCompat:
         mdtypes = pytest.importorskip("memdiver.msl.types")
         md_entries = [
             mdtypes.MslVasEntry(e.base_addr, e.region_size, e.protection,
-                                int(e.region_type), e.mapped_path)
+                                int(e.region_type), e.mapped_path,
+                                name_source=int(e.name_source))
             for e in SAMPLE_ENTRIES
         ]
         theirs = mdwriter._build_vas_map_payload(md_entries)
@@ -214,11 +237,20 @@ class TestBuildVasEntries:
         ]
         got = build_vas_entries(ranges, 4096)
         assert [e.base_addr for e in got] == [0x1000, 0x5000, 0x9000]
-        assert got[0] == VasEntry(0x1000, 0x1000, 5, RegionType.Image, "/system/lib64/libc.so")
-        assert got[1] == VasEntry(0x5000, 0x1000, 0, RegionType.Anon, "")
+        # Names enumerated from the running target are LIVE (spec Section 5.8).
+        assert got[0] == VasEntry(0x1000, 0x1000, 5, RegionType.Image,
+                                  "/system/lib64/libc.so", VasNameSource.LIVE)
+        assert got[1] == VasEntry(0x5000, 0x1000, 0, RegionType.Anon, "",
+                                  VasNameSource.LIVE)
         assert got[2].region_size == 4096  # page-rounded like region blocks
         assert got[2].region_type == RegionType.Heap
         assert got[2].mapped_path == "[anon:dalvik-main space (region space)]"
 
     def test_empty(self):
         assert build_vas_entries([], 4096) == []
+
+    def test_name_source_defaults_to_live_and_can_be_overridden(self):
+        ranges = [MemoryRange(base=0x1000, size=0x1000, protection="r--", file_path="")]
+        assert build_vas_entries(ranges, 4096)[0].name_source is VasNameSource.LIVE
+        got = build_vas_entries(ranges, 4096, name_source=VasNameSource.SYNTHESIZED)
+        assert got[0].name_source is VasNameSource.SYNTHESIZED

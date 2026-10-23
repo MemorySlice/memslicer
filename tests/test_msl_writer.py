@@ -22,7 +22,7 @@ from memslicer.utils.timestamps import now_ns
 def header():
     return FileHeader(
         endianness=1,
-        version=(1, 0),
+        version=(1, 1),
         flags=0,
         cap_bitmap=0x03,
         dump_uuid=uuid.uuid4().bytes,
@@ -72,9 +72,9 @@ class TestMinimalMSL:
         writer.finalize()
 
         data = buf.getvalue()
-        # Version is uint16 LE with major in high byte: v1.0 = 0x0100 → LE bytes [0x00, 0x01]
+        # Version is uint16 LE with major in high byte: v1.1 = 0x0101 → LE bytes [0x01, 0x01]
         version = struct.unpack_from("<H", data, 10)[0]
-        assert version == 0x0100  # major=1, minor=0
+        assert version == 0x0101  # major=1, minor=1
 
     def test_eoc_block_starts_at_64(self, header):
         buf = io.BytesIO()
@@ -268,6 +268,50 @@ class TestIntegrityChain:
         block0_bytes = data[HEADER_SIZE:HEADER_SIZE + block0_len]
         prev_hash_1_offset = block1_start + 48
         assert data[prev_hash_1_offset:prev_hash_1_offset + 32] == blake3.blake3(block0_bytes).digest()
+
+
+class TestPageDataLengthValidation:
+    """Spec Table 24: page data is exactly PageSize bytes per Captured page."""
+
+    def _region(self, states: list[PageState], data: bytes) -> MemoryRegion:
+        return MemoryRegion(
+            base_addr=0x1000,
+            region_size=len(states) * 4096,
+            protection=1,
+            region_type=RegionType.Anon,
+            page_size=4096,
+            timestamp_ns=now_ns(),
+            page_states=states,
+            page_data_chunks=[data],
+        )
+
+    def test_exact_data_is_accepted(self, header):
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region(
+            [PageState.CAPTURED, PageState.FAILED, PageState.CAPTURED],
+            b"\xa5" * (2 * 4096),
+        )
+        writer.write_memory_region(region)
+
+    def test_trailing_partial_page_is_rejected(self, header):
+        """The shape the Android capture produced: four Captured pages but
+        0x500 bytes short of four pages of data."""
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region([PageState.CAPTURED] * 4, b"\xa5" * (0x4000 - 0x500))
+        with pytest.raises(ValueError, match="does not match 4 captured pages"):
+            writer.write_memory_region(region)
+
+    def test_surplus_data_is_rejected(self, header):
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region([PageState.CAPTURED], b"\xa5" * (4096 + 1))
+        with pytest.raises(ValueError, match="page_data length"):
+            writer.write_memory_region(region)
+
+    def test_data_for_a_failed_page_is_rejected(self, header):
+        writer = MSLWriter(io.BytesIO(), header)
+        region = self._region([PageState.FAILED], b"\xa5" * 4096)
+        with pytest.raises(ValueError, match="0 captured pages"):
+            writer.write_memory_region(region)
 
 
 class TestPageSizeLog2Validation:

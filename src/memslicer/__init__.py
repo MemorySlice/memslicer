@@ -1,6 +1,6 @@
 """MemSlicer - Memory slice capture and analysis toolkit."""
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 from memslicer.msl.constants import (
     BlockType,

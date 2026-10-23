@@ -595,3 +595,69 @@ class TestNewBlockTypes:
     def test_related_dump_block_type_code_value(self):
         """RelatedDump enum value is 0x0041."""
         assert BlockType.RelatedDump == 0x0041
+
+
+# ===================================================================
+# 10. EndOfCapture BlockCount (spec Section 4.5)
+# ===================================================================
+
+class TestEndOfCaptureBlockCount:
+    """The 48-byte EoC payload carries the capture-segment block count."""
+
+    def _walk_blocks(self, data: bytes) -> list[tuple[int, int]]:
+        """Return ``(offset, block_type)`` for every block after the header."""
+        blocks = []
+        offset = HEADER_SIZE
+        while offset < len(data):
+            assert data[offset:offset + 4] == BLOCK_MAGIC
+            block_type = struct.unpack_from("<H", data, offset + 4)[0]
+            block_len = struct.unpack_from("<I", data, offset + 8)[0]
+            blocks.append((offset, block_type))
+            offset += block_len
+        assert offset == len(data)
+        return blocks
+
+    def _region(self, base: int) -> MemoryRegion:
+        return MemoryRegion(
+            base_addr=base,
+            region_size=4096,
+            protection=3,
+            region_type=RegionType.Image,
+            page_size=4096,
+            timestamp_ns=now_ns(),
+            page_states=[PageState.CAPTURED],
+            page_data_chunks=[b"\xCD" * 4096],
+        )
+
+    def test_eoc_block_count_matches_walk(self, header):
+        """EoC BlockCount at +0x28 counts every block incl. the EoC; header stays 0."""
+        buf = io.BytesIO()
+        writer = MSLWriter(buf, header)
+        writer.write_process_identity(ProcessIdentity(ppid=1, exe_path="/bin/sh"))
+        writer.write_memory_region(self._region(0x10000))
+        writer.write_memory_region(self._region(0x20000))
+        writer.finalize()
+        data = buf.getvalue()
+
+        blocks = self._walk_blocks(data)
+        assert len(blocks) == 4
+        eoc_offset, eoc_type = blocks[-1]
+        assert eoc_type == BlockType.EndOfCapture
+
+        eoc_len = struct.unpack_from("<I", data, eoc_offset + 8)[0]
+        payload = data[eoc_offset + BLOCK_HEADER_SIZE:eoc_offset + eoc_len]
+        assert len(payload) == 48
+        assert struct.unpack_from("<I", payload, 0x28)[0] == len(blocks)
+        assert struct.unpack_from("<I", payload, 0x2C)[0] == 0
+        assert struct.unpack_from("<I", data, 0x39)[0] == 0
+
+    def test_eoc_block_count_minimal_file(self, header):
+        """A header + EoC file counts exactly one block."""
+        data = _write_minimal(header)
+        blocks = self._walk_blocks(data)
+        assert len(blocks) == 1
+        eoc_offset, _ = blocks[0]
+        payload = data[eoc_offset + BLOCK_HEADER_SIZE:]
+        assert len(payload) == 48
+        assert struct.unpack_from("<I", payload, 0x28)[0] == 1
+        assert struct.unpack_from("<I", data, 0x39)[0] == 0

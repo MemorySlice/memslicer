@@ -1550,3 +1550,409 @@ class TestGDBBridgeEmptyRemoteTarget:
         assert GDBBridge(
             target=1234, remote="host:1234", logger=MagicMock(),
         ).is_remote is True
+
+
+# ---------------------------------------------------------------------------
+# Tests -- page residency
+# ---------------------------------------------------------------------------
+
+class TestGDBBridgeResidency:
+    """Residency comes from the local /proc/<pid>/pagemap, never remotely."""
+
+    def test_local_readable_pagemap_reports_pagemap(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+
+        with patch(
+            "memslicer.acquirer.gdb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "pagemap"
+
+        probe.assert_called_once_with(1234)
+
+    def test_local_unreadable_pagemap_reports_none(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+
+        with patch(
+            "memslicer.acquirer.gdb_bridge.pagemap_readable", return_value=False,
+        ):
+            assert bridge.residency_method() == "none"
+
+    def test_remote_target_reports_none_without_probing(self):
+        """The constructor PID names a process on this host, not the target."""
+        bridge = GDBBridge(target=1234, remote="host:5555", logger=MagicMock())
+
+        with patch(
+            "memslicer.acquirer.gdb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "none"
+
+        probe.assert_not_called()
+
+    def test_query_reads_the_local_pagemap_with_the_local_page_size(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+        bridge._send_console_command = MagicMock()
+
+        with patch(
+            "memslicer.acquirer.gdb_bridge.read_pagemap",
+            return_value=b"\x01\x00",
+        ) as reader, patch("os.sysconf", return_value=16384):
+            mask = bridge.query_residency(0x10000, 0x8000)
+
+        assert mask == b"\x01\x00"
+        reader.assert_called_once_with(1234, 0x10000, 0x8000, 16384)
+        bridge._send_console_command.assert_not_called()
+
+    def test_query_passes_an_unreadable_pagemap_through(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+
+        with patch(
+            "memslicer.acquirer.gdb_bridge.read_pagemap", return_value=None,
+        ):
+            assert bridge.query_residency(0x10000, 0x1000) is None
+
+    def test_query_remote_returns_none_without_reading(self):
+        bridge = GDBBridge(target=1234, remote="host:5555", logger=MagicMock())
+        bridge._send_console_command = MagicMock()
+
+        with patch(
+            "memslicer.acquirer.gdb_bridge.read_pagemap", return_value=b"\x01",
+        ) as reader:
+            assert bridge.query_residency(0x10000, 0x1000) is None
+
+        reader.assert_not_called()
+        bridge._send_console_command.assert_not_called()
+
+    def test_bridge_satisfies_residency_capable(self):
+        from memslicer.acquirer.bridge import ResidencyCapable
+
+        assert isinstance(GDBBridge(target=1234, logger=MagicMock()), ResidencyCapable)
+
+
+# ---------------------------------------------------------------------------
+# Tests -- thread stack pointers
+# ---------------------------------------------------------------------------
+
+class TestGDBBridgeStackPointers:
+    """"thread apply all p/x $sp" yields one value line per thread."""
+
+    def test_parses_one_sp_per_thread_and_ignores_headers(self):
+        """The thread headers carry a pthread handle in hex; it is not an SP."""
+        bridge = _console_bridge(
+            'Thread 2 (Thread 0x7ffff7a2d700 (LWP 5679) "worker"):\n'
+            "$1 = 0x7ffff7a2ce50\n"
+            "\n"
+            'Thread 1 (Thread 0x7ffff7d8a740 (LWP 5678) "main"):\n'
+            "$2 = 0x7fffffffe3a0\n"
+        )
+
+        pointers = bridge.enumerate_stack_pointers()
+
+        assert pointers == [0x7ffff7a2ce50, 0x7fffffffe3a0]
+        bridge._send_console_command.assert_called_once_with(
+            "thread apply all p/x $sp"
+        )
+
+    def test_quiet_output_without_headers_parses_the_same(self):
+        bridge = _console_bridge("$1 = 0x7ffff7a2ce50\n$2 = 0x7fffffffe3a0\n")
+
+        assert bridge.enumerate_stack_pointers() == [0x7ffff7a2ce50, 0x7fffffffe3a0]
+
+    def test_duplicates_are_dropped_and_order_kept(self):
+        bridge = _console_bridge("$1 = 0x20\n$2 = 0x10\n$3 = 0x20\n")
+
+        assert bridge.enumerate_stack_pointers() == [0x20, 0x10]
+
+    def test_no_value_lines_gives_empty(self):
+        bridge = _console_bridge("No threads.\n")
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_mi_error_gives_empty(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+        bridge._send_console_command = MagicMock(side_effect=MIError("No threads."))
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_timeout_gives_empty(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+        bridge._send_console_command = MagicMock(side_effect=TimeoutError("slow"))
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_before_connect_gives_empty(self):
+        """Without a GDB process the transport raises RuntimeError."""
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_bridge_satisfies_thread_stack_capable(self):
+        from memslicer.acquirer.bridge import ThreadStackCapable
+
+        assert isinstance(GDBBridge(target=1234, logger=MagicMock()), ThreadStackCapable)
+
+
+# ---------------------------------------------------------------------------
+# Tests -- thread enumeration with registers
+# ---------------------------------------------------------------------------
+
+_ARCH_X86_64_REPLY = (
+    'The target architecture is set to "auto" (currently "i386:x86-64").\n'
+)
+
+_INFO_THREADS_TWO = (
+    "  Id   Target Id                                   Frame \n"
+    '* 1    Thread 0x7ffff7d8a740 (LWP 5678) "main"   main () at x.c:5\n'
+    '  2    Thread 0x7ffff7a2d700 (LWP 5679) "worker" worker (arg=0x0) at x.c:12\n'
+)
+
+_REGISTERS_MAIN = (
+    'Thread 1 (Thread 0x7ffff7d8a740 (LWP 5678) "main"):\n'
+    "rax            0x555555555131      93824992235825\n"
+    "rbx            0x7fffffffe4b8      140737488348344\n"
+    "rsp            0x7fffffffe3a0      0x7fffffffe3a0\n"
+    "rbp            0x7fffffffe3b0      0x7fffffffe3b0\n"
+    "rip            0x555555555131      0x555555555131 <main+8>\n"
+    "eflags         0x246               [ IF ZF PF ]\n"
+    "cs             0x33                51\n"
+    "fs_base        0x7ffff7d8a740      140737351558976\n"
+    "k0             0x0                 0\n"
+    "xmm0           {v8_bfloat16 = {0, 0, 0, 0, 0, 0, 0, 0}, v4_float = {0, 0, 0, 0}}\n"
+    "st0            0                   (raw 0x00000000000000000000)\n"
+)
+
+_REGISTERS_WORKER = (
+    "\n"
+    'Thread 2 (Thread 0x7ffff7a2d700 (LWP 5679) "worker"):\n'
+    "rax            0xfffffffffffffdfc  -516\n"
+    "rbx            0x0                 0\n"
+    "rsp            0x7ffff7a2ce50      0x7ffff7a2ce50\n"
+    "rbp            0x7ffff7a2ce70      0x7ffff7a2ce70\n"
+    "rip            0x7ffff7e5a3bf      0x7ffff7e5a3bf <clock_nanosleep+95>\n"
+    "eflags         0x293               [ CF AF SF IF ]\n"
+    "cs             0x33                51\n"
+    "fs_base        0x7ffff7a2d700      140737348098816\n"
+    "k0             0x0                 0\n"
+)
+
+
+def _register(thread, name):
+    """The register named *name* in *thread*, or None."""
+    return next((r for r in thread.registers if r.name == name), None)
+
+
+class TestGDBBridgeEnumerateThreads:
+    """"info threads" joined with "thread apply all info registers"."""
+
+    def test_two_threads_with_registers(self):
+        from memslicer.msl.constants import (
+            REG_ROLE_FLAGS, REG_ROLE_FP, REG_ROLE_PC, REG_ROLE_SP, REG_ROLE_TLS,
+            ThreadState,
+        )
+
+        bridge = _console_bridge(
+            _INFO_THREADS_TWO, _REGISTERS_MAIN + _REGISTERS_WORKER,
+        )
+        bridge._arch_cache = ArchType.x86_64
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [5678, 5679]
+        assert [t.name for t in threads] == ["main", "worker"]
+        assert all(t.suspended is True for t in threads)
+        assert all(t.state == ThreadState.STOPPED for t in threads)
+        assert all(t.partial is False for t in threads)
+        main = threads[0]
+        assert _register(main, "rip").role == REG_ROLE_PC
+        assert _register(main, "rsp").role == REG_ROLE_SP
+        assert _register(main, "rbp").role == REG_ROLE_FP
+        assert _register(main, "eflags").role == REG_ROLE_FLAGS
+        assert _register(main, "fs_base").role == REG_ROLE_TLS
+        assert _register(main, "rax").role == 0
+        assert _register(main, "rip").width == 8
+        assert _register(main, "rip").value == (0x555555555131).to_bytes(8, "little")
+        assert _register(main, "eflags").value == (0x246).to_bytes(8, "little")
+        assert _register(main, "cs").as_int == 0x33
+        assert _register(main, "xmm0") is None
+        assert _register(main, "st0") is None
+        assert _register(threads[1], "rsp").as_int == 0x7ffff7a2ce50
+        assert _register(threads[1], "rax").as_int == 0xfffffffffffffdfc
+        assert [c.args[0] for c in bridge._send_console_command.call_args_list] == [
+            "info threads", "thread apply all info registers",
+        ]
+
+    def test_uncached_arch_is_asked_first(self):
+        bridge = _console_bridge(
+            _ARCH_X86_64_REPLY, _INFO_THREADS_TWO, _REGISTERS_MAIN + _REGISTERS_WORKER,
+        )
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [5678, 5679]
+        assert bridge._arch_cache == ArchType.x86_64
+        assert [c.args[0] for c in bridge._send_console_command.call_args_list] == [
+            "show architecture", "info threads", "thread apply all info registers",
+        ]
+
+    def test_process_target_form_uses_process_id(self):
+        bridge = _console_bridge(
+            "  Id   Target Id         Frame \n"
+            "* 1    process 1234      main () at x.c:5\n",
+            "Thread 1 (process 1234):\n" + _REGISTERS_MAIN.split("\n", 1)[1],
+        )
+        bridge._arch_cache = ArchType.x86_64
+
+        threads = bridge.enumerate_threads()
+
+        assert len(threads) == 1
+        assert threads[0].tid == 1234
+        assert threads[0].name == ""
+
+    def test_running_row_is_running_and_not_suspended(self):
+        from memslicer.msl.constants import ThreadState
+
+        bridge = _console_bridge(
+            "  Id   Target Id                                   Frame \n"
+            '* 1    Thread 0x7ffff7d8a740 (LWP 5678) "main"   (running)\n',
+            _REGISTERS_MAIN,
+        )
+        bridge._arch_cache = ArchType.x86_64
+
+        threads = bridge.enumerate_threads()
+
+        assert len(threads) == 1
+        assert threads[0].state == ThreadState.RUNNING
+        assert threads[0].suspended is False
+
+    def test_arm64_roles(self):
+        from memslicer.msl.constants import (
+            REG_ROLE_FLAGS, REG_ROLE_FP, REG_ROLE_LR, REG_ROLE_PC, REG_ROLE_SP,
+        )
+
+        bridge = _console_bridge(
+            "  Id   Target Id                              Frame \n"
+            '* 1    Thread 0x7fb7ff5f00 (LWP 4242) "app"   main () at a.c:3\n',
+            'Thread 1 (Thread 0x7fb7ff5f00 (LWP 4242) "app"):\n'
+            "x0             0x1                 1\n"
+            "x29            0x7fffffe6b0        549755810480\n"
+            "x30            0x5555550784        366503987076\n"
+            "sp             0x7fffffe6b0        0x7fffffe6b0\n"
+            "pc             0x5555550798        0x5555550798 <main+20>\n"
+            "cpsr           0x60001000          [ EL=0 BTYPE=0 SSBS C Z ]\n"
+            "fpsr           0x0                 0\n",
+        )
+        bridge._arch_cache = ArchType.ARM64
+
+        threads = bridge.enumerate_threads()
+
+        assert len(threads) == 1
+        thread = threads[0]
+        assert thread.tid == 4242
+        assert _register(thread, "pc").role == REG_ROLE_PC
+        assert _register(thread, "sp").role == REG_ROLE_SP
+        assert _register(thread, "x29").role == REG_ROLE_FP
+        assert _register(thread, "x30").role == REG_ROLE_LR
+        assert _register(thread, "cpsr").role == REG_ROLE_FLAGS
+        assert _register(thread, "x0").role == 0
+        assert _register(thread, "fpsr").role == 0
+        assert _register(thread, "pc").as_int == 0x5555550798
+
+    def test_thread_without_sp_is_skipped(self):
+        worker_without_rsp = _REGISTERS_WORKER.replace(
+            "rsp            0x7ffff7a2ce50      0x7ffff7a2ce50\n", "",
+        )
+        bridge = _console_bridge(
+            _INFO_THREADS_TWO, _REGISTERS_MAIN + worker_without_rsp,
+        )
+        bridge._arch_cache = ArchType.x86_64
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [5678]
+
+    def test_thread_without_register_section_is_skipped(self):
+        bridge = _console_bridge(_INFO_THREADS_TWO, _REGISTERS_MAIN)
+        bridge._arch_cache = ArchType.x86_64
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [5678]
+
+    def test_value_wider_than_register_is_skipped(self):
+        bridge = _console_bridge(
+            _INFO_THREADS_TWO.splitlines(keepends=True)[0]
+            + _INFO_THREADS_TWO.splitlines(keepends=True)[1],
+            _REGISTERS_MAIN
+            + "ymm0h          0x0123456789abcdef0123456789abcdef  {...}\n",
+        )
+        bridge._arch_cache = ArchType.x86_64
+
+        threads = bridge.enumerate_threads()
+
+        assert len(threads) == 1
+        assert _register(threads[0], "ymm0h") is None
+        assert _register(threads[0], "rip") is not None
+
+    def test_no_threads_gives_empty_without_asking_registers(self):
+        bridge = _console_bridge("No threads.\n")
+        bridge._arch_cache = ArchType.x86_64
+
+        assert bridge.enumerate_threads() == []
+        bridge._send_console_command.assert_called_once_with("info threads")
+
+    def test_mi_error_gives_empty(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+        bridge._arch_cache = ArchType.x86_64
+        bridge._send_console_command = MagicMock(side_effect=MIError("No threads."))
+
+        assert bridge.enumerate_threads() == []
+
+    def test_timeout_gives_empty(self):
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+        bridge._arch_cache = ArchType.x86_64
+        bridge._send_console_command = MagicMock(side_effect=TimeoutError("slow"))
+
+        assert bridge.enumerate_threads() == []
+
+    def test_unparseable_architecture_gives_empty(self):
+        bridge = _console_bridge("The target architecture is set to \"vax\".\n")
+
+        assert bridge.enumerate_threads() == []
+
+    def test_before_connect_gives_empty(self):
+        """Without a GDB process the transport raises RuntimeError."""
+        bridge = GDBBridge(target=1234, logger=MagicMock())
+
+        assert bridge.enumerate_threads() == []
+
+    def test_get_platform_info_caches_architecture(self):
+        bridge = _console_bridge(_ARCH_X86_64_REPLY)
+        bridge._target_pid = MagicMock(return_value=1234)
+        bridge._detect_os = MagicMock(return_value=OSType.Linux)
+        bridge._detect_page_size = MagicMock(return_value=(4096, False))
+
+        assert bridge._arch_cache is None
+        info = bridge.get_platform_info()
+
+        assert info.arch == ArchType.x86_64
+        assert bridge._arch_cache == ArchType.x86_64
+
+    def test_cached_arch_does_not_ask_again(self):
+        bridge = _console_bridge()
+        bridge._arch_cache = ArchType.ARM64
+
+        assert bridge._cached_arch() == ArchType.ARM64
+        bridge._send_console_command.assert_not_called()
+
+    def test_cached_arch_asks_once_when_empty(self):
+        bridge = _console_bridge(_ARCH_X86_64_REPLY)
+
+        assert bridge._cached_arch() == ArchType.x86_64
+        assert bridge._cached_arch() == ArchType.x86_64
+        bridge._send_console_command.assert_called_once_with("show architecture")
+
+    def test_bridge_satisfies_thread_registers_capable(self):
+        from memslicer.acquirer.bridge import ThreadRegistersCapable
+
+        assert isinstance(
+            GDBBridge(target=1234, logger=MagicMock()), ThreadRegistersCapable,
+        )

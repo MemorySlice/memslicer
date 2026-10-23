@@ -9,18 +9,20 @@ from typing import BinaryIO, Callable
 
 from memslicer.msl.constants import (
     FILE_MAGIC, BLOCK_MAGIC, HEADER_SIZE, ENCRYPTED_HEADER_SIZE,
-    BLOCK_HEADER_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
+    BLOCK_HEADER_SIZE, HASH_SIZE, HAS_CHILDREN, COMPRESSED, COMPALGO_MASK,
     CONTINUATION, FLAG_ENCRYPTED, BlockType, CompAlgo, PageState,
     PAGE_SIZE_LOG2_MIN, PAGE_SIZE_LOG2_MAX, valid_page_size,
-    RegionType, OmissionReason,
+    RegionType, OmissionReason, VasNameSource, ThreadState,
+    EXTENSION_FORBIDDEN_TYPES,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, SystemContext,
     ProcessEntry, ConnectionEntry, HandleEntry, KeyHint, ImportProvenance,
     RelatedDump, KernelSymbolBundle, PhysicalMemoryMap, ConnectivityTable,
-    KernelModuleList, ModuleBuildIdManifest, TargetIntrospection,
-    PersistenceManifest, RegionOmissionManifest, RegionOmissionRow,
-    VasEntry,
+    KernelModuleList, ModuleBuildIdManifest, ModuleBuildIdRow,
+    TargetIntrospection, PersistenceManifest, RegionOmissionManifest,
+    RegionOmissionRow, VasEntry, EndOfCapture, EndOfExtension,
+    ThreadContext, ThreadRegister,
 )
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.compression import compress
@@ -184,7 +186,9 @@ def _packed_or_none(
 
 
 _VAS_PATH_MAX = 0xFFFF
-_VAS_ENTRY_HEAD = struct.Struct("<QQBBH4x")
+# BaseAddr(8) RegionSize(8) Protection(1) RegionType(1) PathLen(2)
+# NameSource(1) Reserved(3) -- spec Section 5.8.
+_VAS_ENTRY_HEAD = struct.Struct("<QQBBHB3x")
 
 
 def _vas_path_bytes(name: str) -> bytes:
@@ -212,7 +216,7 @@ def _pack_vas_entry(entry: VasEntry) -> bytes | None:
         _VAS_ENTRY_HEAD.pack(
             entry.base_addr, entry.region_size,
             int(entry.protection) & 0xFF, int(entry.region_type) & 0xFF,
-            len(path),
+            len(path), int(entry.name_source) & 0xFF,
         )
     ))
     return None if head is None else head + pad_bytes(path)
@@ -244,7 +248,7 @@ def _read_vas_entry(payload: bytes, offset: int) -> tuple[VasEntry, int]:
     """Read one entry at *offset*; return ``(entry, bytes_consumed)``."""
     if offset + _VAS_ENTRY_HEAD.size > len(payload):
         raise ValueError("VASMap entry truncated")
-    base, size, prot, rtype, path_len = _VAS_ENTRY_HEAD.unpack_from(payload, offset)
+    base, size, prot, rtype, path_len, source = _VAS_ENTRY_HEAD.unpack_from(payload, offset)
     start = offset + _VAS_ENTRY_HEAD.size
     if start + path_len > len(payload):
         raise ValueError("VASMap entry path truncated")
@@ -253,8 +257,155 @@ def _read_vas_entry(payload: bytes, offset: int) -> tuple[VasEntry, int]:
         base_addr=base, region_size=size, protection=prot,
         region_type=_enum_or_int(RegionType, rtype),
         mapped_path=raw.decode("utf-8", errors="replace"),
+        name_source=_enum_or_int(VasNameSource, source),
     )
     return entry, _VAS_ENTRY_HEAD.size + pad8(path_len)
+
+
+# FileHash(32) AcqEnd(8) BlockCount(4) Reserved(4) -- spec Section 4.5.
+_EOC_LEGACY_SIZE = 40
+_EOC_SIZE = 48
+# SegmentHash(32) WrittenAt(8) BlockCount(4) Reserved(4) ProducerLen(2)
+# Reserved(6) -- spec Section 4.6; Producer (pad8) follows.
+_EOX_HEAD = struct.Struct("<32sQIIH6x")
+# ThreadID(8) StartTime(8) Flags(2) ThreadState(1) Arch(1) RegCount(4)
+# NameLen(2) Reserved(6) -- spec Table 19a; ThreadName (pad8) follows.
+_TC_HEAD = struct.Struct("<QQHBBIH6x")
+# NameLen(1) Width(1) Flags(2) Reserved(4) -- spec Table 19b; Name (pad8)
+# and Value (pad8) follow.
+_TC_REG_HEAD = struct.Struct("<BBH4x")
+_MODULE_BUILD_ID_ROW = 64
+
+
+def parse_end_of_capture(payload: bytes) -> EndOfCapture:
+    """Parse an End-of-Capture (0x0FFF) payload.
+
+    Accepts the legacy 40-byte form (BlockCount unknown, reported as 0)
+    and the 1.1 form with BlockCount at ``+0x28``.
+
+    Raises:
+        ValueError: if the payload is shorter than the legacy form.
+    """
+    if len(payload) < _EOC_LEGACY_SIZE:
+        raise ValueError("EndOfCapture payload truncated")
+    acq_end_ns = struct.unpack_from("<Q", payload, 0x20)[0]
+    block_count = (
+        struct.unpack_from("<I", payload, 0x28)[0]
+        if len(payload) >= 0x2C else 0
+    )
+    return EndOfCapture(
+        file_hash=bytes(payload[:HASH_SIZE]), acq_end_ns=acq_end_ns,
+        block_count=block_count,
+    )
+
+
+def parse_end_of_extension(payload: bytes) -> EndOfExtension:
+    """Parse an End-of-Extension (0x0FFE) payload.
+
+    Inverse of :meth:`MSLWriter.finalize_extension`.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < _EOX_HEAD.size:
+        raise ValueError("EndOfExtension payload truncated")
+    segment_hash, written_at, count, _reserved, producer_len = (
+        _EOX_HEAD.unpack_from(payload, 0)
+    )
+    start = _EOX_HEAD.size
+    if start + producer_len > len(payload):
+        raise ValueError("EndOfExtension producer truncated")
+    producer = _decode_nul_string(payload[start:start + producer_len])
+    return EndOfExtension(
+        segment_hash=segment_hash, written_at_ns=written_at,
+        block_count=count, producer=producer,
+    )
+
+
+def parse_module_build_id_manifest(payload: bytes) -> ModuleBuildIdManifest:
+    """Parse a ModuleBuildIdManifest (0x005A) payload.
+
+    Inverse of :meth:`MSLWriter.write_module_build_id_manifest` (fixed
+    64-byte rows after a ``Count(4) Reserved(4)`` preamble).
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < 8:
+        raise ValueError("ModuleBuildIdManifest payload truncated")
+    count = struct.unpack_from("<I", payload, 0)[0]
+    if 8 + count * _MODULE_BUILD_ID_ROW > len(payload):
+        raise ValueError("ModuleBuildIdManifest rows truncated")
+    rows = [
+        _read_module_build_id_row(payload, 8 + i * _MODULE_BUILD_ID_ROW)
+        for i in range(count)
+    ]
+    return ModuleBuildIdManifest(rows=rows)
+
+
+def _read_module_build_id_row(payload: bytes, offset: int) -> ModuleBuildIdRow:
+    """Decode one 64-byte manifest row at *offset*."""
+    base, build_id_len, source, flags, _reserved = struct.unpack_from(
+        "<QBBBB", payload, offset,
+    )
+    build_id = bytes(payload[offset + 12:offset + 32][:build_id_len])
+    disk_hash = bytes(payload[offset + 32:offset + 64])
+    return ModuleBuildIdRow(
+        base_addr=base, build_id_len=build_id_len, build_id_source=source,
+        flags=flags, build_id=build_id, disk_hash=disk_hash,
+    )
+
+
+def parse_thread_context(payload: bytes) -> ThreadContext:
+    """Parse a Thread Context (0x0011) payload.
+
+    Inverse of :meth:`MSLWriter.write_thread_context`.
+
+    Raises:
+        ValueError: if the payload is truncated.
+    """
+    if len(payload) < _TC_HEAD.size:
+        raise ValueError("ThreadContext payload truncated")
+    tid, start_ns, flags, state, arch, reg_count, name_len = (
+        _TC_HEAD.unpack_from(payload, 0)
+    )
+    offset = _TC_HEAD.size
+    name = _decode_nul_string(_slice_checked(payload, offset, name_len, "ThreadName"))
+    offset += pad8(name_len)
+    registers: list[ThreadRegister] = []
+    for _ in range(reg_count):
+        register, offset = _read_thread_register(payload, offset)
+        registers.append(register)
+    return ThreadContext(
+        thread_id=tid, start_time_ns=start_ns, flags=flags,
+        state=_enum_or_int(ThreadState, state), arch=arch, name=name,
+        registers=registers,
+    )
+
+
+def _read_thread_register(payload: bytes, offset: int) -> tuple[ThreadRegister, int]:
+    """Read one Table 19b register entry; return ``(register, next_offset)``."""
+    if offset + _TC_REG_HEAD.size > len(payload):
+        raise ValueError("ThreadContext register truncated")
+    name_len, width, flags = _TC_REG_HEAD.unpack_from(payload, offset)
+    offset += _TC_REG_HEAD.size
+    name = _decode_nul_string(_slice_checked(payload, offset, name_len, "register name"))
+    offset += pad8(name_len)
+    value = _slice_checked(payload, offset, width, "register value")
+    offset += pad8(width)
+    return ThreadRegister(name=name, width=width, flags=flags, value=value), offset
+
+
+def _slice_checked(payload: bytes, offset: int, length: int, what: str) -> bytes:
+    """Return ``payload[offset:offset+length]``, refusing to run past the end."""
+    if offset + length > len(payload):
+        raise ValueError(f"ThreadContext {what} truncated")
+    return bytes(payload[offset:offset + length])
+
+
+def _decode_nul_string(raw: bytes) -> str:
+    """Decode a NUL-terminated UTF-8 field, tolerating a missing terminator."""
+    return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
 
 
 def _bounded_or_absent(value: str) -> tuple[bytes, int]:
@@ -290,6 +441,30 @@ def _warn_if_truncated(field: str, original: str, stored_len: int) -> None:
         )
 
 
+_REG_NAME_MAX = 0xFF  # u8 NameLen, terminator included
+_REG_WIDTH_MAX = 0xFF  # u8 Width
+
+
+def _pack_thread_register(reg: ThreadRegister) -> bytes:
+    """Pack one Table 19b register entry (name lowercased, value pad8).
+
+    Raises:
+        ValueError: see :meth:`MSLWriter.write_thread_context`.
+    """
+    raw_name = reg.name.lower().encode("utf-8") + b"\x00"
+    if len(raw_name) <= 1 or len(raw_name) > _REG_NAME_MAX:
+        raise ValueError(f"register name {reg.name!r} must be 1..254 bytes")
+    if not 1 <= reg.width <= _REG_WIDTH_MAX:
+        raise ValueError(f"register {reg.name!r} width {reg.width} not in 1..255")
+    if len(reg.value) != reg.width:
+        raise ValueError(
+            f"register {reg.name!r} value holds {len(reg.value)} bytes, "
+            f"width says {reg.width}"
+        )
+    head = _TC_REG_HEAD.pack(len(raw_name), reg.width, reg.flags)
+    return head + pad_bytes(raw_name) + pad_bytes(reg.value)
+
+
 class MSLWriter:
     """Streaming writer for MSL format files.
 
@@ -309,15 +484,25 @@ class MSLWriter:
         comp_algo: CompAlgo = CompAlgo.NONE,
         encryption_key: bytes | None = None,
         encryption_params: "EncryptionParams | None" = None,
+        *,
+        _resume_chain: IntegrityChain | None = None,
+        _resume_block_index: int = 0,
+        _resume_after_eoc: bool = False,
     ) -> None:
         self._output = output
         self._header = header
         self._comp_algo = comp_algo
-        self._chain = IntegrityChain(hash_algo=header.hash_algo)
-        self._block_index: int = 0
+        self._chain = _resume_chain or IntegrityChain(hash_algo=header.hash_algo)
+        self._block_index: int = _resume_block_index
         self._encrypted = bool(encryption_key)
         self._encryption_params = None
         self._encryptor = None
+        # Segment bookkeeping (spec Section 4.6): once the EoC is written
+        # only extension segments may follow, each opened explicitly.
+        self._eoc_written: bool = _resume_after_eoc
+        self._in_extension: bool = False
+        self._segment_blocks: int = 0
+        self._sealed: bool = False
 
         # Pre-compute compression flags (constant per writer instance)
         if comp_algo != CompAlgo.NONE:
@@ -335,6 +520,11 @@ class MSLWriter:
             self._encryption_params = encryption_params
             self._encryption_key = encryption_key
 
+        if _resume_chain is not None:
+            # Continuing an existing file: its header is already on disk
+            # and already folded into the supplied chain.
+            return
+
         self._write_header()
 
         if self._encrypted:
@@ -343,6 +533,69 @@ class MSLWriter:
                 nonce=self._encryption_params.nonce,
                 aad=self._header_bytes,
             )
+
+    @classmethod
+    def resume(
+        cls,
+        output: BinaryIO,
+        header: FileHeader,
+        chain: IntegrityChain,
+        block_index: int,
+        comp_algo: CompAlgo = CompAlgo.NONE,
+    ) -> "MSLWriter":
+        """Return a writer that appends blocks to an existing, unencrypted file.
+
+        No file header is written. ``chain`` must already have been fed
+        the existing file's header and every block that precedes the
+        append point (spec Section 4.4), so the next block's PrevHash and
+        the EndOfCapture FileHash continue the original chain.
+        ``block_index`` is the number of blocks already in the file; it
+        keeps block-position checks (e.g. ProcessIdentity in Block 0)
+        accurate.
+
+        Args:
+            output: Stream positioned where the next block belongs.
+            header: Header of the existing file (supplies ``hash_algo``).
+            chain: Integrity chain seeded from the existing bytes.
+            block_index: Count of blocks already in the file.
+            comp_algo: Compression for the appended blocks.
+        """
+        return cls(
+            output, header, comp_algo,
+            _resume_chain=chain, _resume_block_index=block_index,
+        )
+
+    @classmethod
+    def extend(
+        cls,
+        output: BinaryIO,
+        header: FileHeader,
+        chain: IntegrityChain,
+        block_index: int,
+        comp_algo: CompAlgo = CompAlgo.NONE,
+    ) -> "MSLWriter":
+        """Return a writer that appends extension segments to a finished file.
+
+        Like :meth:`resume`, but the capture segment is treated as closed:
+        :meth:`finalize` refuses to write a second EndOfCapture and blocks
+        are accepted only between :meth:`begin_extension` and
+        :meth:`finalize_extension` (spec Section 4.6). ``chain`` must have
+        been fed the header, every capture-segment block including the
+        EoC, and every existing extension segment, so the chain continues
+        linearly across segments.
+
+        Args:
+            output: Stream positioned at the end of the last valid segment.
+            header: Header of the existing file (supplies ``hash_algo``).
+            chain: Integrity chain seeded from every existing byte.
+            block_index: Count of blocks already in the file.
+            comp_algo: Compression for the appended blocks.
+        """
+        return cls(
+            output, header, comp_algo,
+            _resume_chain=chain, _resume_block_index=block_index,
+            _resume_after_eoc=True,
+        )
 
     # ------------------------------------------------------------------
     # File header
@@ -438,7 +691,13 @@ class MSLWriter:
         """Write a complete block and update the integrity chain.
 
         Returns the block's UUID.
+
+        Raises:
+            ValueError: if the block is not allowed where the writer
+                currently is (spec Section 4.6): evidence blocks inside an
+                extension segment, or any block after the EoC outside one.
         """
+        self._check_segment_rules(block_type)
         if block_uuid is None:
             block_uuid = uuid.uuid4().bytes
         if parent_uuid is None:
@@ -452,10 +711,10 @@ class MSLWriter:
             uncompressed_size = len(padded_payload)
             comp_algo = CompAlgo((flags & COMPALGO_MASK) >> 1)
             compressed_data = compress(padded_payload, comp_algo)
-            # On-disk: UncompressedSize(8B) + CompressedData, padded to 8B
-            on_disk_payload = pad_bytes(
-                struct.pack("<Q", uncompressed_size) + compressed_data
-            )
+            # On-disk: UncompressedSize(8B) + CompressedData, NOT padded.
+            # Spec Section 4.2.1 Table 9: BlockLength = 80 + 8 +
+            # len(CompressedData); lz4 also rejects trailing padding.
+            on_disk_payload = struct.pack("<Q", uncompressed_size) + compressed_data
         else:
             on_disk_payload = padded_payload
 
@@ -497,7 +756,23 @@ class MSLWriter:
             self._output.write(on_disk_payload)
         self._chain.feed_block_parts(block_header, on_disk_payload)
         self._block_index += 1
+        if self._in_extension:
+            self._segment_blocks += 1
         return block_uuid
+
+    def _check_segment_rules(self, block_type: BlockType) -> None:
+        """Refuse a block the current segment position does not admit."""
+        if self._in_extension:
+            if int(block_type) in EXTENSION_FORBIDDEN_TYPES:
+                raise ValueError(
+                    f"block type 0x{int(block_type):04X} is evidence and may "
+                    "not appear in an extension segment (spec Section 4.6)"
+                )
+        elif self._eoc_written:
+            raise ValueError(
+                "capture segment is closed; call begin_extension() before "
+                "writing further blocks"
+            )
 
     # ------------------------------------------------------------------
     # Memory region
@@ -553,6 +828,19 @@ class MSLWriter:
             raise ValueError(
                 f"page_states count ({len(region.page_states)}) does not match "
                 f"region_size/page_size ({expected_pages})"
+            )
+
+        # Spec Table 24: a Captured page carries exactly PageSize bytes and
+        # every other state carries none, so the page data must be precisely
+        # captured_pages * page_size long. Anything else would put bytes at
+        # offsets the page-state map does not claim.
+        captured_pages = region.page_states.count(PageState.CAPTURED)
+        expected_data = captured_pages * region.page_size
+        if len(raw_page_data) != expected_data:
+            raise ValueError(
+                f"page_data length ({len(raw_page_data)}) does not match "
+                f"{captured_pages} captured pages x page_size "
+                f"{region.page_size} ({expected_data})"
             )
 
         # Already range-checked by valid_page_size above.
@@ -1475,12 +1763,22 @@ class MSLWriter:
     # End of capture
     # ------------------------------------------------------------------
 
-    def finalize(self) -> None:
+    def finalize(self, *, seal: bool = True) -> None:
         """Write End-of-Capture block and flush.
 
+        The EoC records the exact capture-segment block count (itself
+        included, spec Section 4.5), so the header may stay at 0.
+
         When encrypted: flushes all buffered blocks as AEAD ciphertext
-        and appends the 16-byte authentication tag.
+        and appends the 16-byte authentication tag. Pass ``seal=False``
+        to keep the AEAD open so extension segments can be written
+        inside it (spec Section 4.6); call :meth:`seal` afterwards.
+
+        Raises:
+            ValueError: if an EndOfCapture was already written.
         """
+        if self._eoc_written:
+            raise ValueError("EndOfCapture already written")
         if self._block_index == 0:
             # Nothing was written, so the EoC below is about to land in
             # Block 0 -- the slot the spec reserves for ProcessIdentity.
@@ -1492,18 +1790,165 @@ class MSLWriter:
         file_hash = self._chain.finalize()
         acq_end_ns = now_ns()
 
-        # EoC payload: FileHash(32) + AcqEnd(8) + Reserved(8) = 48 bytes
-        payload = file_hash + struct.pack("<Q8s", acq_end_ns, b"\x00" * 8)
+        # EoC payload: FileHash(32) + AcqEnd(8) + BlockCount(4) + Reserved(4)
+        # = 48 bytes; BlockCount includes the EoC itself.
+        payload = file_hash + struct.pack(
+            "<QII", acq_end_ns, self._block_index + 1, 0,
+        )
 
         self._write_block(BlockType.EndOfCapture, payload)
+        self._eoc_written = True
 
-        if self._encrypted and self._encryptor is not None:
-            # Encrypt the entire block stream and write ciphertext + tag
-            ciphertext, tag = self._encryptor.finalize()
-            self._output.write(ciphertext)
-            self._output.write(tag)
-
+        if seal and self._encrypted:
+            self.seal()
         self._output.flush()
+
+    def seal(self) -> None:
+        """Encrypt the buffered block stream and write ciphertext + tag.
+
+        Only meaningful for encrypted writers; :meth:`finalize` calls it
+        unless asked not to. Nothing can be written after sealing.
+
+        Raises:
+            ValueError: if the writer is not encrypted, the EoC has not
+                been written, an extension segment is open, or the
+                container was already sealed.
+        """
+        if not self._encrypted or self._encryptor is None:
+            raise ValueError("seal() applies to encrypted writers only")
+        if not self._eoc_written:
+            raise ValueError("finalize() must precede seal()")
+        if self._in_extension:
+            raise ValueError("extension segment still open")
+        if self._sealed:
+            raise ValueError("container already sealed")
+        ciphertext, tag = self._encryptor.finalize()
+        self._output.write(ciphertext)
+        self._output.write(tag)
+        self._sealed = True
+        self._output.flush()
+
+    # ------------------------------------------------------------------
+    # Extension segments (spec Section 4.6)
+    # ------------------------------------------------------------------
+
+    def begin_extension(self) -> None:
+        """Open an extension segment after the EndOfCapture.
+
+        Blocks written until :meth:`finalize_extension` form one segment
+        whose hash the terminator records.
+
+        Raises:
+            ValueError: if the EoC has not been written, a segment is
+                already open, or an encrypted container is sealed.
+        """
+        if not self._eoc_written:
+            raise ValueError("begin_extension() requires a written EndOfCapture")
+        if self._in_extension:
+            raise ValueError("extension segment already open")
+        if self._sealed:
+            raise ValueError("container already sealed")
+        self._chain.start_segment()
+        self._segment_blocks = 0
+        self._in_extension = True
+
+    def finalize_extension(
+        self, producer: str, written_at_ns: int | None = None,
+    ) -> bytes:
+        """Terminate the open extension segment with an EndOfExtension block.
+
+        The SegmentHash is taken over every segment block written so far,
+        before the terminator itself is written. Returns the terminator's
+        block UUID.
+
+        .. code-block:: text
+
+            segment_hash: 32 bytes
+            written_at:   u64 ns
+            block_count:  u32      # segment blocks incl. this terminator
+            reserved:     u32
+            producer_len: u16      # incl. NUL; 0 = none
+            reserved:     6 bytes
+            producer:     bytes[producer_len] NUL-terminated, pad8
+
+        Raises:
+            ValueError: if no segment is open or it holds no blocks.
+        """
+        if not self._in_extension:
+            raise ValueError("no extension segment open")
+        if self._segment_blocks == 0:
+            raise ValueError("extension segment holds no blocks")
+        payload = self._end_of_extension_payload(producer, written_at_ns)
+        block_uuid = self._write_block(BlockType.EndOfExtension, payload)
+        self._chain.end_segment()
+        self._in_extension = False
+        return block_uuid
+
+    def _end_of_extension_payload(
+        self, producer: str, written_at_ns: int | None,
+    ) -> bytes:
+        """Build the EndOfExtension payload for the open segment."""
+        producer_bytes, producer_len = _bounded_or_absent(producer)
+        _warn_if_truncated("Producer", producer, producer_len)
+        written_at = now_ns() if written_at_ns is None else written_at_ns
+        head = _EOX_HEAD.pack(
+            self._chain.segment_digest(), written_at,
+            self._segment_blocks + 1, 0, producer_len,
+        )
+        return head + producer_bytes
+
+    # ------------------------------------------------------------------
+    # Thread Context (Block 0x0011, spec Tables 19a/19b)
+    # ------------------------------------------------------------------
+
+    def write_thread_context(
+        self, tc: ThreadContext, parent_uuid: bytes | None = None,
+    ) -> bytes:
+        """Write a Thread Context block. Returns the block UUID.
+
+        .. code-block:: text
+
+            Payload header (Table 19a, 32 bytes):
+                thread_id:    u64
+                start_time:   u64 ns
+                flags:        u16      # TC_FLAG_* bits
+                thread_state: u8       # ThreadState
+                arch:         u8       # 0 = header ArchType
+                reg_count:    u32
+                name_len:     u16      # incl. NUL; 0 = none
+                reserved:     6 bytes
+                thread_name:  bytes[name_len] NUL-terminated, pad8 (omitted when 0)
+            Register entry (Table 19b):
+                name_len:     u8       # incl. NUL
+                width:        u8       # value size in bytes
+                flags:        u16      # REG_ROLE_* bits
+                reserved:     4 bytes
+                name:         bytes[name_len] NUL-terminated, pad8, lowercase
+                value:        bytes[width] in file byte order, pad8
+
+        Raises:
+            ValueError: if ``state`` or ``arch`` does not fit its u8 field
+                (``ArchType.Unknown`` is not representable; use 0 for the
+                header ArchType), if a register name is empty or longer
+                than the u8 length admits, its width is outside 1..255, or
+                its value does not hold exactly ``width`` bytes.
+        """
+        if not 0 <= int(tc.state) <= 0xFF or not 0 <= int(tc.arch) <= 0xFF:
+            raise ValueError(
+                f"ThreadContext state {int(tc.state)} / arch {int(tc.arch)} "
+                "must fit u8 (spec Table 19a)"
+            )
+        name_bytes, name_len = _bounded_or_absent(tc.name)
+        _warn_if_truncated("ThreadName", tc.name, name_len)
+        head = _TC_HEAD.pack(
+            tc.thread_id, tc.start_time_ns, tc.flags, int(tc.state),
+            int(tc.arch), len(tc.registers), name_len,
+        )
+        registers = b"".join(_pack_thread_register(r) for r in tc.registers)
+        return self._write_block(
+            BlockType.ThreadContext, head + name_bytes + registers,
+            parent_uuid=parent_uuid,
+        )
 
     # ------------------------------------------------------------------
     # Helpers

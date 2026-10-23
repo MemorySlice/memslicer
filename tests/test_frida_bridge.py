@@ -687,3 +687,762 @@ class TestFridaScriptProcMapsFallback:
         assert "f.readText(65536)" in _FRIDA_SCRIPT
         assert "typeof f.readText !== 'function'" in _FRIDA_SCRIPT
         assert "f.read(" not in _FRIDA_SCRIPT
+
+
+# ---------------------------------------------------------------------------
+# Tests -- page residency and thread stack pointers
+# ---------------------------------------------------------------------------
+
+class TestFridaScriptResidencyExports:
+    """The agent exposes the residency/thread exports and feature-detects
+    every API they rely on: Frida 17 removed the static Module.* lookups and
+    older GumJS File objects have no seek()/readBytes()."""
+
+    @pytest.mark.parametrize("export", [
+        "residencyMethod", "residencyDetail", "queryResidency",
+        "enumerateStackPointers", "closeResidency",
+    ])
+    def test_export_is_defined(self, export):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert f"{export}: function" in _FRIDA_SCRIPT
+
+    @pytest.mark.parametrize("guard", [
+        "typeof Module.findGlobalExportByName === 'function'",
+        "typeof Module.findExportByName === 'function'",
+        "typeof File === 'undefined'",
+        "typeof File.prototype.seek !== 'function'",
+        "typeof File.prototype.readBytes !== 'function'",
+        "typeof File.readAllText === 'function'",
+        "typeof File.SEEK_SET === 'number'",
+        "typeof Process.enumerateThreads !== 'function'",
+    ])
+    def test_api_is_feature_detected(self, guard):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert guard in _FRIDA_SCRIPT
+
+    def test_pagemap_probe_and_decoding(self):
+        """Opens pagemap binary, probes one entry, masks the top-byte bits."""
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "new File('/proc/self/pagemap', 'rb')" in _FRIDA_SCRIPT
+        assert "f.readBytes(8)" in _FRIDA_SCRIPT
+        assert "& 0xC0" in _FRIDA_SCRIPT
+        assert "Process.platform !== 'linux'" in _FRIDA_SCRIPT
+
+    def test_mincore_is_gated_on_empty_swap(self):
+        """mincore() cannot see swapped pages, so VmSwap must be 0 kB."""
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "_findGlobalExport('mincore')" in _FRIDA_SCRIPT
+        assert "/proc/self/status" in _FRIDA_SCRIPT
+        assert "/^VmSwap:[ \\t]*([0-9]+)[ \\t]*kB/m" in _FRIDA_SCRIPT
+        assert "['pointer', 'size_t', 'pointer']" in _FRIDA_SCRIPT
+        assert "flags[i] & 1" in _FRIDA_SCRIPT
+
+    def test_script_is_valid_javascript(self, tmp_path):
+        """node --check on the agent, when node is installed."""
+        import shutil
+        import subprocess
+
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not installed")
+        script = tmp_path / "agent.js"
+        script.write_text(_FRIDA_SCRIPT)
+
+        result = subprocess.run(
+            [node, "--check", str(script)], capture_output=True, text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+
+class TestFridaScriptSwapTable:
+    """mincore() is trusted per VMA: with VmSwap > 0 the agent builds a swap
+    table from /proc/self/smaps and refuses to answer for VMAs holding swap,
+    so pruning stays lossless on Android where pagemap is SELinux-denied."""
+
+    def test_swap_table_is_built_from_smaps(self):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "function _loadSwapTable()" in _FRIDA_SCRIPT
+        assert "_readTextFile('/proc/self/smaps')" in _FRIDA_SCRIPT
+        assert "/^([0-9a-f]+)-([0-9a-f]+) /" in _FRIDA_SCRIPT
+        assert "/^Swap:[ \\t]*([0-9]+)[ \\t]*kB/" in _FRIDA_SCRIPT
+        assert "parseInt(h[1], 16), parseInt(h[2], 16)" in _FRIDA_SCRIPT
+
+    def test_mincore_needs_the_table_only_while_swap_is_in_use(self):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "if (_vmSwapKb() !== 0) {" in _FRIDA_SCRIPT
+        assert "_noteWhy('smaps unreadable')" in _FRIDA_SCRIPT
+        assert "_noteWhy('mincore export missing')" in _FRIDA_SCRIPT
+
+    def test_mask_refuses_vmas_with_swap(self):
+        """Unknown VMA, swap inside it, or a span leaving it => null."""
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "function _findSwapEntry(addr)" in _FRIDA_SCRIPT
+        assert (
+            "if (vma === null || vma[2] > 0 || spanEnd > vma[1]) return null;"
+            in _FRIDA_SCRIPT
+        )
+
+    def test_detail_export_explains_the_method(self):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "residencyDetail: function()" in _FRIDA_SCRIPT
+        assert "'swap table: ' + _swapTable.length + ' VMAs, '" in _FRIDA_SCRIPT
+        assert "'none: ' + (_residencyWhy === '' ? 'unknown' : _residencyWhy)" in _FRIDA_SCRIPT
+
+    def test_close_forgets_the_table_and_the_reason(self):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        close_body = _FRIDA_SCRIPT.split("closeResidency: function() {", 1)[1]
+        assert "_swapTable = null;" in close_body
+        assert "_residencyWhy = '';" in close_body
+
+    @pytest.mark.parametrize("scenario, method, detail, swapped_vma", [
+        ("swap", "mincore", "mincore (swap table: 3 VMAs, 1 with swap)", None),
+        ("noswap", "mincore", "mincore (VmSwap 0 kB, no swap table)", 2),
+        ("nosmaps", "none", "none: pagemap: Permission denied; smaps unreadable", None),
+        ("nomincore", "none", "none: pagemap: Permission denied; mincore export missing", None),
+    ])
+    def test_agent_logic_under_node(self, tmp_path, scenario, method, detail, swapped_vma):
+        """Runs the agent in node with stubbed Frida globals: pagemap denied,
+        a synthetic smaps with one swapped VMA, and the given status/exports."""
+        import json
+        import shutil
+        import subprocess
+
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        node = shutil.which("node")
+        if node is None:
+            pytest.skip("node not installed")
+        (tmp_path / "agent.js").write_text(_FRIDA_SCRIPT)
+        (tmp_path / "harness.js").write_text(_NODE_HARNESS)
+
+        result = subprocess.run(
+            [node, str(tmp_path / "harness.js"), str(tmp_path / "agent.js"), scenario],
+            capture_output=True, text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        answer = json.loads(result.stdout)
+        assert answer["method"] == method
+        assert answer["detail"] == detail
+        assert answer["swapped_vma"] == swapped_vma
+        if method == "mincore":
+            assert answer["clean_vma"] == 2
+        else:
+            assert answer["clean_vma"] is None
+        if scenario == "swap":
+            assert answer["crosses_end"] is None
+            assert answer["no_vma"] is None
+
+
+_NODE_HARNESS = r"""
+const fs = require('fs'), vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8'), scenario = process.argv[3];
+const PAGE = 4096;
+const smaps = [
+  '10000-20000 rw-p 00000000 00:00 0', 'Size: 64 kB', 'Swap: 0 kB',
+  '20000-30000 rw-p 00000000 00:00 0', 'Size: 64 kB', 'Swap: 8 kB',
+  '40000-50000 r--p 00000000 00:00 0', 'Size: 64 kB', 'Swap:         0 kB',
+].join('\n') + '\n';
+const files = {
+  '/proc/self/status': scenario === 'noswap' ? 'VmSwap:\t0 kB\n' : 'VmSwap:\t  244 kB\n',
+  '/proc/self/smaps': scenario === 'nosmaps' ? '' : smaps,
+};
+function Ptr(n) { this.n = BigInt(n); }
+Ptr.prototype.toString = function() { return this.n.toString(); };
+Ptr.prototype.isNull = function() { return this.n === 0n; };
+Ptr.prototype.and = function(o) { return new Ptr(this.n & o.n); };
+Ptr.prototype.not = function() { return new Ptr(~this.n & 0xffffffffffffffffn); };
+Ptr.prototype.readByteArray = function(n) { return new Uint8Array(n).fill(1).buffer; };
+const sandbox = {
+  Process: { platform: 'linux', pageSize: PAGE },
+  Module: { findGlobalExportByName: () => (scenario === 'nomincore' ? null : new Ptr(0x1000)) },
+  File: function() { throw new Error('Permission denied'); },
+  Memory: { alloc: () => new Ptr(0x2000) },
+  NativeFunction: function() { return () => 0; },
+  ptr: v => new Ptr(typeof v === 'string' ? BigInt(v) : v),
+  rpc: {},
+};
+sandbox.File.prototype.seek = function() {};
+sandbox.File.prototype.readBytes = function() {};
+sandbox.File.readAllText = p => files[p];
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox);
+const x = sandbox.rpc.exports;
+const q = (a, n) => {
+  const r = x.queryResidency('0x' + a.toString(16), n * PAGE);
+  return r === null ? null : new Uint8Array(r).length;
+};
+console.log(JSON.stringify({
+  method: x.residencyMethod(), detail: x.residencyDetail(),
+  clean_vma: q(0x10000, 2), swapped_vma: q(0x20000, 2),
+  crosses_end: q(0x1f000, 2), no_vma: q(0x30000, 1),
+}));
+x.closeResidency();
+"""
+
+
+class TestFridaBridgeResidencyMethod:
+    """residency_method() reports the agent's answer and degrades to none."""
+
+    def test_reports_agent_answer(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "pagemap"
+
+        assert bridge.residency_method() == "pagemap"
+
+    def test_answer_is_cached_per_connection(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "mincore"
+
+        assert bridge.residency_method() == "mincore"
+        assert bridge.residency_method() == "mincore"
+
+        api.residency_method.assert_called_once()
+
+    def test_rpc_raising_degrades_to_none(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.side_effect = RuntimeError("script unloaded")
+
+        assert bridge.residency_method() == "none"
+
+    def test_non_string_answer_degrades_to_none(self):
+        """An unstubbed RPC on a MagicMock api answers a MagicMock."""
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+
+        assert not isinstance(api.residency_method(), str)
+        assert bridge.residency_method() == "none"
+
+    def test_unknown_string_degrades_to_none(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "madvise"
+
+        assert bridge.residency_method() == "none"
+
+    def test_missing_export_degrades_to_none(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        del api.residency_method
+
+        assert bridge.residency_method() == "none"
+
+    def test_before_connect_is_none(self):
+        bridge = _make_bridge(target=1234)
+
+        assert bridge.residency_method() == "none"
+
+    def test_disconnect_forgets_the_cached_answer(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "pagemap"
+        bridge.residency_method()
+
+        bridge.disconnect()
+
+        assert bridge._residency_method is None
+
+    def test_detail_is_logged_once_at_debug_when_resolved(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "mincore"
+        api.residency_detail.return_value = "mincore (swap table: 3 VMAs, 1 with swap)"
+
+        bridge.residency_method()
+        bridge.residency_method()
+
+        api.residency_detail.assert_called_once_with()
+        logged = [
+            call.args for call in bridge._log.debug.call_args_list
+            if call.args and call.args[0] == "residency method %s (%s)"
+        ]
+        assert logged == [(
+            "residency method %s (%s)", "mincore",
+            "mincore (swap table: 3 VMAs, 1 with swap)",
+        )]
+
+    def test_bridge_satisfies_residency_capable(self):
+        from memslicer.acquirer.bridge import ResidencyCapable
+
+        assert isinstance(_make_bridge(target=1234), ResidencyCapable)
+
+    def test_bridge_satisfies_thread_stack_capable(self):
+        from memslicer.acquirer.bridge import ThreadStackCapable
+
+        assert isinstance(_make_bridge(target=1234), ThreadStackCapable)
+
+
+class TestFridaBridgeResidencyDetail:
+    """residency_detail() is informational and degrades to an empty string."""
+
+    def test_reports_agent_answer(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_detail.return_value = "none: pagemap: Permission denied"
+
+        assert bridge.residency_detail() == "none: pagemap: Permission denied"
+        api.residency_detail.assert_called_once_with()
+
+    def test_rpc_raising_degrades_to_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_detail.side_effect = RuntimeError("script unloaded")
+
+        assert bridge.residency_detail() == ""
+
+    def test_non_string_answer_degrades_to_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_detail.return_value = {"method": "mincore"}
+
+        assert bridge.residency_detail() == ""
+
+    def test_missing_export_degrades_to_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        del api.residency_detail
+
+        assert bridge.residency_detail() == ""
+
+    def test_before_connect_is_empty(self):
+        bridge = _make_bridge(target=1234)
+
+        assert bridge.residency_detail() == ""
+
+    def test_missing_detail_does_not_break_residency_method(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "pagemap"
+        del api.residency_detail
+
+        assert bridge.residency_method() == "pagemap"
+
+
+class TestFridaBridgeQueryResidency:
+    """query_residency() trusts the agent only for an exactly-sized mask."""
+
+    def _pagemap_bridge(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "pagemap"
+        return bridge, api
+
+    def test_returns_one_byte_per_page(self):
+        bridge, api = self._pagemap_bridge()
+        api.query_residency.return_value = bytes([1, 0, 1])
+
+        mask = bridge.query_residency(0x10000, 3 * 4096)
+
+        assert mask == b"\x01\x00\x01"
+        api.query_residency.assert_called_once_with("0x10000", 3 * 4096)
+
+    def test_unaligned_span_is_counted_outwards(self):
+        """Half a page at each end still means three pages, like page_count."""
+        bridge, api = self._pagemap_bridge()
+        api.query_residency.return_value = bytes([1, 1, 1])
+
+        assert bridge.query_residency(0x10800, 2 * 4096) == b"\x01\x01\x01"
+
+    def test_bytearray_answer_is_accepted(self):
+        bridge, api = self._pagemap_bridge()
+        api.query_residency.return_value = bytearray([0, 1])
+
+        mask = bridge.query_residency(0x10000, 2 * 4096)
+
+        assert mask == b"\x00\x01"
+        assert isinstance(mask, bytes)
+
+    def test_wrong_length_is_rejected(self):
+        bridge, api = self._pagemap_bridge()
+        api.query_residency.return_value = bytes([1, 0])
+
+        assert bridge.query_residency(0x10000, 3 * 4096) is None
+
+    def test_null_answer_returns_none(self):
+        bridge, api = self._pagemap_bridge()
+        api.query_residency.return_value = None
+
+        assert bridge.query_residency(0x10000, 4096) is None
+
+    def test_rpc_raising_returns_none(self):
+        bridge, api = self._pagemap_bridge()
+        api.query_residency.side_effect = RuntimeError("script unloaded")
+
+        assert bridge.query_residency(0x10000, 4096) is None
+
+    def test_non_bytes_answer_returns_none(self):
+        bridge, api = self._pagemap_bridge()
+
+        assert not isinstance(api.query_residency(), bytes)
+        assert bridge.query_residency(0x10000, 4096) is None
+
+    def test_missing_export_returns_none(self):
+        bridge, api = self._pagemap_bridge()
+        del api.query_residency
+
+        assert bridge.query_residency(0x10000, 4096) is None
+
+    def test_method_none_skips_the_rpc(self):
+        """"none" promises that query_residency always answers None."""
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.residency_method.return_value = "none"
+        api.query_residency.return_value = bytes([1])
+
+        assert bridge.query_residency(0x10000, 4096) is None
+        api.query_residency.assert_not_called()
+
+
+class TestFridaBridgeEnumerateStackPointers:
+    """enumerate_stack_pointers() parses what it can and never raises."""
+
+    def test_parses_hex_strings_and_skips_junk(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_stack_pointers.return_value = ["0x7fff0000", "junk"]
+
+        assert bridge.enumerate_stack_pointers() == [0x7fff0000]
+
+    def test_ints_are_accepted_and_other_types_skipped(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_stack_pointers.return_value = [
+            0x1000, "0x2000", None, 3.5, True, MagicMock(),
+        ]
+
+        assert bridge.enumerate_stack_pointers() == [0x1000, 0x2000]
+
+    def test_rpc_raising_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_stack_pointers.side_effect = RuntimeError("no threads")
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_non_list_answer_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+
+        assert not isinstance(api.enumerate_stack_pointers(), list)
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_missing_export_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        del api.enumerate_stack_pointers
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_before_connect_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+
+        assert bridge.enumerate_stack_pointers() == []
+
+
+class TestFridaBridgeEnumerateThreads:
+    """enumerate_threads() turns the agent's sampled contexts into ThreadInfo
+    entries and never raises."""
+
+    X86_64_CONTEXT = {
+        "rip": "0x401000", "rsp": "0x7ffd0000", "rbp": "0x7ffd0040",
+        "rax": "0x2a", "pc": "0x401000", "sp": "0x7ffd0000",
+    }
+    ARM64_CONTEXT = {
+        "pc": "0x7000", "sp": "0x7ff0000", "fp": "0x7ff0040",
+        "lr": "0x7010", "x0": "0x1", "nzcv": "0x60000000",
+    }
+
+    @staticmethod
+    def _connect_with_arch(bridge, frida_arch):
+        """Run connect() with the agent reporting *frida_arch*."""
+        _device, api = _prepare_device_and_api(bridge)
+        api.get_arch.return_value = frida_arch
+        with patch.dict(sys.modules, {"frida": _prepare_mock_frida_module()}):
+            bridge.connect()
+        return api
+
+    @staticmethod
+    def _by_name(info):
+        return {r.name: r for r in info.registers}
+
+    def test_x86_64_context_drops_generic_aliases(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 4321, "name": "worker", "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert len(threads) == 1
+        regs = self._by_name(threads[0])
+        assert set(regs) == {"rip", "rsp", "rbp", "rax"}
+
+    def test_x86_64_roles_and_little_endian_values(self):
+        from memslicer.msl.constants import REG_ROLE_FP, REG_ROLE_PC, REG_ROLE_SP
+
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        regs = self._by_name(bridge.enumerate_threads()[0])
+
+        assert regs["rip"].role == REG_ROLE_PC
+        assert regs["rsp"].role == REG_ROLE_SP
+        assert regs["rbp"].role == REG_ROLE_FP
+        assert regs["rax"].role == 0
+        assert regs["rip"].width == 8
+        assert regs["rip"].value == (0x401000).to_bytes(8, "little")
+        assert regs["rax"].value == b"\x2a" + b"\x00" * 7
+
+    def test_thread_metadata_is_carried(self):
+        from memslicer.msl.constants import ThreadState
+
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 4321, "name": "worker", "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        info = bridge.enumerate_threads()[0]
+
+        assert info.tid == 4321
+        assert info.name == "worker"
+        assert info.state == ThreadState.RUNNING
+        assert info.suspended is False
+        assert info.partial is False
+
+    @pytest.mark.parametrize("text, expected", [
+        ("running", "RUNNING"), ("stopped", "STOPPED"), ("waiting", "WAITING"),
+        ("uninterruptible", "UNINTERRUPTIBLE"), ("halted", "HALTED"),
+        ("", "UNKNOWN"), ("something-new", "UNKNOWN"), (None, "UNKNOWN"),
+    ])
+    def test_frida_state_strings_map_to_spec_states(self, text, expected):
+        from memslicer.msl.constants import ThreadState
+
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": text,
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        assert bridge.enumerate_threads()[0].state == ThreadState[expected]
+
+    def test_arm64_context_keeps_generic_names_with_roles(self):
+        from memslicer.msl.constants import (
+            REG_ROLE_FLAGS, REG_ROLE_FP, REG_ROLE_LR, REG_ROLE_PC, REG_ROLE_SP,
+        )
+
+        bridge = _make_bridge(target=1234)
+        api = self._connect_with_arch(bridge, "arm64")
+        api.enumerate_threads.return_value = [
+            {"id": 7, "name": "main", "state": "waiting",
+             "context": dict(self.ARM64_CONTEXT)},
+        ]
+
+        assert bridge.get_platform_info().arch == ArchType.ARM64
+        regs = self._by_name(bridge.enumerate_threads()[0])
+
+        assert set(regs) == {"pc", "sp", "fp", "lr", "x0", "nzcv"}
+        assert regs["pc"].role == REG_ROLE_PC
+        assert regs["sp"].role == REG_ROLE_SP
+        assert regs["fp"].role == REG_ROLE_FP
+        assert regs["lr"].role == REG_ROLE_LR
+        assert regs["nzcv"].role == REG_ROLE_FLAGS
+        assert regs["x0"].role == 0
+        assert regs["sp"].value == (0x7ff0000).to_bytes(8, "little")
+
+    def test_thread_without_sp_is_skipped(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": {"rip": "0x401000", "rax": "0x1"}},
+            {"id": 2, "name": "", "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_thread_without_pc_is_skipped(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": {"rsp": "0x7ffd0000", "rax": "0x1"}},
+        ]
+
+        assert bridge.enumerate_threads() == []
+
+    def test_unparseable_register_is_skipped_and_marks_partial(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": {**self.X86_64_CONTEXT, "rbx": "junk"}},
+        ]
+
+        info = bridge.enumerate_threads()[0]
+
+        assert "rbx" not in self._by_name(info)
+        assert info.partial is True
+
+    @pytest.mark.parametrize("bad", [
+        "-0x1", -1, 1 << 64, "0x10000000000000000", True, None, 3.5, [],
+    ])
+    def test_value_outside_register_width_marks_partial(self, bad):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": {**self.X86_64_CONTEXT, "rbx": bad}},
+        ]
+
+        info = bridge.enumerate_threads()[0]
+
+        assert "rbx" not in self._by_name(info)
+        assert info.partial is True
+
+    def test_plain_int_values_are_accepted(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": {"rip": 0x401000, "rsp": 0x7ffd0000}},
+        ]
+
+        info = bridge.enumerate_threads()[0]
+
+        assert info.partial is False
+        assert self._by_name(info)["rip"].as_int == 0x401000
+
+    def test_register_names_are_lowercased(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 1, "name": "", "state": "running",
+             "context": {"RIP": "0x401000", "RSP": "0x7ffd0000"}},
+        ]
+
+        assert set(self._by_name(bridge.enumerate_threads()[0])) == {"rip", "rsp"}
+
+    def test_non_dict_items_and_bad_context_are_skipped(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            "junk", None, 42, ["rip"],
+            {"id": 1, "name": "", "state": "running", "context": "nope"},
+            {"id": 2, "name": "", "state": "running"},
+            {"id": 3, "name": "", "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        assert [t.tid for t in bridge.enumerate_threads()] == [3]
+
+    def test_bad_tid_and_name_fall_back_to_defaults(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": "4321", "name": None, "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+            {"id": True, "name": 5, "state": "running",
+             "context": dict(self.X86_64_CONTEXT)},
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [0, 0]
+        assert [t.name for t in threads] == ["", ""]
+
+    def test_rpc_raising_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.side_effect = RuntimeError("no threads")
+
+        assert bridge.enumerate_threads() == []
+
+    def test_non_list_answer_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+
+        assert not isinstance(api.enumerate_threads(), list)
+        assert bridge.enumerate_threads() == []
+
+    def test_missing_export_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        del api.enumerate_threads
+
+        assert bridge.enumerate_threads() == []
+
+    def test_before_connect_returns_empty(self):
+        bridge = _make_bridge(target=1234)
+
+        assert bridge.enumerate_threads() == []
+
+    def test_agent_export_is_defined_and_feature_detected(self):
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "enumerateThreads: function" in _FRIDA_SCRIPT
+        assert "typeof Process.enumerateThreads" in _FRIDA_SCRIPT
+        assert "_hexContext(t.context || {})" in _FRIDA_SCRIPT
+
+    def test_bridge_is_thread_registers_capable(self):
+        from memslicer.acquirer.bridge import ThreadRegistersCapable
+
+        assert isinstance(_make_bridge(target=1234), ThreadRegistersCapable)
+
+
+class TestFridaBridgeDisconnectClosesResidency:
+    """disconnect() releases the agent's pagemap handle, best-effort."""
+
+    def test_disconnect_closes_residency_before_detaching(self):
+        bridge = _make_bridge(target=1234)
+        device, api = _setup_device_and_api(bridge)
+
+        bridge.disconnect()
+
+        api.close_residency.assert_called_once_with()
+        device.attach.return_value.detach.assert_called_once()
+
+    def test_missing_close_export_still_detaches(self):
+        bridge = _make_bridge(target=1234)
+        device, api = _setup_device_and_api(bridge)
+        del api.close_residency
+
+        bridge.disconnect()
+
+        device.attach.return_value.detach.assert_called_once()
+
+    def test_close_raising_still_detaches(self):
+        bridge = _make_bridge(target=1234)
+        device, api = _setup_device_and_api(bridge)
+        api.close_residency.side_effect = RuntimeError("script unloaded")
+
+        bridge.disconnect()
+
+        device.attach.return_value.detach.assert_called_once()
+        assert bridge._session is None

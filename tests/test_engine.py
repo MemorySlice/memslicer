@@ -1261,16 +1261,22 @@ class TestShortReadAccounting:
         )
         assert data_size == 3 * PAGE
 
-    def test_partial_page_still_claims_only_one_page(self):
-        """A read stopping mid-page captures that page and nothing beyond."""
+    def test_partial_page_is_not_captured(self):
+        """A read stopping mid-page captures only the whole pages before it.
+
+        Spec Table 24 gives a Captured page exactly PageSize bytes, so the
+        partial page is recorded as Failed and its fragment is dropped
+        rather than padded with fabricated zeros.
+        """
         bridge = ShortReadBridge(returned=PAGE + 100)
 
         region, data_size = _read_span(bridge, BASE, REGION_SIZE)
 
         assert region.page_states == _states(
-            (PageState.CAPTURED, 2), (PageState.FAILED, REGION_PAGES - 2),
+            (PageState.CAPTURED, 1), (PageState.FAILED, REGION_PAGES - 1),
         )
-        assert data_size == PAGE + 100
+        assert data_size == PAGE
+        assert sum(len(c) for c in region.page_data_chunks) == PAGE
 
     def test_short_read_in_a_chunked_region(self):
         """The same accounting applies to each chunk of an oversized region."""

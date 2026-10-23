@@ -26,6 +26,7 @@ from pathlib import Path
 from memslicer.acquirer.engine import classify_region
 from memslicer.msl.constants import (
     VERSION, ArchType, CapBit, CompAlgo, Endianness, OSType, PageState,
+    VasNameSource,
 )
 from memslicer.msl.types import (
     FileHeader, MemoryRegion, ModuleEntry, ProcessIdentity, VasEntry,
@@ -99,7 +100,8 @@ def _memory_region(r: FixtureRange) -> MemoryRegion:
 def vas_entries() -> list[VasEntry]:
     """VAS Map rows for every fixture range, sorted by base address."""
     return sorted(
-        (VasEntry(r.base, r.size, r.protection, classify_region(r.name), r.name)
+        (VasEntry(r.base, r.size, r.protection, classify_region(r.name), r.name,
+                  VasNameSource.LIVE)
          for r in RANGES),
         key=lambda e: e.base_addr,
     )

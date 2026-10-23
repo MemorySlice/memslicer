@@ -1172,3 +1172,386 @@ def test_device_id_marks_attribution_remote(mock_factory, mock_validate):
 
     assert result.exit_code == 0, result.output
     assert mock_validate.call_args.kwargs["is_remote"] is True
+
+
+# ---------- --scope / --exclude-module / --app-path / --resident-only ----------
+
+
+def _survey():
+    """A small RegionSurvey: two heap regions kept, libc and a no-read skipped."""
+    from memslicer.acquirer.bridge import MemoryRange, ModuleInfo
+    from memslicer.acquirer.engine import RegionDecision, RegionSurvey
+    from memslicer.acquirer.region_classify import RegionCategory, RegionInfo
+
+    libc = ModuleInfo(name="libc.so", path="/system/lib64/libc.so", base=0x40000, size=0x2000)
+
+    def decision(base, size, prot, category, label, skip=None, owner=None):
+        return RegionDecision(
+            range=MemoryRange(base=base, size=size, protection=prot, file_path=label),
+            protection=6 if prot == "rw-" else 5,
+            info=RegionInfo(category=category, owner=owner, label=label, system_owned=owner is not None),
+            skip_reason=skip,
+        )
+
+    decisions = [
+        decision(0x10000, 8192, "rw-", RegionCategory.HEAP_NATIVE, "scudo:primary"),
+        decision(0x20000, 16384, "rw-", RegionCategory.HEAP_MANAGED, "dalvik-main space"),
+        decision(0x40000, 8192, "r-x", RegionCategory.IMAGE, "/system/lib64/libc.so", "scope", libc),
+        decision(0x80000, 4096, "---", RegionCategory.ANON, "", "no-read"),
+    ]
+    return RegionSurvey(_OSType.Android, 4096, [libc], decisions)
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_scope_option_parsed_into_region_filter(mock_factory):
+    """--scope heap,stack lands on the RegionFilter as a token set."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--scope", "heap,stack"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args[1]["region_filter"].scope == {"heap", "stack"}
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_scope_alias_heapstack(mock_factory):
+    """The heapstack alias expands to heap and stack."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--scope", "heapstack"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args[1]["region_filter"].scope == {"heap", "stack"}
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_scope_defaults_to_full(mock_factory):
+    """Without --scope the filter keeps everything."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    rf = mock_factory.call_args[1]["region_filter"]
+    assert rf.scope == {"full"}
+    assert rf.exclude_modules == []
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_scope_unknown_token_is_a_usage_error(mock_factory):
+    """An unknown scope token is refused before anything is attached."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--scope", "bogus"])
+
+    assert result.exit_code == 2
+    assert "unknown scope token" in result.output
+    mock_factory.assert_not_called()
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_scope_full_cannot_be_combined(mock_factory):
+    """full already keeps everything, so full,heap is refused."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--scope", "full,heap"])
+
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
+    mock_factory.assert_not_called()
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_exclude_module_order_preserved(mock_factory):
+    """Repeated --exclude-module patterns reach the filter in the given order."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "1234", "-o", "test.msl",
+        "--exclude-module", "libhwui*", "--exclude-module", "/apex/*",
+    ])
+
+    assert result.exit_code == 0
+    rf = mock_factory.call_args[1]["region_filter"]
+    assert rf.exclude_modules == ["libhwui*", "/apex/*"]
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_app_path_and_resident_only_reach_factory(mock_factory):
+    """--app-path and --resident-only are handed to _create_acquirer."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "1234", "-o", "test.msl", "--app-path", "/opt/foo", "--resident-only",
+    ])
+
+    assert result.exit_code == 0
+    call_kwargs = mock_factory.call_args[1]
+    assert call_kwargs["app_paths"] == ("/opt/foo",)
+    assert call_kwargs["resident_only"] is True
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_app_path_and_resident_only_default_off(mock_factory):
+    """Without the options the engine gets no app paths and no pruning."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["1234", "-o", "test.msl"]).exit_code == 0
+
+    call_kwargs = mock_factory.call_args[1]
+    assert call_kwargs["app_paths"] == ()
+    assert call_kwargs["resident_only"] is False
+
+
+def test_create_acquirer_forwards_app_paths_and_resident_only():
+    """The factory passes app_paths and resident_only to AcquisitionEngine."""
+    with patch("memslicer.acquirer.engine.AcquisitionEngine") as mock_engine, \
+         patch("memslicer.acquirer.gdb_bridge.GDBBridge"):
+        _create_acquirer(
+            backend="gdb", target=1234, comp_algo=_CompAlgo.NONE,
+            region_filter=_RegionFilter(), os_override=None,
+            logger=logging.getLogger("memslicer"), read_timeout=10.0,
+            usb=False, remote_addr=None,
+            app_paths=("/opt/foo",), resident_only=True,
+        )
+    kwargs = mock_engine.call_args[1]
+    assert kwargs["app_paths"] == ("/opt/foo",)
+    assert kwargs["resident_only"] is True
+
+
+# ---------- --dry-run ----------
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_dry_run_surveys_without_writing_anything(mock_factory):
+    """--dry-run surveys, prints the plan and leaves no .msl or .msl.log."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.survey_regions.return_value = _survey()
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli, [
+            "1234", "-o", "test.msl", "--dry-run",
+            "--scope", "heap", "--exclude-module", "libhwui*",
+        ])
+        leftovers = sorted(p.name for p in _Path(".").iterdir())
+
+    assert result.exit_code == 0, result.output
+    assert leftovers == []
+    mock_acquirer.survey_regions.assert_called_once_with()
+    mock_acquirer.acquire.assert_not_called()
+    assert "Dry run for 1234" in result.output
+    assert "Dumping" not in result.output
+    assert "Scope: heap | Exclude: libhwui*" in result.output
+    assert "regions kept" in result.output and "bytes skipped" in result.output
+    assert "heap-managed" in result.output
+    assert "Top owners:" in result.output
+    assert "libc.so" in result.output
+    assert "Would capture 24.0 KiB of 32.0 KiB readable bytes across 2 of 4 regions" in result.output
+    assert "1 outside selected --scope (heap)" in result.output
+    assert "1 no read permission" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_dry_run_ignores_encryption_and_output_options(mock_factory):
+    """--dry-run with -E/--passphrase/-o is accepted and still writes nothing."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.survey_regions.return_value = _survey()
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(cli, [
+            "1234", "-o", "out.msl", "-E", "--passphrase", "pw", "--dry-run",
+        ])
+        leftovers = sorted(p.name for p in _Path(".").iterdir())
+
+    assert result.exit_code == 0, result.output
+    assert leftovers == []
+    mock_acquirer.acquire.assert_not_called()
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_dry_run_attach_error_has_no_log_pointer(mock_factory):
+    """An attach failure during a dry run renders without a .msl.log line."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.survey_regions.side_effect = AttachError(
+        "attach to 9999 failed", remediation=["Check the PID"],
+    )
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["9999", "--dry-run"])
+
+    assert result.exit_code == 1
+    assert "Error: attach to 9999 failed" in result.output
+    assert "→ Check the PID" in result.output
+    assert "Full environment record" not in result.output
+    assert ".msl.log" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_dry_run_preflight_refusal_keeps_exit_code(mock_factory):
+    """A preflight refusal during a dry run still exits 3."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.survey_regions.side_effect = AttachPreflightError("refused")
+    mock_factory.return_value = mock_acquirer
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["9999", "--dry-run"])
+
+    assert result.exit_code == EXIT_PREFLIGHT_REFUSED
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_dry_run_detaches_console_handler(mock_factory):
+    """A dry run leaves the shared logger as it found it."""
+    mock_acquirer = _make_mock_acquirer()
+    mock_acquirer.survey_regions.return_value = _survey()
+    mock_factory.return_value = mock_acquirer
+    shared = logging.getLogger("memslicer")
+    before = list(shared.handlers)
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["1234", "--dry-run", "-v"]).exit_code == 0
+
+    assert shared.handlers == before
+
+
+# ---------- Summary lines for scope, omissions and residency ----------
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_summary_shows_scope_omitted_and_resident_lines(mock_factory):
+    """A scoped, pruned capture reports scope, exclusions, omissions and residency."""
+    mock_factory.return_value = _make_mock_acquirer(
+        scope="heap", regions_omitted=3, pages_nonresident=10,
+        bytes_nonresident=40960, residency_method="pagemap",
+        skip_reasons={"scope": 6},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "1234", "-o", "test.msl", "--scope", "heap",
+        "--exclude-module", "libhwui*", "--exclude-module", "/apex/*",
+        "--resident-only",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "6 outside selected --scope (heap)" in result.output
+    assert "  Scope   : heap" in result.output
+    assert "  Exclude : libhwui*, /apex/*" in result.output
+    assert "  Omitted : 3 regions recorded in RegionOmissionManifest (0x005B)" in result.output
+    assert ("  Resident: 10 pages (40.0 KiB) skipped as never-touched"
+            " (method: pagemap)") in result.output
+    assert "Note    :" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_summary_notes_when_residency_pruning_unavailable(mock_factory):
+    """--resident-only without residency support says so in one line."""
+    mock_factory.return_value = _make_mock_acquirer(residency_method="none")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--resident-only"])
+
+    assert result.exit_code == 0
+    assert "--resident-only was requested but residency information was unavailable" in result.output
+    assert "Resident:" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_summary_unchanged_for_plain_full_capture(mock_factory):
+    """A full capture without exclusions prints none of the new lines."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    for marker in ("Scope   :", "Exclude :", "Omitted :", "Resident:", "Note    :"):
+        assert marker not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_summary_shows_exclude_line_for_full_scope_with_patterns(mock_factory):
+    """--exclude-module alone is enough to print the Scope and Exclude lines."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["1234", "-o", "test.msl", "--exclude-module", "libfoo*"])
+
+    assert result.exit_code == 0
+    assert "  Scope   : full" in result.output
+    assert "  Exclude : libfoo*" in result.output
+
+
+@pytest.mark.parametrize("n, expected", [
+    (0, "0 B"), (512, "512 B"), (1024, "1.0 KiB"), (40960, "40.0 KiB"),
+    (1536 * 1024, "1.5 MiB"), (3 * 1024 ** 3, "3.0 GiB"), (5 * 1024 ** 4, "5120.0 GiB"),
+])
+def test_fmt_size(n, expected):
+    from memslicer.cli import _fmt_size
+    assert _fmt_size(n) == expected
+
+
+# ---------- --no-registers (Thread Context blocks) ----------
+
+@patch("memslicer.cli._create_acquirer")
+def test_no_registers_reaches_factory(mock_factory):
+    """--no-registers turns register capture off at the factory boundary."""
+    mock_factory.return_value = _make_mock_acquirer()
+
+    result = CliRunner().invoke(cli, ["1234", "-o", "test.msl", "--no-registers"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args[1]["capture_registers"] is False
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_registers_captured_by_default(mock_factory):
+    mock_factory.return_value = _make_mock_acquirer()
+
+    result = CliRunner().invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert mock_factory.call_args[1]["capture_registers"] is True
+
+
+def test_create_acquirer_forwards_capture_registers():
+    """The factory passes capture_registers to AcquisitionEngine."""
+    with patch("memslicer.acquirer.engine.AcquisitionEngine") as mock_engine, \
+         patch("memslicer.acquirer.gdb_bridge.GDBBridge"):
+        _create_acquirer(
+            backend="gdb", target=1234, comp_algo=_CompAlgo.NONE,
+            region_filter=_RegionFilter(), os_override=None,
+            logger=logging.getLogger("memslicer"), read_timeout=10.0,
+            usb=False, remote_addr=None, capture_registers=False,
+        )
+    assert mock_engine.call_args[1]["capture_registers"] is False
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_threads_summary_line_shown_when_contexts_written(mock_factory):
+    mock_factory.return_value = _make_mock_acquirer(thread_contexts=7)
+
+    result = CliRunner().invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "  Threads : 7" in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_threads_summary_line_hidden_without_contexts(mock_factory):
+    """A backend that reports no threads leaves the summary as it was."""
+    mock_factory.return_value = _make_mock_acquirer(thread_contexts=0)
+
+    result = CliRunner().invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "Threads :" not in result.output

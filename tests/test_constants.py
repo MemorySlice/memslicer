@@ -4,6 +4,10 @@ from memslicer.msl.constants import (
     COMPRESSED, COMPALGO_MASK, HAS_KEY_HINTS, HAS_CHILDREN, CONTINUATION,
     Endianness, OSType, ArchType, BlockType, CompAlgo, PageState,
     RegionType, CapBit, ClockSource, OmissionReason,
+    VasNameSource, ThreadState, EXTENSION_FORBIDDEN_TYPES,
+    TC_FLAG_CURRENT, TC_FLAG_CRASHED, TC_FLAG_SUSPENDED, TC_FLAG_PARTIAL,
+    REG_ROLE_PC, REG_ROLE_SP, REG_ROLE_FP, REG_ROLE_FLAGS, REG_ROLE_TLS,
+    REG_ROLE_LR,
 )
 
 
@@ -26,7 +30,8 @@ def test_block_header_size():
 
 
 def test_version():
-    assert VERSION == (1, 0)
+    """MSL 1.1: extension segments, EoC BlockCount, VAS NameSource, Thread Context."""
+    assert VERSION == (1, 1)
 
 
 def test_endianness_values():
@@ -89,6 +94,7 @@ def test_block_type_values():
     assert BlockType.ProcessTable == 0x0051
     assert BlockType.ConnectionTable == 0x0052
     assert BlockType.HandleTable == 0x0053
+    assert BlockType.EndOfExtension == 0x0FFE
     assert BlockType.EndOfCapture == 0x0FFF
     assert BlockType.VASMap == 0x1001
     assert BlockType.PointerGraph == 0x1003
@@ -99,6 +105,55 @@ def test_extension_block_type_values():
     assert BlockType.PhysicalMemoryMap == 0x0059
     assert BlockType.ModuleBuildIdManifest == 0x005A
     assert BlockType.RegionOmissionManifest == 0x005B
+
+
+def test_extension_forbidden_types():
+    """Evidence block types barred from extension segments (spec Section 4.6)."""
+    expected = (
+        {0x0001, 0x0002, 0x0030, 0x0040, 0x0FFF}
+        | set(range(0x0010, 0x0016))
+        | set(range(0x0050, 0x0059))
+    )
+    assert EXTENSION_FORBIDDEN_TYPES == frozenset(expected)
+    # Derived views stay allowed.
+    for allowed in (0x0020, 0x0041, 0x0059, 0x005A, 0x005B, 0x0FFE, 0x1001, 0x1003):
+        assert allowed not in EXTENSION_FORBIDDEN_TYPES
+
+
+def test_vas_name_source_values():
+    assert VasNameSource.UNSPECIFIED == 0
+    assert VasNameSource.LIVE == 1
+    assert VasNameSource.SOURCE_METADATA == 2
+    assert VasNameSource.SYNTHESIZED == 3
+    assert len(VasNameSource) == 4
+
+
+def test_thread_state_values():
+    assert ThreadState.UNKNOWN == 0
+    assert ThreadState.RUNNING == 1
+    assert ThreadState.SLEEPING == 2
+    assert ThreadState.STOPPED == 3
+    assert ThreadState.WAITING == 4
+    assert ThreadState.UNINTERRUPTIBLE == 5
+    assert ThreadState.HALTED == 6
+    assert ThreadState.ZOMBIE == 7
+    assert len(ThreadState) == 8
+
+
+def test_thread_context_flag_bits():
+    assert TC_FLAG_CURRENT == 0x0001
+    assert TC_FLAG_CRASHED == 0x0002
+    assert TC_FLAG_SUSPENDED == 0x0004
+    assert TC_FLAG_PARTIAL == 0x0008
+
+
+def test_register_role_bits():
+    assert REG_ROLE_PC == 0x0001
+    assert REG_ROLE_SP == 0x0002
+    assert REG_ROLE_FP == 0x0004
+    assert REG_ROLE_FLAGS == 0x0008
+    assert REG_ROLE_TLS == 0x0010
+    assert REG_ROLE_LR == 0x0020
 
 
 def test_comp_algo_values():

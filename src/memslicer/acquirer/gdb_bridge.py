@@ -25,9 +25,13 @@ from memslicer.acquirer.bridge import (
     PlatformInfo,
     ReadResult,
     FALLBACK_PAGE_SIZE,
+    RegisterValue,
+    ThreadInfo,
     fault_addr_from_text,
+    register_width_bytes,
 )
 from memslicer.acquirer.errors import AttachError
+from memslicer.acquirer.residency import pagemap_readable, read_pagemap
 from memslicer.acquirer.platform_detect import (
     parse_gdb_architecture,
     parse_gdb_auxv_page_size,
@@ -36,7 +40,7 @@ from memslicer.acquirer.platform_detect import (
     detect_os_from_maps,
     valid_page_size,
 )
-from memslicer.msl.constants import OSType
+from memslicer.msl.constants import ArchType, OSType, ThreadState
 
 _LOG = logging.getLogger(__name__)
 
@@ -164,6 +168,105 @@ _PROC_MAPPINGS_RE = re.compile(
 _SHAREDLIB_RE = re.compile(
     r"0x([0-9a-fA-F]+)[ \t]+0x([0-9a-fA-F]+)[ \t]+\S+(?:[ \t]+\(\*\))?[ \t]+(.+)"
 )
+
+
+# "thread apply all p/x $sp" prints one "$N = 0x..." value line per thread.
+# Only those lines are read: the "Thread N (Thread 0x7f... (LWP ...))" headers
+# around them carry a pthread handle in hex that is not a stack pointer.
+_THREAD_SP_RE = re.compile(r"^\$\d+\s*=\s*(0x[0-9a-fA-F]+)", re.MULTILINE)
+
+# "info threads" prints one row per thread after an "Id Target Id Frame"
+# header; the current thread's row starts with "*".
+_INFO_THREADS_ROW_RE = re.compile(r"^\s*(\*?)\s*(\d+)\s+(.*)$")
+_INFO_THREADS_HEADER_RE = re.compile(r"^\s*Id\s+Target\s+Id\s+Frame", re.IGNORECASE)
+# The OS thread id inside the Target Id column: "LWP 5679" on a threaded
+# Linux target, "process 1234" on a single-threaded one.
+_THREAD_LWP_RE = re.compile(r"LWP (\d+)")
+_THREAD_PROCESS_RE = re.compile(r"process (\d+)")
+_THREAD_NAME_RE = re.compile(r'"([^"]*)"')
+_THREAD_RUNNING_RE = re.compile(r"\(running\)")
+# "thread apply all info registers" prints a "Thread N (...)" header before
+# each thread's register file.
+_THREAD_SECTION_RE = re.compile(r"^\s*Thread (\d+) \(")
+# Integer register lines ("rip 0x... 0x... <main+8>", "eflags 0x246 [ IF ]").
+# Vector and x87 registers print a brace or decimal value and do not match.
+_REGISTER_LINE_RE = re.compile(r"^([a-z][a-z0-9_]*)\s+(0x[0-9a-fA-F]+)")
+
+
+def _thread_tid(target_text: str, gdb_number: int) -> int:
+    """OS thread id from an ``info threads`` Target Id column.
+
+    ``LWP`` names the kernel thread; a non-threaded target has only a
+    ``process`` id; otherwise the GDB thread number is the best available.
+    """
+    for pattern in (_THREAD_LWP_RE, _THREAD_PROCESS_RE):
+        match = pattern.search(target_text)
+        if match is not None:
+            return int(match.group(1))
+    return gdb_number
+
+
+def _parse_info_threads(output: str) -> list[tuple[int, ThreadInfo]]:
+    """``info threads`` rows as ``(gdb_number, ThreadInfo)`` without registers.
+
+    All-stop GDB only answers while the inferior is ptrace-stopped, so a row
+    is STOPPED and suspended unless GDB marks it ``(running)``.
+    """
+    rows: list[tuple[int, ThreadInfo]] = []
+    for line in output.splitlines():
+        if _INFO_THREADS_HEADER_RE.match(line):
+            continue
+        match = _INFO_THREADS_ROW_RE.match(line)
+        if match is None:
+            continue
+        gdb_number, target_text = int(match.group(2)), match.group(3)
+        name = _THREAD_NAME_RE.search(target_text)
+        running = _THREAD_RUNNING_RE.search(target_text) is not None
+        info = ThreadInfo(
+            tid=_thread_tid(target_text, gdb_number),
+            name=name.group(1) if name else "",
+            state=ThreadState.RUNNING if running else ThreadState.STOPPED,
+            suspended=not running,
+        )
+        rows.append((gdb_number, info))
+    return rows
+
+
+def _parse_register_line(
+    line: str, width: int, arch: ArchType,
+) -> RegisterValue | None:
+    """One ``info registers`` line as a :class:`RegisterValue`, or ``None``.
+
+    Non-integer lines (vector, x87) and values wider than the architecture's
+    integer registers are skipped: their layout is unknown, not a failure.
+    """
+    match = _REGISTER_LINE_RE.match(line)
+    if match is None:
+        return None
+    value = int(match.group(2), 16)
+    if value >= 1 << (width * 8):
+        return None
+    return RegisterValue.from_int(match.group(1), value, width, arch)
+
+
+def _parse_thread_registers(
+    output: str, arch: ArchType,
+) -> dict[int, list[RegisterValue]]:
+    """``thread apply all info registers`` output keyed by GDB thread number."""
+    width = register_width_bytes(arch)
+    sections: dict[int, list[RegisterValue]] = {}
+    current: list[RegisterValue] | None = None
+    for line in output.splitlines():
+        header = _THREAD_SECTION_RE.match(line)
+        if header is not None:
+            current = sections.setdefault(int(header.group(1)), [])
+            continue
+        if current is None:
+            continue
+        register = _parse_register_line(line, width, arch)
+        if register is not None:
+            current.append(register)
+    return sections
 
 
 def _mapping_protection(perms: str | None) -> str:
@@ -303,6 +406,8 @@ class GDBBridge:
         self._preflight: PreflightResult | None = None
         # "info proc mappings" output, cached for the life of the connection.
         self._proc_mappings_text: str | None = None
+        # "show architecture" answer, cached for the life of the connection.
+        self._arch_cache: ArchType | None = None
 
     @staticmethod
     def _resolve_pid(name: str, logger: logging.Logger) -> int:
@@ -501,6 +606,7 @@ class GDBBridge:
         arch = parse_gdb_architecture(
             self._send_console_command("show architecture")
         )
+        self._arch_cache = arch
 
         pid = self._target_pid()
         os_type = self._detect_os(pid)
@@ -718,6 +824,104 @@ class GDBBridge:
             name = os.path.basename(path)
             modules.append(ModuleInfo(name, path, base, end - base))
         return modules
+
+    # -- Page residency and thread stacks -----------------------------------
+
+    def residency_method(self) -> str:
+        """``"pagemap"`` for a local target whose pagemap this host can open.
+
+        Implements :class:`~memslicer.acquirer.bridge.ResidencyCapable`. A
+        remote target's ``/proc`` lives on the other machine, and a host
+        without ``/proc/<pid>/pagemap`` (macOS, Windows) cannot open the file
+        at all, so both answer ``"none"``.
+        """
+        if self.is_remote:
+            return "none"
+        return "pagemap" if pagemap_readable(self._pid) else "none"
+
+    def query_residency(self, address: int, size: int) -> bytes | None:
+        """Residency mask of a local target from ``/proc/<pid>/pagemap``.
+
+        Implements :class:`~memslicer.acquirer.bridge.ResidencyCapable`. The
+        page size is the local probe's answer -- for a local target that is
+        ``sysconf`` on this very machine, so no GDB round trip is needed.
+        """
+        if self.is_remote:
+            return None
+        page_size, _assumed = self._detect_page_size()
+        return read_pagemap(self._pid, address, size, page_size)
+
+    def enumerate_stack_pointers(self) -> list[int]:
+        """Current SP of every thread, from ``thread apply all p/x $sp``.
+
+        Implements :class:`~memslicer.acquirer.bridge.ThreadStackCapable`.
+        ``-q`` is deliberately not passed: GDB before 8.3 rejects it, and the
+        value-line regex already ignores the per-thread headers it would hide.
+
+        Returns:
+            The stack pointers in GDB's thread order, duplicates dropped;
+            ``[]`` when GDB cannot answer.
+        """
+        try:
+            output = self._send_console_command("thread apply all p/x $sp")
+        except (RuntimeError, TimeoutError, OSError, ValueError) as exc:
+            self._log.debug("GDB could not report thread stack pointers: %s", exc)
+            return []
+        values = (int(sp, 16) for sp in _THREAD_SP_RE.findall(output))
+        return list(dict.fromkeys(values))
+
+    def _cached_arch(self) -> ArchType:
+        """The target architecture, asking GDB only the first time."""
+        if self._arch_cache is None:
+            self._arch_cache = parse_gdb_architecture(
+                self._send_console_command("show architecture")
+            )
+        return self._arch_cache
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Every thread with its integer register file.
+
+        Implements :class:`~memslicer.acquirer.bridge.ThreadRegistersCapable`.
+        Issues ``info threads`` for the thread list and ``thread apply all
+        info registers`` for the register files, then joins the two on the
+        GDB thread number.
+
+        Returns:
+            The threads in ``info threads`` order (GDB thread 1 is the main
+            thread). A thread without a register section, or whose section
+            lacks a program counter or stack pointer, is left out; ``[]``
+            when GDB cannot answer.
+        """
+        try:
+            arch = self._cached_arch()
+            rows = _parse_info_threads(self._send_console_command("info threads"))
+            if not rows:
+                return []
+            sections = _parse_thread_registers(
+                self._send_console_command("thread apply all info registers"), arch,
+            )
+        except (MIError, RuntimeError, TimeoutError, OSError, ValueError) as exc:
+            self._log.debug("GDB could not report thread registers: %s", exc)
+            return []
+        return self._join_thread_registers(rows, sections)
+
+    def _join_thread_registers(
+        self,
+        rows: list[tuple[int, ThreadInfo]],
+        sections: dict[int, list[RegisterValue]],
+    ) -> list[ThreadInfo]:
+        """Attach each thread's register section; drop threads without PC/SP."""
+        threads: list[ThreadInfo] = []
+        for gdb_number, info in rows:
+            info.registers = sections.get(gdb_number, [])
+            if not info.has_pc_and_sp:
+                self._log.debug(
+                    "GDB thread %d (tid %d) has no usable register file; skipped",
+                    gdb_number, info.tid,
+                )
+                continue
+            threads.append(info)
+        return threads
 
     def _read_once(
         self, address: int, size: int, span: tuple[int, int],

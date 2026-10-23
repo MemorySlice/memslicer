@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from memslicer.msl.constants import (
     OSType, ArchType, CompAlgo, PageState, RegionType, BlockType,
     Endianness, VERSION, HASH_SIZE, ClockSource, HashAlgo, OmissionReason,
+    VasNameSource, ThreadState,
 )
 
 
@@ -48,12 +49,15 @@ class VasEntry:
     range whose bytes were not stored. ``mapped_path`` carries the full
     mapping name (file path or pseudo name such as
     ``[anon:dalvik-main space (region space)]``); empty for anonymous ranges.
+    ``name_source`` records how that name was obtained (spec Section 5.8);
+    it is the last field so positional construction keeps working.
     """
     base_addr: int = 0
     region_size: int = 0
     protection: int = 0  # bit0=R, bit1=W, bit2=X
     region_type: RegionType = RegionType.Unknown
     mapped_path: str = ""
+    name_source: VasNameSource = VasNameSource.UNSPECIFIED
 
 
 @dataclass
@@ -69,9 +73,57 @@ class ModuleEntry:
 
 @dataclass
 class EndOfCapture:
-    """End of capture marker."""
+    """End of capture marker (Block 0x0FFF, spec Section 4.5).
+
+    ``block_count`` is the number of capture-segment blocks including the
+    EoC itself; 0 means unknown (a legacy 40-byte payload).
+    """
     file_hash: bytes = field(default_factory=lambda: b'\x00' * HASH_SIZE)
     acq_end_ns: int = 0
+    block_count: int = 0
+
+
+@dataclass
+class EndOfExtension:
+    """Terminator of an extension segment (Block 0x0FFE, spec Section 4.6).
+
+    ``segment_hash`` covers the segment's bytes from its first block up to
+    (not including) this block; ``block_count`` includes the terminator.
+    """
+    segment_hash: bytes
+    written_at_ns: int
+    block_count: int
+    producer: str = ""
+
+
+@dataclass
+class ThreadRegister:
+    """One register of a Thread Context block (spec Table 19b).
+
+    ``width`` is the value size in bytes (1-255); ``flags`` carries the
+    ``REG_ROLE_*`` role bits; ``value`` holds exactly ``width`` bytes in the
+    file's byte order.
+    """
+    name: str
+    width: int
+    flags: int
+    value: bytes
+
+
+@dataclass
+class ThreadContext:
+    """Thread Context block (0x0011, spec Tables 19a/19b).
+
+    ``flags`` carries the ``TC_FLAG_*`` bits; ``arch`` is 0 for the header
+    ArchType or an :class:`ArchType` code for mixed-mode threads.
+    """
+    thread_id: int
+    start_time_ns: int = 0
+    flags: int = 0
+    state: ThreadState = ThreadState.UNKNOWN
+    arch: int = 0
+    name: str = ""
+    registers: list[ThreadRegister] = field(default_factory=list)
 
 
 @dataclass

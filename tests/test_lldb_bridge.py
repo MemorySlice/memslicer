@@ -1570,3 +1570,411 @@ class TestLLDBImportMessage:
         assert "could not be loaded by this interpreter" in message
         assert sys.executable in message
         assert "cannot import name '_lldb'" in message
+
+
+# ---------------------------------------------------------------------------
+# Tests -- page residency
+# ---------------------------------------------------------------------------
+
+def _connect_local_linux(page_size=4096):
+    """Connect a bridge to a mocked *local* Linux target.
+
+    Mirrors ``TestLLDBBridgeLinuxRefinement``: the triple says Linux, sysconf
+    answers *page_size*, and no /proc/<pid>/maps exists to refine from.
+
+    Returns (bridge, mock_process).
+    """
+    mock_lldb, _debugger, mock_target, mock_process = _make_mock_lldb()
+    mock_target.GetTriple.return_value = "x86_64-unknown-linux-gnu"
+
+    with patch.dict(sys.modules, {"lldb": mock_lldb}), \
+         patch("os.sysconf", return_value=page_size), \
+         patch("os.path.isfile", return_value=False):
+        from memslicer.acquirer.lldb_bridge import LLDBBridge
+
+        bridge = LLDBBridge(target=1234, logger=MagicMock())
+        bridge.connect()
+
+    return bridge, mock_process
+
+
+class TestLLDBBridgeResidency:
+    """Residency comes from a local Linux target's /proc/<pid>/pagemap only."""
+
+    def test_local_linux_readable_pagemap_reports_pagemap(self):
+        bridge, _process = _connect_local_linux()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "pagemap"
+
+        # The PID LLDB attached to, not the constructor argument.
+        probe.assert_called_once_with(9999)
+
+    def test_local_linux_unreadable_pagemap_reports_none(self):
+        bridge, _process = _connect_local_linux()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=False,
+        ):
+            assert bridge.residency_method() == "none"
+
+    def test_macos_target_reports_none_without_probing(self):
+        bridge, *_ = _create_and_connect()
+        assert bridge.get_platform_info().os == OSType.macOS
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "none"
+
+        probe.assert_not_called()
+
+    def test_remote_linux_target_reports_none_without_probing(self):
+        """A remote target's /proc lives on the other machine."""
+        bridge, _lldb, _platform, _logger = _connect_remote()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.pagemap_readable", return_value=True,
+        ) as probe:
+            assert bridge.residency_method() == "none"
+
+        probe.assert_not_called()
+
+    def test_before_connect_reports_none(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.residency_method() == "none"
+
+    def test_query_reads_pagemap_with_the_target_page_size(self):
+        bridge, _process = _connect_local_linux(page_size=16384)
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.read_pagemap", return_value=b"\x01\x00",
+        ) as reader:
+            mask = bridge.query_residency(0x10000, 0x8000)
+
+        assert mask == b"\x01\x00"
+        reader.assert_called_once_with(9999, 0x10000, 0x8000, 16384)
+
+    def test_query_passes_an_unreadable_pagemap_through(self):
+        bridge, _process = _connect_local_linux()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.read_pagemap", return_value=None,
+        ):
+            assert bridge.query_residency(0x10000, 0x1000) is None
+
+    def test_query_macos_returns_none_without_reading(self):
+        bridge, *_ = _create_and_connect()
+
+        with patch(
+            "memslicer.acquirer.lldb_bridge.read_pagemap", return_value=b"\x01",
+        ) as reader:
+            assert bridge.query_residency(0x10000, 0x1000) is None
+
+        reader.assert_not_called()
+
+    def test_query_before_connect_returns_none(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.query_residency(0x10000, 0x1000) is None
+
+    def test_bridge_satisfies_residency_capable(self):
+        from memslicer.acquirer.bridge import ResidencyCapable
+
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert isinstance(bridge, ResidencyCapable)
+
+
+# ---------------------------------------------------------------------------
+# Tests -- thread stack pointers
+# ---------------------------------------------------------------------------
+
+def _thread_with_sp(sp, valid=True):
+    """A mock SBThread whose frame 0 reports *sp*."""
+    thread = MagicMock()
+    frame = thread.GetFrameAtIndex.return_value
+    frame.IsValid.return_value = valid
+    frame.GetSP.return_value = sp
+    return thread
+
+
+class TestLLDBBridgeStackPointers:
+    """enumerate_stack_pointers() reads frame 0 of every thread."""
+
+    def test_reads_frame_zero_sp_of_every_thread(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        threads = [_thread_with_sp(0x7fff0000), _thread_with_sp(0x7ffe0000)]
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = threads
+
+        assert bridge.enumerate_stack_pointers() == [0x7fff0000, 0x7ffe0000]
+
+        process.GetThreadAtIndex.assert_any_call(0)
+        process.GetThreadAtIndex.assert_any_call(1)
+        for thread in threads:
+            thread.GetFrameAtIndex.assert_called_once_with(0)
+
+    def test_unreadable_sps_are_left_out(self):
+        """Invalid address, zero, a non-int answer and an invalid frame."""
+        from memslicer.acquirer.lldb_bridge import _LLDB_INVALID_ADDRESS
+
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.return_value = 5
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_sp(0x7fff0000),
+            _thread_with_sp(_LLDB_INVALID_ADDRESS),
+            _thread_with_sp(0),
+            _thread_with_sp(MagicMock()),
+            _thread_with_sp(0x7ffe0000, valid=False),
+        ]
+
+        assert bridge.enumerate_stack_pointers() == [0x7fff0000]
+
+    def test_thread_raising_is_left_out(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            RuntimeError("thread exited"), _thread_with_sp(0x7ffe0000),
+        ]
+
+        assert bridge.enumerate_stack_pointers() == [0x7ffe0000]
+
+    def test_thread_count_failure_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.side_effect = RuntimeError("process gone")
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_non_int_thread_count_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+
+        assert not isinstance(process.GetNumThreads(), int)
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_before_connect_gives_empty(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_after_disconnect_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = _thread_with_sp(0x7fff0000)
+
+        bridge.disconnect()
+
+        assert bridge.enumerate_stack_pointers() == []
+
+    def test_bridge_satisfies_thread_stack_capable(self):
+        from memslicer.acquirer.bridge import ThreadStackCapable
+
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert isinstance(bridge, ThreadStackCapable)
+
+
+def _mock_register(name, value, byte_size):
+    """Build a MagicMock SBValue for one register."""
+    reg = MagicMock()
+    reg.GetName.return_value = name
+    reg.GetByteSize.return_value = byte_size
+    reg.GetValueAsUnsigned.return_value = value
+    return reg
+
+
+def _thread_with_registers(tid, name, regs, *, valid=True):
+    """Build a MagicMock SBThread whose frame 0 carries *regs*.
+
+    *regs* maps a register name to ``(value, byte_size)``; the registers are
+    returned in one register set, in dict order.
+    """
+    thread = MagicMock()
+    thread.GetThreadID.return_value = tid
+    thread.GetName.return_value = name
+    frame = thread.GetFrameAtIndex.return_value
+    frame.IsValid.return_value = valid
+    reg_set = [_mock_register(n, v, size) for n, (v, size) in regs.items()]
+    frame.GetRegisters.return_value = [reg_set]
+    return thread
+
+
+_X86_64_REGS = {
+    "rip": (0x401000, 8), "rsp": (0x7fff0000, 8), "rbp": (0x7fff0100, 8),
+    "rax": (0x2a, 8), "rflags": (0x246, 8), "cs": (0x33, 2),
+}
+
+
+def _registers_readable(mock_lldb):
+    """Make every SBError the bridge creates report success."""
+    mock_lldb.SBError.return_value.Fail.return_value = False
+
+
+class TestLLDBBridgeEnumerateThreads:
+    """enumerate_threads() reads the frame-0 register file of every thread."""
+
+    @staticmethod
+    def _by_name(info):
+        return {r.name: r for r in info.registers}
+
+    def test_reads_registers_of_every_thread(self):
+        from memslicer.msl.constants import (
+            REG_ROLE_FLAGS, REG_ROLE_FP, REG_ROLE_PC, REG_ROLE_SP, ThreadState,
+        )
+
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        second = dict(_X86_64_REGS, rsp=(0x7ffe0000, 8))
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_registers(101, "main", _X86_64_REGS),
+            _thread_with_registers(102, "worker", second),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [101, 102]
+        assert [t.name for t in threads] == ["main", "worker"]
+        assert all(t.suspended is True for t in threads)
+        assert all(t.state == ThreadState.STOPPED for t in threads)
+        assert all(t.partial is False for t in threads)
+        regs = self._by_name(threads[0])
+        assert set(regs) == {"rip", "rsp", "rbp", "rax", "rflags", "cs"}
+        assert regs["rip"].role == REG_ROLE_PC
+        assert regs["rsp"].role == REG_ROLE_SP
+        assert regs["rbp"].role == REG_ROLE_FP
+        assert regs["rflags"].role == REG_ROLE_FLAGS
+        assert regs["rax"].role == 0
+        assert regs["rsp"].value == (0x7fff0000).to_bytes(8, "little")
+        assert regs["rsp"].width == 8
+        assert regs["cs"].value == (0x33).to_bytes(2, "little")
+        assert regs["cs"].width == 2
+        assert threads[1].stack_pointer == 0x7ffe0000
+
+    def test_registers_wider_than_eight_bytes_are_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        regs = dict(_X86_64_REGS, xmm0=(0x1234, 16))
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = _thread_with_registers(1, "", regs)
+
+        (info,) = bridge.enumerate_threads()
+
+        assert "xmm0" not in self._by_name(info)
+        assert info.partial is False
+
+    def test_unreadable_register_is_left_out_and_marks_partial(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        regs = dict(_X86_64_REGS, fs_base=(0x7f00, 8))
+        thread = _thread_with_registers(1, "", regs)
+        (reg_set,) = thread.GetFrameAtIndex.return_value.GetRegisters.return_value
+        fs_base = next(r for r in reg_set if r.GetName() == "fs_base")
+
+        def failing_read(error, default):
+            error.Fail.return_value = True
+            return default
+
+        fs_base.GetValueAsUnsigned.side_effect = failing_read
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = thread
+
+        (info,) = bridge.enumerate_threads()
+
+        assert "fs_base" not in self._by_name(info)
+        assert "rip" in self._by_name(info)
+        assert info.partial is True
+
+    def test_register_without_name_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        regs = dict(_X86_64_REGS, nameless=(0x1, 8))
+        thread = _thread_with_registers(1, "", regs)
+        (reg_set,) = thread.GetFrameAtIndex.return_value.GetRegisters.return_value
+        reg_set[-1].GetName.return_value = None
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = thread
+
+        (info,) = bridge.enumerate_threads()
+
+        assert set(self._by_name(info)) == set(_X86_64_REGS)
+        assert info.partial is False
+
+    def test_thread_without_stack_pointer_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        no_sp = {k: v for k, v in _X86_64_REGS.items() if k != "rsp"}
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_registers(1, "", no_sp),
+            _thread_with_registers(2, "", _X86_64_REGS),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_invalid_frame_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            _thread_with_registers(1, "", _X86_64_REGS, valid=False),
+            _thread_with_registers(2, "", _X86_64_REGS),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_thread_raising_is_left_out(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 2
+        process.GetThreadAtIndex.side_effect = [
+            RuntimeError("thread exited"),
+            _thread_with_registers(2, "", _X86_64_REGS),
+        ]
+
+        threads = bridge.enumerate_threads()
+
+        assert [t.tid for t in threads] == [2]
+
+    def test_thread_count_failure_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+        process.GetNumThreads.side_effect = RuntimeError("process gone")
+
+        assert bridge.enumerate_threads() == []
+
+    def test_non_int_thread_count_gives_empty(self):
+        bridge, _lldb, _dbg, _target, process = _create_and_connect()
+
+        assert not isinstance(process.GetNumThreads(), int)
+        assert bridge.enumerate_threads() == []
+
+    def test_before_connect_gives_empty(self):
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert bridge.enumerate_threads() == []
+
+    def test_after_disconnect_gives_empty(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = _thread_with_registers(
+            1, "", _X86_64_REGS,
+        )
+
+        bridge.disconnect()
+
+        assert bridge.enumerate_threads() == []
+
+    def test_bridge_satisfies_thread_registers_capable(self):
+        from memslicer.acquirer.bridge import ThreadRegistersCapable
+
+        bridge = TestLLDBBridgeBeforeConnect._unconnected_bridge()
+
+        assert isinstance(bridge, ThreadRegistersCapable)

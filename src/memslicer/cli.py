@@ -20,7 +20,15 @@ from memslicer.acquirer.identity import (
     attribution_options,
     validate_attribution,
 )
-from memslicer.acquirer.region_filter import RegionFilter, SKIP_REASON_LABELS
+from memslicer.acquirer.region_classify import RegionCategory
+from memslicer.acquirer.region_filter import (
+    SKIP_REASON_LABELS,  # noqa: F401  (kept for importers; skip_label wraps it)
+    RegionFilter,
+    parse_scope,
+    scope_label,
+    skip_label,
+)
+from memslicer.cli_verify import verify
 from memslicer.msl.constants import CompAlgo, HashAlgo, OSType
 from memslicer.utils.protection import parse_protection
 
@@ -28,19 +36,186 @@ from memslicer.utils.protection import parse_protection
 _MAX_SHOWN_UNREADABLE = 5
 
 
-def _render_attach_error(error: AttachError, log_file_path: str) -> None:
+def _render_attach_error(error: AttachError, log_file_path: str | None = None) -> None:
     """Print an attach failure as one actionable block.
 
     Args:
         error: The attach error to render.
-        log_file_path: Path of the ``.msl.log`` holding the full record.
+        log_file_path: Path of the ``.msl.log`` holding the full record, or
+            ``None`` when no log was written (a ``--dry-run``).
     """
     click.echo(f"\nError: {error}", err=True)
     for line in error.remediation:
         click.echo(f"  → {line}", err=True)
     if error.probable_cause:
         click.echo(f"  Probable cause: {error.probable_cause}", err=True)
-    click.echo(f"  Full environment record: {log_file_path}", err=True)
+    if log_file_path is not None:
+        click.echo(f"  Full environment record: {log_file_path}", err=True)
+
+
+def _fmt_size(n: int) -> str:
+    """Format a byte count as B/KiB/MiB/GiB with one decimal."""
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            return f"{n} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def _parse_scope_option(text: str) -> frozenset[str]:
+    """Parse ``--scope``, turning a bad value into a click usage error."""
+    try:
+        return parse_scope(text)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--scope")
+
+
+def _device_label(remote_addr: str | None, device_id: str | None, usb: bool) -> str:
+    """Describe where the target lives, for the console banner."""
+    if remote_addr:
+        return remote_addr
+    if device_id:
+        return f"{device_id} (USB)"
+    if usb:
+        return "USB"
+    return "local"
+
+
+def _category_label(category: RegionCategory) -> str:
+    """Render a RegionCategory as a lower-case, hyphenated word."""
+    return category.name.lower().replace("_", "-")
+
+
+def _echo_scope_summary(result: AcquireResult, region_filter: RegionFilter,
+                        resident_only: bool) -> None:
+    """Report scope, exclusions, omissions and residency pruning.
+
+    Only lines that carry information are printed, so a plain full capture
+    reads exactly as before.
+
+    Args:
+        result: The acquisition result to report on.
+        region_filter: The filter the capture ran with.
+        resident_only: Whether ``--resident-only`` was requested.
+    """
+    if result.scope != "full" or region_filter.exclude_modules:
+        click.echo(f"  Scope   : {result.scope}")
+        click.echo(f"  Exclude : {', '.join(region_filter.exclude_modules) or 'none'}")
+    if result.regions_omitted:
+        click.echo(f"  Omitted : {result.regions_omitted} regions recorded in"
+                   f" RegionOmissionManifest (0x005B)")
+    if result.pages_nonresident:
+        click.echo(f"  Resident: {result.pages_nonresident:,} pages"
+                   f" ({_fmt_size(result.bytes_nonresident)}) skipped as"
+                   f" never-touched (method: {result.residency_method})")
+    if resident_only and result.residency_method == "none":
+        click.echo("  Note    : --resident-only was requested but residency"
+                   " information was unavailable; every page was read")
+
+
+# Skip reasons whose regions could not have been read anyway, so a dry run
+# does not count them as readable bytes the operator chose to leave out.
+_UNREADABLE_SKIP_REASONS = frozenset({"no-read", "kernel-pseudo"})
+
+
+def _render_category_table(survey) -> None:
+    """Print one row per RegionCategory, largest total first."""
+    rows = sorted(survey.bytes_by_category().items(),
+                  key=lambda item: -(item[1][1] + item[1][3]))
+    click.echo(f"  {'category':<14} {'regions kept':>12} {'bytes kept':>12}"
+               f" {'regions skipped':>15} {'bytes skipped':>13}")
+    for category, (kept_n, kept_b, skipped_n, skipped_b) in rows:
+        click.echo(f"  {_category_label(category):<14} {kept_n:>12,}"
+                   f" {_fmt_size(kept_b):>12} {skipped_n:>15,}"
+                   f" {_fmt_size(skipped_b):>13}")
+
+
+def _render_owner_table(survey, limit: int = 15) -> None:
+    """Print the largest owners (modules or region labels)."""
+    rows = survey.bytes_by_owner(limit)
+    if not rows:
+        return
+    width = max(len("owner"), *(len(label) for label, _, _ in rows))
+    click.echo("  Top owners:")
+    click.echo(f"  {'owner':<{width}} {'bytes kept':>12} {'bytes skipped':>13}")
+    for label, kept_b, skipped_b in rows:
+        click.echo(f"  {label:<{width}} {_fmt_size(kept_b):>12}"
+                   f" {_fmt_size(skipped_b):>13}")
+
+
+def _render_survey_totals(survey) -> None:
+    """Print the one-line verdict: what would be captured out of what."""
+    kept = survey.kept()
+    kept_bytes = sum(d.range.size for d in kept)
+    readable = kept_bytes + sum(
+        d.range.size for d in survey.skipped()
+        if d.skip_reason not in _UNREADABLE_SKIP_REASONS
+    )
+    click.echo(f"  Would capture {_fmt_size(kept_bytes)} of {_fmt_size(readable)}"
+               f" readable bytes across {len(kept)} of"
+               f" {len(survey.decisions)} regions")
+
+
+def _render_survey_skip_reasons(survey, scope: frozenset[str]) -> None:
+    """Print why regions would be skipped, most frequent first."""
+    counts = survey.skip_reason_counts()
+    if not counts:
+        return
+    click.echo("  Skipped :")
+    for reason, count in sorted(counts.items(), key=lambda x: -x[1]):
+        click.echo(f"            {count} {skip_label(reason, scope)}")
+
+
+def _render_survey(survey, region_filter: RegionFilter, *, target: str,
+                   backend: str, device_str: str) -> None:
+    """Print a dry-run report of what an acquisition would capture.
+
+    Args:
+        survey: The :class:`RegionSurvey` the engine produced.
+        region_filter: The filter the survey was planned with.
+        target: The target as the operator typed it.
+        backend: Debugger backend name.
+        device_str: Device description from :func:`_device_label`.
+    """
+    exclude = ", ".join(region_filter.exclude_modules) or "none"
+    click.echo(f"MemSlicer - Dry run for {target} (nothing is written)")
+    click.echo(f"Backend: {backend} | Device: {device_str} | OS: {survey.os_type.name}"
+               f" | Scope: {scope_label(region_filter.scope)} | Exclude: {exclude}")
+    click.echo(f"  Regions : {len(survey.decisions)} enumerated,"
+               f" page size {survey.page_size:,}")
+    _render_category_table(survey)
+    _render_owner_table(survey)
+    _render_survey_totals(survey)
+    _render_survey_skip_reasons(survey, region_filter.scope)
+
+
+def _run_dry_run(acquirer_kwargs: dict, region_filter: RegionFilter, *,
+                 target: str, backend: str, device_str: str,
+                 logger: logging.Logger) -> None:
+    """Survey the target and print the report; never writes a file.
+
+    Attach failures use the same rendering as a real capture, minus the
+    log-file pointer, since no ``.msl.log`` exists for a dry run.
+    """
+    acquirer = _create_acquirer(**acquirer_kwargs)
+    try:
+        survey = acquirer.survey_regions()
+    except KeyboardInterrupt:
+        click.echo("\nForce quit.")
+        raise SystemExit(1)
+    except AttachPreflightError as e:
+        _render_attach_error(e)
+        raise SystemExit(EXIT_PREFLIGHT_REFUSED)
+    except AttachError as e:
+        _render_attach_error(e)
+        raise SystemExit(1)
+    except Exception as e:
+        logger.debug("Dry run failed", exc_info=True)
+        click.echo(f"\nError: {e}", err=True)
+        raise SystemExit(1)
+    _render_survey(survey, region_filter, target=target, backend=backend,
+                   device_str=device_str)
 
 
 def _echo_unreadable_ranges(result: AcquireResult) -> None:
@@ -274,6 +449,9 @@ def _create_acquirer(
     attribution=None,
     hash_algo: HashAlgo = HashAlgo.BLAKE3,
     device_id: str | None = None,
+    app_paths: tuple[str, ...] = (),
+    resident_only: bool = False,
+    capture_registers: bool = True,
 ):
     """Factory to create the appropriate acquirer for the selected backend."""
     from memslicer.acquirer.engine import AcquisitionEngine
@@ -333,6 +511,9 @@ def _create_acquirer(
         collector=collector,
         attribution=attribution,
         hash_algo=hash_algo,
+        app_paths=app_paths,
+        resident_only=resident_only,
+        capture_registers=capture_registers,
     )
 
 
@@ -352,15 +533,22 @@ def _create_acquirer(
 @click.option("--include-unreadable", is_flag=True, help="Include regions with no read permission")
 @click.option("--skip-kernel-pseudo", is_flag=True, help="Skip kernel pseudo-mappings ([vvar], [vsyscall]) instead of attempting them")
 @click.option("--max-region-size", type=int, default=0, help="Skip regions larger than this size (0 = no limit)")
+@click.option("--scope", default="full", help="Which memory to capture: full (default), app (drop clean read-only mappings of system libraries and device memory), heap (every native and managed heap), stack (thread stacks). Combine with commas, e.g. heap,stack (alias: heapstack).")
+@click.option("--exclude-module", "exclude_module", metavar="PATTERN", multiple=True, help="Skip regions belonging to modules matching this glob (basename, e.g. 'libhwui*'; full path when the pattern contains '/'). Repeatable.")
+@click.option("--app-path", "app_path", metavar="PREFIX", multiple=True, help="Treat files under this path prefix as app-owned for --scope app. Repeatable.")
+@click.option("--resident-only", is_flag=True, help="Skip anonymous pages that were never touched (not resident, not swapped); they read as zero. Needs /proc/<pid>/pagemap or mincore in the target; falls back to full reads with a warning.")
+@click.option("--no-registers", is_flag=True, default=False, help="Do not capture thread register state (no Thread Context blocks). Thread stack pointers are then only queried for --scope heap/stack.")
+@click.option("--dry-run", is_flag=True, help="Enumerate and classify regions, print what would be captured under the current options, and exit without writing a file. On the Frida backend this still injects the agent into the target.")
 @click.option("--investigation", "-I", is_flag=True, help="Investigation mode: capture system-wide context (encrypted by default)")
 @click.option("--encrypt", "-E", is_flag=True, default=False, help="Enable AEAD encryption")
 @click.option("--no-encrypt", is_flag=True, default=False, help="Disable encryption (overrides investigation default)")
 @click.option("--passphrase", default=None, help="Encryption passphrase (prompted if --encrypt and not provided)")
 @click.option("--hash-algo", "hash_algo_str", type=click.Choice(["blake3", "sha256", "sha512-256"]), default="blake3", help="Integrity hash algorithm (default: blake3)")
 @attribution_options
-def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_override, filter_prot, filter_addr,
+def acquire(target, backend, output_path, comp, usb, device_id, remote_addr, os_override, filter_prot, filter_addr,
         verbose, read_timeout, include_unreadable, skip_kernel_pseudo,
-        max_region_size, investigation,
+        max_region_size, scope, exclude_module, app_path, resident_only,
+        no_registers, dry_run, investigation,
         encrypt, no_encrypt, passphrase, hash_algo_str,
         examiner, case_ref, hostname_override, domain_override,
         include_serials, include_network_identity, include_fingerprint,
@@ -462,11 +650,44 @@ def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_over
         skip_no_read=not include_unreadable,
         skip_kernel_pseudo=skip_kernel_pseudo,
         max_region_size=max_region_size,
+        scope=_parse_scope_option(scope),
+        exclude_modules=list(exclude_module),
     )
     if filter_prot:
         region_filter.min_prot = parse_protection(filter_prot)
     if filter_addr:
         region_filter.addr_ranges.append(_parse_addr_range(filter_addr))
+
+    # Everything the factory needs, shared by the dry run and the capture.
+    acquirer_kwargs = dict(
+        backend=backend,
+        target=parsed_target,
+        comp_algo=comp_algo,
+        region_filter=region_filter,
+        os_override=os_ovr,
+        logger=logger,
+        read_timeout=read_timeout,
+        usb=usb,
+        remote_addr=remote_addr,
+        investigation=investigation,
+        passphrase=passphrase if use_encryption else None,
+        device_id=device_id,
+        attribution=attribution,
+        hash_algo=hash_algo,
+        app_paths=tuple(app_path),
+        resident_only=resident_only,
+        capture_registers=not no_registers,
+    )
+    device_str = _device_label(remote_addr, device_id, usb)
+
+    # A dry run plans the capture and reports it; no output file, no log file.
+    if dry_run:
+        try:
+            _run_dry_run(acquirer_kwargs, region_filter, target=target,
+                         backend=backend, device_str=device_str, logger=logger)
+        finally:
+            logger.removeHandler(handler)
+        return
 
     # Default output path
     if output_path is None:
@@ -481,16 +702,6 @@ def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_over
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.setLevel(logging.DEBUG)  # Logger must accept DEBUG for file handler
     logger.addHandler(file_handler)
-
-    # Determine device display string
-    if remote_addr:
-        device_str = remote_addr
-    elif device_id:
-        device_str = f"{device_id} (USB)"
-    elif usb:
-        device_str = "USB"
-    else:
-        device_str = "local"
 
     click.echo(f"MemSlicer - Dumping {target} -> {output_path}")
     click.echo(f"Backend: {backend} | Compression: {comp} | Device: {device_str}")
@@ -517,22 +728,7 @@ def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_over
         logger.addHandler(progress_handler)
 
     # Create acquirer via factory
-    acquirer = _create_acquirer(
-        backend=backend,
-        target=parsed_target,
-        comp_algo=comp_algo,
-        region_filter=region_filter,
-        os_override=os_ovr,
-        logger=logger,
-        read_timeout=read_timeout,
-        usb=usb,
-        remote_addr=remote_addr,
-        investigation=investigation,
-        passphrase=passphrase if use_encryption else None,
-        device_id=device_id,
-        attribution=attribution,
-        hash_algo=hash_algo,
-    )
+    acquirer = _create_acquirer(**acquirer_kwargs)
     acquirer.set_progress_callback(progress)
 
     try:
@@ -556,8 +752,9 @@ def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_over
         if result.skip_reasons:
             for reason, count in sorted(result.skip_reasons.items(),
                                         key=lambda x: -x[1]):
-                label = SKIP_REASON_LABELS.get(reason, reason)
+                label = skip_label(reason, region_filter.scope)
                 click.echo(f"            {count} {label}")
+        _echo_scope_summary(result, region_filter, resident_only)
         total_pages = result.pages_captured + result.pages_failed
         if total_pages > 0:
             page_pct = result.pages_captured / total_pages * 100
@@ -582,6 +779,8 @@ def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_over
             click.echo(f"  Bytes   : {result.bytes_captured:,}")
         _echo_unreadable_ranges(result)
         click.echo(f"  Modules : {result.modules_captured}")
+        if result.thread_contexts > 0:
+            click.echo(f"  Threads : {result.thread_contexts}")
         if result.rwx_regions > 0:
             click.echo(f"  RWX     : {result.rwx_regions} (forensic attention recommended)")
         click.echo(f"  Duration: {result.duration_secs:.2f}s")
@@ -639,3 +838,31 @@ def cli(target, backend, output_path, comp, usb, device_id, remote_addr, os_over
         if progress_handler is not None:
             logger.removeHandler(progress_handler)
         logger.removeHandler(handler)
+
+
+class _DefaultCommandGroup(click.Group):
+    """Command group that falls back to ``acquire`` for unknown first args.
+
+    Keeps the historic ``memslicer <target> [options]`` invocation working
+    alongside named subcommands such as ``memslicer verify <file>``.
+    """
+
+    default_command = "acquire"
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if not args or (args[0] not in self.commands and args[0] not in ("--help", "-h")):
+            args = [self.default_command, *args]
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=_DefaultCommandGroup, context_settings={"help_option_names": ["-h", "--help"]})
+def cli():
+    """memslicer: acquire process memory into MSL slices and verify them.
+
+    Without a subcommand, arguments are passed to ``acquire``
+    (``memslicer <target> [options]``).
+    """
+
+
+cli.add_command(acquire)
+cli.add_command(verify)

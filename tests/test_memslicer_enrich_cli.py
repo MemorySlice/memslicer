@@ -21,20 +21,26 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from memslicer.acquirer.elf_notes import ELF_MAGIC
-from memslicer.cli_enrich import main as enrich_main
+from memslicer.cli_enrich import PRODUCER, main as enrich_main
 from memslicer.msl.constants import (
+    BLOCK_MAGIC,
     BlockType,
     CompAlgo,
+    HashAlgo,
     PageState,
     RegionType,
 )
-from memslicer.msl.iterator import iterate_blocks
+from memslicer.msl.integrity import IntegrityChain
+from memslicer.msl.iterator import iterate_blocks, read_hash_algo
 from memslicer.msl.types import (
     FileHeader,
     MemoryRegion,
+    ModuleBuildIdManifest,
+    ModuleBuildIdRow,
     ModuleEntry,
 )
-from memslicer.msl.writer import MSLWriter
+from memslicer.msl.verify import VerifyReport, verify_slice
+from memslicer.msl.writer import MSLWriter, parse_module_build_id_manifest
 
 
 # ---------------------------------------------------------------------------
@@ -93,16 +99,33 @@ def _elf_page(build_id: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+def _manifest_for(mod: ModuleEntry, build_id: bytes) -> ModuleBuildIdManifest:
+    """A one-row manifest claiming *build_id* for *mod*."""
+    return ModuleBuildIdManifest(rows=[ModuleBuildIdRow(
+        base_addr=mod.base_addr, build_id_len=len(build_id), build_id_source=1,
+        flags=0, build_id=build_id, disk_hash=b"\x00" * 32,
+    )])
+
+
 def _synthesize_slice(
     path: Path,
     modules_with_pages: list[tuple[ModuleEntry, bytes]],
+    hash_algo: HashAlgo = HashAlgo.BLAKE3,
+    comp_algo: CompAlgo = CompAlgo.NONE,
+    capture_manifest: ModuleBuildIdManifest | None = None,
+    segment_manifest: ModuleBuildIdManifest | None = None,
 ) -> None:
-    """Write an .msl file containing matching MemoryRegions + ModuleEntries."""
+    """Write an .msl file containing matching MemoryRegions + ModuleEntries.
+
+    ``capture_manifest`` is written before the EoC, the way a pre-1.1
+    ``memslicer-enrich`` left it; ``segment_manifest`` goes into an
+    extension segment after the EoC with producer ``other/1``.
+    """
     with open(path, "wb") as f:
-        header = FileHeader()
+        header = FileHeader(hash_algo=hash_algo)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            writer = MSLWriter(f, header, CompAlgo.NONE)
+            writer = MSLWriter(f, header, comp_algo)
             for mod, page in modules_with_pages:
                 region = MemoryRegion(
                     base_addr=mod.base_addr,
@@ -114,7 +137,31 @@ def _synthesize_slice(
                 )
                 writer.write_memory_region(region)
             writer.write_module_list([m for m, _ in modules_with_pages])
+            if capture_manifest is not None:
+                writer.write_module_build_id_manifest(capture_manifest)
             writer.finalize()
+            if segment_manifest is not None:
+                writer.begin_extension()
+                writer.write_module_build_id_manifest(segment_manifest)
+                writer.finalize_extension("other/1")
+
+
+def _verify(path: Path) -> VerifyReport:
+    with open(path, "rb") as f:
+        return verify_slice(f)
+
+
+def _records(path: Path) -> list:
+    with open(path, "rb") as f:
+        return list(iterate_blocks(f))
+
+
+def _manifests(path: Path) -> list[tuple[int, ModuleBuildIdManifest]]:
+    """``(segment, manifest)`` for every ModuleBuildIdManifest block."""
+    return [
+        (b.segment, parse_module_build_id_manifest(b.payload))
+        for b in _records(path) if b.block_type == BlockType.ModuleBuildIdManifest
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +205,22 @@ class TestEnrichCLI:
         assert result.exit_code == 0, result.output
         assert output_path.exists()
 
-        # Verify the output has a ModuleBuildIdManifest block.
-        with open(output_path, "rb") as f:
-            block_types = [b.block_type for b in iterate_blocks(f)]
-        assert BlockType.ModuleBuildIdManifest in block_types
+        # The manifest lands in extension segment 1, right after the
+        # original EoC, closed by an EndOfExtension block.
+        records = _records(output_path)
+        types = [b.block_type for b in records]
+        eoc = types.index(BlockType.EndOfCapture)
+        assert records[eoc].segment == 0
+        assert types[eoc + 1:] == [
+            BlockType.ModuleBuildIdManifest, BlockType.EndOfExtension,
+        ]
+        assert [b.segment for b in records[eoc + 1:]] == [1, 1]
+
+        report = _verify(output_path)
+        assert report.valid, report.errors
+        assert len(report.segments) == 1 and report.segments[0].verified
+        assert report.segments[0].producer == PRODUCER
+        assert report.segments[0].block_count == 2
 
     def test_in_place_replacement(self, tmp_path):
         build_id = b"\xbb" * 20
@@ -169,14 +228,17 @@ class TestEnrichCLI:
         mod = ModuleEntry(base_addr=0x200000, module_size=4096, path="/bin/b")
         slice_path = tmp_path / "slice.msl"
         _synthesize_slice(slice_path, [(mod, page)])
-        original_size = slice_path.stat().st_size
+        original = slice_path.read_bytes()
 
         runner = CliRunner()
         result = runner.invoke(enrich_main, [str(slice_path), "--in-place"])
         assert result.exit_code == 0, result.output
 
-        # File should have grown due to the appended manifest + new EoC.
-        assert slice_path.stat().st_size > original_size
+        # File should have grown due to the appended extension segment,
+        # and the whole original file is its prefix.
+        enriched = slice_path.read_bytes()
+        assert len(enriched) > len(original)
+        assert enriched[:len(original)] == original
 
         # tmp path should no longer exist (replaced atomically).
         tmp_output = slice_path.with_suffix(slice_path.suffix + ".tmp")
@@ -186,6 +248,9 @@ class TestEnrichCLI:
         with open(slice_path, "rb") as f:
             block_types = [b.block_type for b in iterate_blocks(f)]
         assert BlockType.ModuleBuildIdManifest in block_types
+        report = _verify(slice_path)
+        assert report.valid, report.errors
+        assert len(report.segments) == 1 and report.segments[0].verified
 
     def test_nothing_to_enrich_when_blobs_populated(self, tmp_path):
         # Construct a module whose native_blob is already set.
@@ -206,6 +271,42 @@ class TestEnrichCLI:
         )
         assert result.exit_code == 0, result.output
         assert "nothing to enrich" in result.output
+        assert not output_path.exists()
+
+    def test_old_style_enriched_file_is_recognised(self, tmp_path):
+        """A pre-1.1 enriched file carries its manifest before a replaced
+        EoC (segment 0); its rows still count as enriched."""
+        mod = ModuleEntry(base_addr=0x310000, module_size=4096, path="/bin/c2")
+        slice_path = tmp_path / "slice.msl"
+        _synthesize_slice(
+            slice_path, [(mod, _elf_page(b"\xdd" * 20))],
+            capture_manifest=_manifest_for(mod, b"\x55" * 20),
+        )
+        assert _manifests(slice_path)[0][0] == 0  # sanity: in the capture segment
+
+        output_path = tmp_path / "slice.enriched"
+        result = CliRunner().invoke(
+            enrich_main, [str(slice_path), "-o", str(output_path)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "nothing to enrich" in result.output
+        assert not output_path.exists()
+
+    def test_trailing_bytes_are_refused(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x320000, module_size=4096, path="/bin/c3")
+        slice_path = tmp_path / "slice.msl"
+        _synthesize_slice(slice_path, [(mod, _elf_page(b"\xee" * 20))])
+        with open(slice_path, "ab") as f:
+            f.write(b"\x00" * 64)
+
+        output_path = tmp_path / "slice.enriched"
+        result = CliRunner().invoke(
+            enrich_main, [str(slice_path), "-o", str(output_path)]
+        )
+        assert result.exit_code == 1
+        combined = result.output + (result.stderr_bytes or b"").decode()
+        assert "trailing" in combined
+        assert not output_path.exists()
 
     def test_unresolvable_build_id_graceful(self, tmp_path):
         # Region contents are not a valid ELF; Path B extracts nothing.
@@ -267,3 +368,159 @@ class TestEnrichCLI:
             ]
         assert len(manifest_payloads) == 1
         assert build_id in manifest_payloads[0]
+
+    def test_existing_segment_is_kept_and_a_second_appended(self, tmp_path):
+        """Module A is covered by an existing segment; only B is enriched,
+        into a second segment appended after the first."""
+        mod_a = ModuleEntry(base_addr=0x610000, module_size=4096, path="/bin/fa")
+        mod_b = ModuleEntry(base_addr=0x620000, module_size=4096, path="/bin/fb")
+        build_id_b = b"\x66" * 20
+        slice_path = tmp_path / "slice.msl"
+        _synthesize_slice(
+            slice_path,
+            [(mod_a, _elf_page(b"\x65" * 20)), (mod_b, _elf_page(build_id_b))],
+            segment_manifest=_manifest_for(mod_a, b"\x65" * 20),
+        )
+        original = slice_path.read_bytes()
+
+        output_path = tmp_path / "slice.enriched"
+        _enrich(slice_path, output_path)
+
+        enriched = output_path.read_bytes()
+        assert enriched[:len(original)] == original
+        report = _verify(output_path)
+        assert report.valid, report.errors
+        assert [s.producer for s in report.segments] == ["other/1", PRODUCER]
+        assert all(s.verified for s in report.segments)
+        manifests = _manifests(output_path)
+        assert [segment for segment, _ in manifests] == [1, 2]
+        rows = manifests[1][1].rows
+        assert [r.base_addr for r in rows] == [mod_b.base_addr]
+        assert rows[0].build_id == build_id_b
+
+
+# ---------------------------------------------------------------------------
+# Integrity chain continuity (spec Sections 4.4 and 4.6)
+# ---------------------------------------------------------------------------
+
+
+def _assert_chain_valid(path: Path) -> None:
+    """The file verifies end to end: chain, FileHash, every segment, no trailing data."""
+    report = _verify(path)
+    assert report.valid, report.errors
+    assert report.trailing_bytes == 0
+    assert all(segment.verified for segment in report.segments)
+
+
+def _enrich(slice_path: Path, output_path: Path) -> None:
+    result = CliRunner().invoke(
+        enrich_main, [str(slice_path), "-o", str(output_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+
+class TestEnrichChainContinuity:
+    @pytest.mark.parametrize(
+        "hash_algo,comp_algo",
+        [
+            (HashAlgo.BLAKE3, CompAlgo.NONE),
+            (HashAlgo.SHA256, CompAlgo.NONE),
+            (HashAlgo.SHA512_256, CompAlgo.NONE),
+            (HashAlgo.BLAKE3, CompAlgo.LZ4),
+            (HashAlgo.SHA256, CompAlgo.ZSTD),
+        ],
+    )
+    def test_enriched_chain_and_file_hash_valid(self, tmp_path, hash_algo, comp_algo):
+        mod = ModuleEntry(base_addr=0x700000, module_size=4096, path="/bin/g")
+        slice_path = tmp_path / "slice.msl"
+        _synthesize_slice(
+            slice_path, [(mod, _elf_page(b"\x22" * 20))],
+            hash_algo=hash_algo, comp_algo=comp_algo,
+        )
+        _assert_chain_valid(slice_path)  # sanity: input is valid
+
+        output_path = tmp_path / "slice.enriched"
+        _enrich(slice_path, output_path)
+
+        raw = output_path.read_bytes()
+        assert read_hash_algo(io.BytesIO(raw)) == hash_algo
+        _assert_chain_valid(output_path)
+
+    def test_enriched_preamble_is_byte_identical(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x710000, module_size=4096, path="/bin/h")
+        slice_path = tmp_path / "slice.msl"
+        _synthesize_slice(slice_path, [(mod, _elf_page(b"\x33" * 20))])
+        output_path = tmp_path / "slice.enriched"
+        _enrich(slice_path, output_path)
+
+        original = slice_path.read_bytes()
+        with open(slice_path, "rb") as f:
+            eoc_end = [
+                b.end_offset for b in iterate_blocks(f)
+                if b.block_type == BlockType.EndOfCapture
+            ][0]
+        # The original EoC is preserved, not replaced.
+        assert output_path.read_bytes()[:eoc_end] == original[:eoc_end]
+        assert _verify(output_path).eoc_block_count == _verify(slice_path).eoc_block_count
+
+    def test_second_run_has_nothing_to_enrich(self, tmp_path):
+        """The manifest written by the first run covers the module, so a
+        second run finds nothing to do and writes no file."""
+        mod = ModuleEntry(base_addr=0x720000, module_size=4096, path="/bin/i")
+        slice_path = tmp_path / "slice.msl"
+        _synthesize_slice(
+            slice_path, [(mod, _elf_page(b"\x44" * 20))],
+            hash_algo=HashAlgo.SHA256,
+        )
+        once = tmp_path / "once.msl"
+        twice = tmp_path / "twice.msl"
+        _enrich(slice_path, once)
+        once_bytes = once.read_bytes()
+
+        result = CliRunner().invoke(enrich_main, [str(once), "-o", str(twice)])
+        assert result.exit_code == 0, result.output
+        assert "nothing to enrich" in result.output
+        assert not twice.exists()
+        assert once.read_bytes() == once_bytes
+
+        types = [b.block_type for b in _records(once)]
+        assert types.count(BlockType.ModuleBuildIdManifest) == 1
+        assert types.count(BlockType.EndOfCapture) == 1
+        _assert_chain_valid(once)
+
+
+class TestWriterResume:
+    def test_resume_writes_no_header_and_continues_chain(self):
+        original = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # no ProcessIdentity in this fixture
+            writer = MSLWriter(original, FileHeader(hash_algo=HashAlgo.SHA256))
+            writer.write_module_list([ModuleEntry(base_addr=0x1000, path="/x")])
+        prefix = original.getvalue()
+
+        chain = IntegrityChain(hash_algo=HashAlgo.SHA256)
+        chain.feed_header(prefix[:64])
+        offset = 64
+        block_count = 0
+        while offset < len(prefix):
+            length = struct.unpack_from("<I", prefix, offset + 8)[0]
+            chain.feed_block(prefix[offset:offset + length])
+            offset += length
+            block_count += 1
+        expected_prev = chain.prev_hash
+
+        tail = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # no Block-0 warning on resume
+            resumed = MSLWriter.resume(
+                tail, FileHeader(hash_algo=HashAlgo.SHA256), chain,
+                block_index=block_count,
+            )
+            resumed.finalize()
+        tail_bytes = tail.getvalue()
+
+        assert tail_bytes[:4] == BLOCK_MAGIC
+        assert tail_bytes[0x30:0x50] == expected_prev
+        report = verify_slice(io.BytesIO(prefix + tail_bytes))
+        assert report.valid, report.errors
+        assert report.file_hash_ok is True

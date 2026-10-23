@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Iterable, Protocol, runtime_checkable
 
-from memslicer.msl.constants import ArchType, OSType
+from memslicer.msl.constants import (
+    REG_ROLE_FLAGS, REG_ROLE_FP, REG_ROLE_LR, REG_ROLE_PC, REG_ROLE_SP,
+    REG_ROLE_TLS, ArchType, OSType, ThreadState,
+)
 
 if TYPE_CHECKING:
     import logging
@@ -70,6 +73,165 @@ class ModuleInfo:
     path: str
     base: int
     size: int
+
+
+# Register roles (spec Table 19b) by lowercase canonical mnemonic, per
+# architecture. The generic aliases ``pc``/``sp``/``fp``/``lr`` are listed for
+# every architecture: a backend that only knows the generic name still gets
+# the role, and on AArch64 they *are* the canonical names.
+_GENERIC_ROLES: dict[str, int] = {
+    "pc": REG_ROLE_PC, "sp": REG_ROLE_SP, "fp": REG_ROLE_FP, "lr": REG_ROLE_LR,
+}
+_X86_ROLES: dict[str, int] = {
+    "eip": REG_ROLE_PC, "esp": REG_ROLE_SP, "ebp": REG_ROLE_FP,
+    "eflags": REG_ROLE_FLAGS, "fs_base": REG_ROLE_TLS, "gs_base": REG_ROLE_TLS,
+}
+_X86_64_ROLES: dict[str, int] = {
+    "rip": REG_ROLE_PC, "rsp": REG_ROLE_SP, "rbp": REG_ROLE_FP,
+    # GDB prints the 64-bit flags register as ``eflags`` even on x86_64.
+    "rflags": REG_ROLE_FLAGS, "eflags": REG_ROLE_FLAGS,
+    "fs_base": REG_ROLE_TLS, "gs_base": REG_ROLE_TLS,
+}
+_ARM32_ROLES: dict[str, int] = {
+    "r15": REG_ROLE_PC, "r13": REG_ROLE_SP, "r11": REG_ROLE_FP, "r14": REG_ROLE_LR,
+    "cpsr": REG_ROLE_FLAGS, "tpidruro": REG_ROLE_TLS, "tpidrurw": REG_ROLE_TLS,
+}
+_ARM64_ROLES: dict[str, int] = {
+    "x29": REG_ROLE_FP, "x30": REG_ROLE_LR,
+    "pstate": REG_ROLE_FLAGS, "cpsr": REG_ROLE_FLAGS, "nzcv": REG_ROLE_FLAGS,
+    "tpidr_el0": REG_ROLE_TLS, "tpidr": REG_ROLE_TLS,
+}
+_ROLES_BY_ARCH: dict[ArchType, dict[str, int]] = {
+    ArchType.x86: _X86_ROLES,
+    ArchType.x86_64: _X86_64_ROLES,
+    ArchType.ARM32: _ARM32_ROLES,
+    ArchType.ARM64: _ARM64_ROLES,
+}
+# For an unknown architecture any known mnemonic is accepted.
+_ALL_ROLES: dict[str, int] = {
+    **_X86_ROLES, **_X86_64_ROLES, **_ARM32_ROLES, **_ARM64_ROLES,
+}
+
+
+def register_role(name: str, arch: ArchType | None = None) -> int:
+    """``REG_ROLE_*`` bits of register *name* on *arch*; 0 for a general register.
+
+    *name* is matched case-insensitively against the lowercase canonical
+    mnemonics of spec Section 5.7 (``rip``/``eip``/``pc``, ``rsp``/``esp``/
+    ``sp``, ``rbp``/``ebp``/``fp``/``x29``, ``rflags``/``eflags``/``pstate``/
+    ``cpsr``/``nzcv``, ``fs_base``/``gs_base``/``tpidr_el0``, ``lr``/``x30``).
+    With *arch* ``None`` every known mnemonic is accepted.
+    """
+    key = name.lower()
+    table = _ALL_ROLES if arch is None else _ROLES_BY_ARCH.get(arch, _ALL_ROLES)
+    return table.get(key, _GENERIC_ROLES.get(key, 0))
+
+
+# Integer register width in bytes per architecture (GPRs); 8 otherwise.
+_REG_WIDTH: dict[ArchType, int] = {
+    ArchType.x86: 4, ArchType.ARM32: 4, ArchType.MIPS32: 4,
+    ArchType.RISC_V_RV32: 4, ArchType.PPC32: 4,
+}
+
+
+def register_width_bytes(arch: ArchType | None) -> int:
+    """Integer register width in bytes for *arch* (8 when unknown)."""
+    if arch is None:
+        return 8
+    return _REG_WIDTH.get(arch, 8)
+
+
+@dataclass(frozen=True)
+class RegisterValue:
+    """One CPU register as a debugger bridge reports it (spec Table 19b).
+
+    Attributes:
+        name: Lowercase canonical mnemonic, e.g. ``"rip"`` or ``"x0"``.
+        width: Value width in bytes.
+        value: Exactly *width* bytes, little-endian.
+        role: ``REG_ROLE_*`` bits; 0 for a general register.
+    """
+
+    name: str
+    width: int
+    value: bytes
+    role: int = 0
+
+    @classmethod
+    def from_int(
+        cls, name: str, value: int, width: int, arch: ArchType | None = None,
+    ) -> RegisterValue:
+        """Build an entry from an unsigned integer *value*.
+
+        The name is lowercased, the value masked to *width* bytes and
+        encoded little-endian, and the role looked up with
+        :func:`register_role`.
+        """
+        masked = int(value) & ((1 << (width * 8)) - 1)
+        return cls(
+            name=name.lower(), width=width,
+            value=masked.to_bytes(width, "little"),
+            role=register_role(name, arch),
+        )
+
+    @property
+    def as_int(self) -> int:
+        """The value decoded as an unsigned little-endian integer."""
+        return int.from_bytes(self.value, "little")
+
+
+@dataclass
+class ThreadInfo:
+    """Execution state of one thread as a debugger bridge reports it.
+
+    Attributes:
+        tid: OS thread identifier; 0 when unknown.
+        name: Thread name; empty when the target reports none.
+        state: Scheduler state (spec Table 19a).
+        registers: The register file read from the thread.
+        suspended: ``True`` only when the thread was stopped while its
+            registers were read (ptrace-stopped, debugger-halted), so the
+            values form a consistent snapshot. A bridge that samples a
+            running thread leaves this ``False``.
+        partial: ``True`` when the bridge could not read every register it
+            would normally record.
+    """
+
+    tid: int
+    name: str = ""
+    state: ThreadState = ThreadState.UNKNOWN
+    registers: list[RegisterValue] = field(default_factory=list)
+    suspended: bool = False
+    partial: bool = False
+
+    def _with_role(self, role: int) -> RegisterValue | None:
+        return next((r for r in self.registers if r.role & role), None)
+
+    @property
+    def has_pc_and_sp(self) -> bool:
+        """Whether the register file carries both a program counter and a
+        stack pointer -- the minimum spec Section 5.7 lets a producer emit."""
+        return (
+            self._with_role(REG_ROLE_PC) is not None
+            and self._with_role(REG_ROLE_SP) is not None
+        )
+
+    @property
+    def stack_pointer(self) -> int | None:
+        """The stack pointer value, ``None`` when no SP register was read."""
+        sp = self._with_role(REG_ROLE_SP)
+        return sp.as_int if sp is not None else None
+
+
+def stack_pointers_of(threads: Iterable[ThreadInfo]) -> tuple[int, ...]:
+    """Distinct non-zero stack pointers of *threads*, in thread order.
+
+    Lets the engine feed the SP-based stack classifier from the thread
+    enumeration it already performed for the Thread Context blocks, instead
+    of asking the bridge a second time.
+    """
+    pointers = (t.stack_pointer for t in threads)
+    return tuple(dict.fromkeys(sp for sp in pointers if sp))
 
 
 @dataclass(frozen=True)
@@ -268,6 +430,28 @@ class ThreadStackCapable(Protocol):
 
         Implementations never raise; a thread whose SP cannot be read is left
         out rather than reported as zero.
+        """
+        ...
+
+
+@runtime_checkable
+class ThreadRegistersCapable(Protocol):
+    """Optional bridge capability: every thread with its register file.
+
+    Feeds the Thread Context blocks (spec Section 5.7). Bridges are not
+    required to implement this; the engine probes for the method and emits
+    no Thread Context block when it is absent.
+    """
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Every thread the backend can see, with its registers.
+
+        Implementations never raise. A thread whose program counter or
+        stack pointer could not be read is left out (the spec requires both
+        in every block); one whose other registers were only partly read is
+        reported with ``partial`` set. ``[]`` when the backend cannot
+        enumerate threads at all -- the engine then logs that no thread
+        contexts are available and writes none.
         """
         ...
 

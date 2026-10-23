@@ -1,7 +1,7 @@
 # MemSlicer
 
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.4.4-green)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.5.0-green)](pyproject.toml)
 
 A memory acquisition tool that captures process memory snapshots into the MSL (Memory Slice) binary format. Supports multiple debugger backends (Frida, GDB, LLDB) and targets across Windows, Linux, macOS, Android, and iOS. Designed for forensic analysis, reverse engineering, and security research.
 
@@ -273,6 +273,40 @@ Dump by PID on a USB Android device:
 memslicer 12345 -U --os android -o app_dump.msl -c zstd
 ```
 
+On Android 14+ (API 36) even a trivial app maps roughly 3.3 GB of readable
+memory, of which only about 100 MB is resident: the two 1 GB
+`[anon:dalvik-LinearAlloc]` reservations and the ~600 MB ART heap
+reservation are untouched zero pages, while the system libraries account for
+only ~300 MB. `--scope app` alone therefore saves little; `--resident-only`
+is what shrinks the dump. Combine the two for the smallest useful slice.
+
+Dump only the app's heap and stacks of a running app:
+
+```bash
+memslicer com.example.app -U --scope heap,stack
+```
+
+Shrink a dump to resident pages (never-touched anonymous pages are skipped and
+recorded as PageState `NotResident`):
+
+```bash
+memslicer com.example.app -U --scope app --resident-only -c zstd
+```
+
+Preview what a dump would contain (enumerates and classifies regions, writes
+nothing; the Frida agent is still injected):
+
+```bash
+memslicer com.example.app -U --scope heap,stack --dry-run
+```
+
+Exclude a module (glob on the basename; the `.bss` attributed to it is
+excluded with it):
+
+```bash
+memslicer com.example.app -U --exclude-module 'libhwui*' --exclude-module 'libGLES*'
+```
+
 ### macOS / iOS
 
 *macOS needs root unless the target carries `get-task-allow`; iOS needs a jailbroken device — see [Privileges](#privileges).*
@@ -343,12 +377,67 @@ memslicer chrome --include-unreadable
 memslicer chrome --max-region-size 104857600 --read-timeout 30
 ```
 
+### Verifying a slice
+
+`memslicer verify` checks a slice's PrevHash chain (spec §4.4) and its
+EndOfCapture FileHash, using the hash algorithm recorded in the file
+(BLAKE3, SHA-256 or SHA-512/256):
+
+```
+$ memslicer verify dump.msl
+hash=BLAKE3 encrypted=no blocks=97 (header BlockCount=0, EoC BlockCount=97)
+chain: OK
+FileHash: OK
+extensions: 0 segment(s)
+VALID
+```
+
+Encrypted slices are decrypted first (the AEAD tags are checked) and the
+FileHash is verified over the plaintext; pass `--passphrase` or enter it when
+prompted. A missing EndOfCapture, a legacy zero Block-0 PrevHash and bytes
+after the last verified segment (`trailing: N byte(s)`) are printed as
+warnings and do not fail verification. A header or EoC BlockCount that
+disagrees with the blocks on disk is an error.
+
+Every extension segment after the EndOfCapture (spec §4.6) is checked for
+chain continuity, `SegmentHash` and `BlockCount` and printed as
+`segment k: OK (...)` or `segment k: BROKEN (...)`; a broken segment makes
+the slice INVALID. A slice produced by `memslicer-enrich` therefore shows:
+
+```
+$ memslicer verify dump.enriched.msl
+hash=BLAKE3 encrypted=no blocks=97 (header BlockCount=0, EoC BlockCount=97)
+chain: OK
+FileHash: OK
+extensions: 1 segment(s)
+segment 1: OK (2 blocks, producer=memslicer-enrich/0.5.0)
+VALID
+```
+
+### Enriching a slice
+
+`memslicer-enrich <slice> [-o OUT | --in-place]` adds ELF build-ids that were
+not available at capture time. The capture segment -- header, every block and
+the original EndOfCapture -- is copied verbatim and the build-id manifest goes
+into a new extension segment (spec §4.6) appended after it, closed by an
+`EndOfExtension` block (0x0FFE). The original EoC FileHash stays valid and
+`memslicer verify` lists the segment. Running it again on an enriched slice
+prints `nothing to enrich` and writes nothing. Encrypted slices are not
+supported.
+
 ---
 
 ## CLI Reference
 
+`memslicer` has two subcommands: `acquire` (capture a process) and `verify`
+(check a slice). `memslicer <target> ...` is shorthand for
+`memslicer acquire <target> ...`. A process literally named `acquire` or
+`verify` must be given as `memslicer acquire <name>` (or by PID).
+
+### memslicer acquire
+
 ```
-Usage: memslicer [OPTIONS] TARGET
+Usage: memslicer acquire [OPTIONS] TARGET
 
   Dump process memory to MSL format.
 
@@ -374,11 +463,148 @@ Options:
   --skip-kernel-pseudo            Skip kernel pseudo-mappings ([vvar], [vsyscall])
                                   instead of attempting them.
   --max-region-size INT           Skip regions larger than this size (0 = no limit).
+  --scope TEXT                    Which memory to capture: full (default), app (drop
+                                  clean read-only mappings of system libraries and
+                                  device memory), heap (every native and managed heap),
+                                  stack (thread stacks). Combine with commas, e.g.
+                                  heap,stack (alias: heapstack).
+  --exclude-module PATTERN        Skip regions belonging to modules matching this glob
+                                  (basename, e.g. 'libhwui*'; full path when the
+                                  pattern contains '/'). Repeatable.
+  --app-path PREFIX               Treat files under this path prefix as app-owned for
+                                  --scope app. Repeatable.
+  --resident-only                 Skip anonymous pages that were never touched (not
+                                  resident, not swapped); they read as zero. Needs
+                                  /proc/<pid>/pagemap or mincore in the target; falls
+                                  back to full reads with a warning.
+  --dry-run                       Enumerate and classify regions, print what would be
+                                  captured under the current options, and exit without
+                                  writing a file. On the Frida backend this still
+                                  injects the agent into the target.
+  --no-registers                  Do not capture thread register state (no Thread
+                                  Context blocks). Thread stack pointers are then
+                                  only queried for --scope heap/stack.
   -I, --investigation             Investigation mode: capture system-wide context.
   -E, --encrypt                   Enable AEAD encryption (AES-256-GCM + Argon2id).
   --no-encrypt                    Disable encryption (overrides -I default).
   --passphrase TEXT               Encryption passphrase (prompted if not provided).
   --help                          Show this message and exit.
+```
+
+### Capture scope and residency
+
+`--scope` selects which regions are captured; the module list and the VAS Map
+always stay complete. Tokens can be combined with commas (`heap,stack`;
+`heapstack` is an alias); `full` cannot be combined with other tokens.
+
+- `app` drops clean read-only/executable mappings of system-owned files and
+  device mappings (`/dev/*`, dmabuf). System-owned means Android `/system`,
+  `/system_ext`, `/apex`, `/vendor`, `/odm`, `/product`, `/oem`,
+  `/data/dalvik-cache`; Linux `/lib*`, `/usr/lib*`, `/usr/libexec`,
+  `/usr/share`, `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/etc`; macOS/iOS
+  `/usr/lib`, `/System`, `/Library/Apple`, the cryptexes and the dyld shared
+  cache; Windows `<drive>:\Windows`. It keeps the writable `.data`/`.bss` of
+  system libraries, the main executable, everything under `--app-path`, and
+  all anonymous memory.
+- `heap` keeps every heap: `[heap]`, scudo/libc_malloc/GWP-ASan/bionic_alloc/
+  jemalloc arenas, every ART/Dalvik space including the boot/app image `.art`
+  spaces and legacy `/dev/ashmem/dalvik-*`, and unnamed writable anonymous
+  memory (glibc arenas, macOS malloc zones, Windows private heaps, custom
+  allocators) that is not a detected thread stack.
+- `stack` keeps `[stack]`, `[anon:stack_and_tls:*]`, signal stacks, TLS and,
+  on platforms without named stacks, the unnamed regions that contain a
+  thread's current stack pointer (Frida `enumerateThreads`, GDB `$sp`, LLDB
+  frame SP).
+
+`--exclude-module PATTERN` is a repeatable glob matched against the module
+basename, the full path when the pattern contains `/`, the module name, or an
+anonymous label such as `dalvik-LinearAlloc`. A `.bss` attributed to the
+adjacent module is excluded together with it. `--app-path PREFIX` (repeatable)
+marks files under that prefix as app-owned for `--scope app`.
+
+`--resident-only` skips anonymous pages that are neither present nor swapped;
+they read as zero. It is never applied to file-backed mappings. Residency comes
+from `/proc/self/pagemap`, read inside the target by the Frida agent, or from
+`mincore` combined with the per-mapping `Swap:` figures of `/proc/self/smaps`
+(a mapping that holds swapped pages is read in full, because `mincore` cannot
+see swapped pages); local GDB/LLDB captures read `/proc/<pid>/pagemap` on the
+host. On Android an app may not open its own pagemap (SELinux), so the Frida
+backend uses the `mincore` path there. Without either source memslicer falls
+back to full reads and prints a warning. Skipped pages are recorded with
+PageState `NotResident` (value 3, spec 1.1 Table 24) so readers can tell them
+from read failures; readers that predate the value must treat it as a 0-byte
+page.
+
+Reading a page is itself a write to the page tables: the first dump of a
+process faults every untouched anonymous page in (it is backed by the kernel
+zero page afterwards), and from then on residency sources report it as
+present. `--resident-only` therefore only shrinks the *first* capture of a
+process; a second capture of the same process finds almost everything
+resident. Measured on an API 36 emulator: a never-dumped Clock app read
+615 MB instead of 3.3 GB (2.6 GiB skipped) in 15 s, and `--scope heap,stack
+--resident-only` read 94 MB in 3.4 s.
+
+Regions left out by `--scope` or `--exclude-module` are listed in a
+`RegionOmissionManifest` block (0x005B, a non-spec extension) carrying the
+scope, the exclude patterns and one row per omitted region (base, size,
+protection, region type, reason, name). The block is only written when
+something was omitted.
+
+`--dry-run` enumerates and classifies the target's regions and prints what the
+current options would capture, per category and per owner, without writing a
+file (on the Frida backend the agent is still injected):
+
+```
+MemSlicer - Dry run for com.example.app (nothing is written)
+Backend: frida | Device: USB | OS: Android | Scope: heap,stack | Exclude: none
+  Regions : 2874 enumerated, page size 4,096
+  category       regions kept   bytes kept regions skipped bytes skipped
+  anon-named                0          0 B             318       2.1 GiB
+  heap-managed             41    612.3 MiB               0           0 B
+  image                     0          0 B            1402     291.7 MiB
+  device                    0          0 B              58     120.0 MiB
+  heap-native              23     96.5 MiB               0           0 B
+  stack                   118     94.2 MiB               0           0 B
+  mapped-file               0          0 B             611      88.4 MiB
+  bss                       0          0 B             202      14.9 MiB
+  anon                     37     12.6 MiB               0           0 B
+  shared-mem                0          0 B              64       9.3 MiB
+  kernel                    0          0 B               2       8.0 KiB
+  Top owners:
+  owner                              bytes kept bytes skipped
+  dalvik-LinearAlloc                        0 B       2.0 GiB
+  dalvik-main space (region space)    512.0 MiB           0 B
+  libhwui.so                                0 B      41.2 MiB
+  dalvik-zygote space                  38.7 MiB           0 B
+  scudo:primary                        31.9 MiB           0 B
+  stack_and_tls:12345                   8.0 MiB           0 B
+  Would capture 815.6 MiB of 3.2 GiB readable bytes across 219 of 2874 regions
+  Skipped :
+            2597 outside selected --scope (heap,stack)
+            58 no read permission (use --include-unreadable to include)
+```
+
+### Thread registers
+
+Every thread's register file is written as a Thread Context block (0x0011,
+spec §5.7) on the Frida, GDB and LLDB backends; `--no-registers` turns this
+off. On Android, Frida enumerates threads of ordinary apps but none for privileged
+system apps (`priv_app`, `platform_app`), so such captures carry no
+Thread Context blocks and the log notes it once.
+
+### memslicer verify
+
+```
+Usage: memslicer verify [OPTIONS] FILE
+
+  Verify an MSL slice's PrevHash chain and EoC FileHash.
+
+  FILE is the .msl slice to check. Exits 0 when valid, 1 otherwise.
+
+Options:
+  --passphrase TEXT  Decryption passphrase (prompted if the slice is encrypted
+                     and not provided)
+  -h, --help         Show this message and exit.
 ```
 
 ---
@@ -387,15 +613,27 @@ Options:
 
 MemSlicer writes memory snapshots to the MSL (Memory Slice) binary format. Each file contains:
 
-- A file header with format version, target metadata, and capture timestamp
+- A file header (MSL 1.1, format version `0x0101`) with target metadata and capture
+  timestamp; the header's BlockCount stays 0, the EndOfCapture block carries the exact count
 - Process identity block (ppid, session ID, start time, executable path, command line)
+- Thread Context blocks (0x0011), one per thread, with thread ID, state, name and register
+  file (Frida, GDB and LLDB; none with `--no-registers`)
 - Module list with base addresses, sizes, and paths
 - Per-region records with base address, size, protection flags, and page-level data
 - A VAS Map block (0x1001) listing every enumerated mapping -- captured, filter-skipped or
   left unread by an abort -- sorted by base address, with protection, region type and the
   full mapping name (e.g. `[anon:dalvik-main space (region space)]`, `[anon:scudo:primary]`).
   A VAS entry without a matching region record is a range whose bytes were not stored.
+  Every entry records its `NameSource` (spec §5.8).
+- A RegionOmissionManifest block (0x005B, non-spec extension) when `--scope` or
+  `--exclude-module` left regions out: the scope, the exclude patterns and one row per
+  omitted region (base, size, protection, region type, reason, name)
+- Per-page states; anonymous pages skipped by `--resident-only` carry PageState
+  `NotResident` (3, spec 1.1 Table 24) and 0 bytes of data, distinct from read failures
 - BLAKE3 integrity chain across all blocks
+- Zero or more extension segments after the EndOfCapture (spec §4.6), each closed by an
+  `EndOfExtension` block (0x0FFE) carrying `SegmentHash`, `BlockCount` and the producer;
+  `memslicer-enrich` appends its build-id manifest this way
 - Optional compressed data blocks (zstd or lz4)
 - Optional AEAD encryption (AES-256-GCM + Argon2id)
 
@@ -421,6 +659,7 @@ Progress: [##################################################] 100.00% Complete
   Missing : 2 unreadable range(s)
             0x7f2c00a000-0x7f2c00c000 (8,192 bytes)
   Modules : 142
+  Threads : 37
   Duration: 12.34s
   File    : chrome_1773528836.msl (48,234,567 bytes)
   Log     : chrome_1773528836.msl.log
@@ -432,6 +671,24 @@ Progress: [##################################################] 100.00% Complete
 `ptrace` read. They are not data loss, so they are kept out of the quality
 figure — but they are always named rather than silently dropped. `[vdso]` is
 genuinely readable and is captured normally.
+
+`Threads:` counts the Thread Context blocks written. The line is absent when
+there are none (`--no-registers`, or a privileged Android system app).
+
+With `--scope`, `--exclude-module` or `--resident-only` the summary gains lines
+that are omitted from a plain full capture:
+
+```
+  Scope   : heap,stack
+  Exclude : libhwui*
+  Omitted : 2655 regions recorded in RegionOmissionManifest (0x005B)
+  Resident: 785,412 pages (3.0 GiB) skipped as never-touched (method: pagemap)
+```
+
+`Scope`/`Exclude` echo the options, `Omitted` counts the regions listed in the
+0x005B block, and `Resident` reports the anonymous pages `--resident-only` left
+out together with the residency source (`pagemap` or `mincore`). If residency
+information was unavailable a `Note` line says so and every page was read.
 
 ### Exit Codes
 
@@ -447,6 +704,13 @@ full environment record (uid, capabilities, `ptrace_scope`, LSM profile) is
 written to the companion `.msl.log` so the constraint is documented in the case
 file. See [Privileges](#privileges) for what each refusal means and how to
 resolve it.
+
+`memslicer verify` uses its own exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | Slice is `VALID` (warnings, if any, do not change this). |
+| `1`  | Slice is `INVALID`: broken PrevHash chain, FileHash mismatch, BlockCount mismatch, broken extension segment, failed decryption, unreadable header, or no passphrase for an encrypted slice. |
 
 ---
 

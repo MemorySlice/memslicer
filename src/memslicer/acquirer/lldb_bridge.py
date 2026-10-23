@@ -16,16 +16,20 @@ from memslicer.acquirer.bridge import (
     ModuleInfo,
     PlatformInfo,
     ReadResult,
+    RegisterValue,
+    ThreadInfo,
     fault_addr_from_text,
+    register_width_bytes,
 )
 from memslicer.acquirer.errors import AttachError
+from memslicer.acquirer.residency import pagemap_readable, read_pagemap
 from memslicer.acquirer.platform_detect import (
     detect_os_from_maps,
     parse_lldb_triple,
     valid_page_size,
     parse_proc_maps,
 )
-from memslicer.msl.constants import ArchType, OSType
+from memslicer.msl.constants import ArchType, OSType, ThreadState
 
 
 def _lldb_binding_candidates() -> list[str]:
@@ -199,6 +203,10 @@ def _default_page_size(arch: ArchType, os_type: OSType) -> int:
 # Protection string builder
 # ---------------------------------------------------------------------------
 
+# LLDB_INVALID_ADDRESS: what SBFrame.GetSP() answers for a frame it cannot read.
+_LLDB_INVALID_ADDRESS = 0xFFFFFFFFFFFFFFFF
+
+
 def _protection_string(region: Any) -> str:
     """Build an ``rwx``-style protection string from an SBMemoryRegionInfo."""
     return (
@@ -211,6 +219,33 @@ def _protection_string(region: Any) -> str:
 # ---------------------------------------------------------------------------
 # LLDBBridge
 # ---------------------------------------------------------------------------
+
+# Widest register that belongs in a Thread Context block (spec Section 5.7);
+# anything wider is vector or extended state.
+_MAX_INT_REGISTER_BYTES = 8
+
+
+def _thread_id(thread: Any) -> int:
+    """OS thread id of SBThread *thread*; 0 when LLDB does not know it."""
+    tid = thread.GetThreadID()
+    if isinstance(tid, bool) or not isinstance(tid, int):
+        return 0
+    return tid
+
+
+def _thread_name(thread: Any) -> str:
+    """Name of SBThread *thread*; empty when the target reports none."""
+    name = thread.GetName()
+    return name if isinstance(name, str) else ""
+
+
+def _register_size(reg: Any, arch: ArchType) -> int:
+    """Byte width of SBValue *reg*, the GPR width of *arch* when unknown."""
+    size = reg.GetByteSize()
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        return register_width_bytes(arch)
+    return size
+
 
 class LLDBBridge:
     """DebuggerBridge implementation using the LLDB Python module.
@@ -526,6 +561,165 @@ class LLDBBridge:
 
         self._log.debug("Enumerated %d modules via LLDB", len(modules))
         return modules
+
+    # -- Page residency and thread stacks -----------------------------------
+
+    def _local_linux_pid(self) -> int | None:
+        """PID of the target when its ``/proc`` is on this machine, else ``None``.
+
+        Only a local Linux or Android target has a ``/proc/<pid>/pagemap``
+        that this process can open; a remote one's lives on the other machine
+        and macOS/iOS have none.
+        """
+        info = self._platform_info
+        if info is None or self.is_remote:
+            return None
+        if info.os not in (OSType.Linux, OSType.Android):
+            return None
+        return info.pid
+
+    def residency_method(self) -> str:
+        """``"pagemap"`` for a local Linux target whose pagemap can be opened.
+
+        Implements :class:`~memslicer.acquirer.bridge.ResidencyCapable`.
+        """
+        pid = self._local_linux_pid()
+        if pid is None:
+            return "none"
+        return "pagemap" if pagemap_readable(pid) else "none"
+
+    def query_residency(self, address: int, size: int) -> bytes | None:
+        """Residency mask of a local Linux target from ``/proc/<pid>/pagemap``.
+
+        Implements :class:`~memslicer.acquirer.bridge.ResidencyCapable`. Uses
+        the page size :meth:`connect` established for the target.
+        """
+        pid = self._local_linux_pid()
+        if pid is None:
+            return None
+        return read_pagemap(pid, address, size, self._platform_info.page_size)
+
+    def enumerate_stack_pointers(self) -> list[int]:
+        """Current SP of every thread, read from its innermost frame.
+
+        Implements :class:`~memslicer.acquirer.bridge.ThreadStackCapable`.
+        A thread whose SP LLDB cannot read is left out; ``[]`` before
+        :meth:`connect` or when the thread list itself is unavailable.
+        """
+        process = self._process
+        if process is None:
+            return []
+        try:
+            count = process.GetNumThreads()
+        except Exception as exc:
+            self._log.debug("LLDB could not enumerate threads: %s", exc)
+            return []
+        if isinstance(count, bool) or not isinstance(count, int):
+            return []
+        pointers = (self._thread_stack_pointer(process, i) for i in range(count))
+        return [sp for sp in pointers if sp is not None]
+
+    def _thread_stack_pointer(self, process: Any, index: int) -> int | None:
+        """SP of frame 0 of thread *index*, ``None`` when it cannot be read."""
+        try:
+            frame = process.GetThreadAtIndex(index).GetFrameAtIndex(0)
+            if not frame.IsValid():
+                return None
+            sp = frame.GetSP()
+        except Exception as exc:
+            self._log.debug("LLDB could not read SP of thread %d: %s", index, exc)
+            return None
+        if isinstance(sp, bool) or not isinstance(sp, int):
+            return None
+        return None if sp in (0, _LLDB_INVALID_ADDRESS) else sp
+
+    def enumerate_threads(self) -> list[ThreadInfo]:
+        """Every thread with the register file of its innermost frame.
+
+        Implements :class:`~memslicer.acquirer.bridge.ThreadRegistersCapable`.
+        A thread LLDB cannot describe, or whose register file lacks a program
+        counter or stack pointer (the minimum spec Section 5.7 requires), is
+        left out; ``[]`` before :meth:`connect` or when the thread list itself
+        is unavailable.
+        """
+        process = self._process
+        if process is None or self._platform_info is None:
+            return []
+        try:
+            count = process.GetNumThreads()
+        except Exception as exc:
+            self._log.debug("LLDB could not enumerate threads: %s", exc)
+            return []
+        if isinstance(count, bool) or not isinstance(count, int):
+            return []
+        arch = self._platform_info.arch
+        threads = (self._thread_info(process, i, arch) for i in range(count))
+        return [info for info in threads if info is not None]
+
+    def _thread_info(
+        self, process: Any, index: int, arch: ArchType,
+    ) -> ThreadInfo | None:
+        """Thread *index* with its frame-0 registers, ``None`` when unusable."""
+        try:
+            thread = process.GetThreadAtIndex(index)
+            frame = thread.GetFrameAtIndex(0)
+            if not frame.IsValid():
+                return None
+            registers, partial = self._frame_registers(frame, arch)
+            info = ThreadInfo(
+                tid=_thread_id(thread), name=_thread_name(thread),
+                # The process is stopped while LLDB is attached, so every
+                # thread is halted and its register file is a consistent
+                # snapshot rather than a sample of a running thread.
+                state=ThreadState.STOPPED, suspended=True,
+                registers=registers, partial=partial,
+            )
+        except Exception as exc:
+            self._log.debug("LLDB could not read thread %d: %s", index, exc)
+            return None
+        if not info.has_pc_and_sp:
+            self._log.debug("LLDB thread %d lacks a PC or SP; skipped", index)
+            return None
+        return info
+
+    def _frame_registers(
+        self, frame: Any, arch: ArchType,
+    ) -> tuple[list[RegisterValue], bool]:
+        """Integer registers of *frame* and whether any could not be read.
+
+        Registers wider than :data:`_MAX_INT_REGISTER_BYTES` (vector and
+        extended state) are not part of the Thread Context block and are
+        skipped silently; a register LLDB fails to read marks the thread
+        partial.
+        """
+        registers: list[RegisterValue] = []
+        partial = False
+        for reg_set in frame.GetRegisters():
+            for reg in reg_set:
+                name = reg.GetName()
+                if not isinstance(name, str) or not name:
+                    continue
+                size = _register_size(reg, arch)
+                if size > _MAX_INT_REGISTER_BYTES:
+                    continue
+                value = self._register_value(reg)
+                if value is None:
+                    partial = True
+                    continue
+                registers.append(RegisterValue.from_int(name, value, size, arch))
+        return registers, partial
+
+    def _register_value(self, reg: Any) -> int | None:
+        """Unsigned value of register *reg*, ``None`` when LLDB cannot read it."""
+        error = self._lldb.SBError()
+        try:
+            value = reg.GetValueAsUnsigned(error, 0)
+        except Exception as exc:
+            self._log.debug("LLDB could not read register: %s", exc)
+            return None
+        if error.Fail() or isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
 
     def read_memory_ex(self, address: int, size: int) -> ReadResult:
         """Read *size* bytes at *address*, reporting the fault on failure.

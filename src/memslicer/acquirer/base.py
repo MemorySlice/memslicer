@@ -53,6 +53,21 @@ class AcquireResult:
     expected_unreadable_regions: list[str] = field(default_factory=list)
     unreadable_ranges: list[UnreadableRange] = field(default_factory=list)
     unreadable_ranges_truncated: int = 0
+    # Regions the operator deliberately left out via ``--scope`` or
+    # ``--exclude-module``; each one is a row of the RegionOmissionManifest
+    # (Block 0x005B) so a reader can tell a partial slice from a broken one.
+    regions_omitted: int = 0
+    # Canonical label of the acquisition scope (``"full"``, ``"heap,stack"``).
+    scope: str = "full"
+    # Resident-only pruning (--resident-only): pages that were mapped but never
+    # touched are recorded as PageState.NOT_RESIDENT and not read.
+    pages_nonresident: int = 0
+    bytes_nonresident: int = 0
+    residency_method: str = "none"
+    # Thread Context blocks (spec Section 5.7) written before the first
+    # Memory Region; 0 when the backend could not enumerate threads with
+    # registers or ``--no-registers`` was given.
+    thread_contexts: int = 0
 
 
 class BaseAcquirer(ABC):

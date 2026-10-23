@@ -13,25 +13,80 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Every capture now ends with a VAS Map block (0x1001) before EndOfCapture:
-  one entry per enumerated range (captured, filter-skipped, or not reached
-  after an abort), sorted by base, carrying protection, the region type its
-  MemoryRegion block would have and the full mapping name. Readers such as
-  MemDiver can classify Android regions (zygote space, boot image, scudo,
-  stack_and_tls, ...) by name. The payload is byte-identical to MemDiver's
-  `add_vas_map` encoding; names containing NUL or longer than 65534 bytes are
-  stored empty. New `MSLWriter.write_vas_map`, `parse_vas_map` and
-  `VasEntry`.
+- Every capture ends with a VAS Map block (0x1001) listing every enumerated
+  range. New `MSLWriter.write_vas_map`, `parse_vas_map` and `VasEntry`.
 - `tests/tools/make_android_fixture.py` generates a small Android `.msl`
-  fixture, and `tests/data/region_name_vectors.json` holds the region-name
-  vectors shared with MemDiver.
+  fixture; `tests/data/region_name_vectors.json` holds the MemDiver vectors.
 
 - `-D/--device <id>` selects a specific Frida device when several are
   attached (ids as printed by `frida-ls-devices`); `-U` keeps taking the
   first USB device. `-D` is a Frida-only option and cannot be combined
   with `-R`.
 
+- `memslicer verify <file> [--passphrase P]` checks a slice's integrity: the
+  spec §4.4 PrevHash chain (Block 0 hashes the file header, block i hashes the
+  on-disk bytes of block i-1) and the EndOfCapture FileHash, using the file's
+  HashAlgo (BLAKE3, SHA-256 or SHA-512/256). Encrypted slices are decrypted
+  (AEAD tag check; the passphrase is prompted for if not given), their
+  PrevHash fields must be zero and the FileHash is checked over the plaintext.
+  A missing EndOfCapture, a legacy zero Block-0 PrevHash and trailing bytes
+  after the last segment are reported as warnings.
+  Exits 0 when the slice is VALID, 1 when it is INVALID or cannot be read.
+- `memslicer` is now a command group with `acquire` and `verify`
+  subcommands. `memslicer <target> ...` still works and runs `acquire`; a
+  process literally named `acquire` or `verify` must be given as
+  `memslicer acquire <name>` (or by PID).
+- `--scope full|app|heap|stack` (comma-combinable, alias `heapstack`) limits
+  capture to app-owned, heap or stack regions; modules and VAS Map stay full.
+- `--exclude-module PATTERN` (repeatable glob on name, path or anon label)
+  skips its regions; `--app-path PREFIX` marks files app-owned for `app`.
+- `--resident-only` skips anonymous pages that are neither present nor swapped
+  (they read as zero); file-backed mappings are never pruned.
+- New PageState `NotResident` (value 3, spec 1.1 Table 24) marks pages
+  `--resident-only` skips; readers must treat value 3 as a 0-byte page.
+- New extension block `RegionOmissionManifest` (0x005B) lists every region
+  `--scope`/`--exclude-module` omitted; absent when nothing was omitted.
+- `--dry-run` enumerates and classifies the target's regions, prints what the
+  current options would capture and exits without writing a file.
+- The capture summary gains `Scope`, `Exclude`, `Omitted` and `Resident` lines
+  when scope, exclusions or residency pruning were in effect.
+- Slices are written as MSL 1.1 (header version `0x0101`); the EoC carries the
+  exact block count, the header count stays 0.
+- Extension segments closed by `EndOfExtension` (0x0FFE); `memslicer-enrich`
+  appends a segment instead of replacing the EoC.
+- `memslicer verify` checks the header and EoC block counts and every extension
+  segment (chain, `SegmentHash`, `BlockCount`).
+- VAS Map entries carry `NameSource` (spec Section 5.8).
+- Thread Context blocks (0x0011) with per-thread registers on Frida, GDB and
+  LLDB; `--no-registers` disables them; the summary gains a `Threads` line.
+- New `MSLWriter.extend`, `MSLWriter.begin_extension`,
+  `MSLWriter.finalize_extension` and `MSLWriter.write_thread_context`.
+
+### Changes
+
+- A header BlockCount that disagrees with the blocks on disk is now a
+  `memslicer verify` error, not a warning.
+- `memslicer-enrich` exits without writing when there is nothing to enrich.
+
 ### Bug Fixes
+
+- `/proc/<pid>/maps` names containing spaces or a ` (deleted)` suffix are no
+  longer truncated at the first space in the region record and the VAS Map.
+- `[anon:...]` heaps and stacks (`scudo:*`, `stack_and_tls:*`) now get the
+  right RegionType and volatility order, not generic anonymous memory.
+- memslicer can read its own LZ4-compressed slices again; they used to fail
+  with `LZ4BlockError`. The writer padded `UncompressedSize + CompressedData`
+  to 8 bytes, contrary to spec §4.2.1 Table 9
+  (BlockLength = 80 + 8 + len(CompressedData)), and lz4 rejects the trailing
+  padding. Compressed payloads are no longer padded; the reader still accepts
+  slices written by memslicer <= 0.4.4 by trimming up to 7 trailing zero bytes
+  and retrying.
+- `memslicer-enrich` keeps the slice's integrity chain intact. The appended
+  manifest and EndOfCapture were chained from a throwaway header and always
+  hashed with BLAKE3, so enriched slices had a broken PrevHash chain and a
+  wrong FileHash. The tail now continues the original chain and hash
+  algorithm, and enriched slices pass `memslicer verify`. New
+  `MSLWriter.resume(...)`.
 
 - Investigation captures no longer abort with `'Q' format requires 0 <= number …`
   on Linux hosts ([#3](https://github.com/MemorySlice/memslicer/issues/3)).

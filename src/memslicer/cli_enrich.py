@@ -16,19 +16,28 @@ logic against its captured regions, and append the manifest block as
 an additive overlay. The original bytes in the input slice are
 untouched until the new file is written alongside.
 
+Extension segment (spec Section 4.6): the capture segment -- header,
+every block and the original ``EndOfCapture`` -- is copied verbatim,
+together with every extension segment that already verifies. The
+manifest goes into a new extension segment appended after them, closed
+by an ``EndOfExtension`` block that records the segment's hash, its
+block count and ``memslicer-enrich/<version>`` as producer. The
+``PrevHash`` chain (Section 4.4) continues through the EoC and the
+existing segments, so the enriched file still has one linear chain and
+the original EoC ``FileHash`` stays valid.
+
+Modules whose build-id an existing manifest (in any segment, including
+a pre-1.1 manifest written before a replaced EoC) already covers are
+skipped; when nothing is left the slice is not rewritten.
+
 Known limitations (P1.7):
 
-* **Integrity chain**: the appended manifest block is written with a
-  fresh ``prev_hash`` chain — it does not chain from the hash of the
-  preceding bytes in the original slice. The new ``EndOfCapture``'s
-  ``file_hash`` is computed over that fresh chain (fresh file header +
-  manifest + EoC), NOT over the full enriched file bytes, so a strict
-  chain-continuity validator would reject the enriched file on the
-  manifest block's ``prev_hash`` mismatch. Adding a
-  ``seed_chain_from_bytes`` API to the writer to preserve full chain
-  continuity is P2 scope.
+* **Encrypted slices**: not supported. An extension segment would have
+  to lie inside the AEAD stream, which nothing here can re-seal.
 
-* **Encrypted slices**: not supported (the iterator refuses).
+* **Trailing data**: a slice with bytes after its last verified segment
+  (an unterminated or tampered segment, non-MSL garbage) is refused
+  rather than built upon (Section 4.6 producer rules).
 
 * **Full MemoryRegion parse**: the CLI parses only the first page of
   each region, which is sufficient for build-id extraction. A
@@ -50,18 +59,28 @@ from pathlib import Path
 
 import click
 
+from memslicer import __version__
 from memslicer.acquirer.build_id_post import (
     SOURCE_RETROACTIVE,
     populate_from_regions,
 )
 from memslicer.msl.constants import (
-    HEADER_SIZE,
+    COMPRESSED,
     BlockType,
-    CompAlgo,
     HashAlgo,
     PageState,
 )
-from memslicer.msl.iterator import is_encrypted, iterate_blocks, read_hash_algo
+from memslicer.msl.integrity import IntegrityChain
+from memslicer.msl.iterator import (
+    SegmentSpan,
+    _decompress_block_payload,
+    _iter_raw_blocks,
+    is_encrypted,
+    iterate_blocks,
+    read_file_header_info,
+    read_hash_algo,
+    scan_extension_segments,
+)
 from memslicer.msl.types import (
     FileHeader,
     MemoryRegion,
@@ -69,7 +88,14 @@ from memslicer.msl.types import (
     ModuleBuildIdRow,
     ModuleEntry,
 )
-from memslicer.msl.writer import MSLWriter
+from memslicer.msl.writer import (
+    MSLWriter,
+    parse_end_of_extension,
+    parse_module_build_id_manifest,
+)
+
+PRODUCER = f"memslicer-enrich/{__version__}"
+"""Producer string recorded in the EndOfExtension block (spec Table 12a)."""
 
 
 _log = logging.getLogger("memslicer.enrich")
@@ -216,45 +242,54 @@ def _extract_blob_fields(native_blob: bytes) -> tuple[int, int, int, bytes]:
 
 def _load_slice(
     slice_path: Path,
-) -> tuple[list[ModuleEntry], list[MemoryRegion], int, HashAlgo]:
-    """Read modules, regions, the EoC start offset, and hash algo from a slice.
+) -> tuple[list[ModuleEntry], list[MemoryRegion], HashAlgo, set[int]]:
+    """Read modules, regions, hash algo and already-enriched bases from a slice.
 
-    Returns ``(modules, regions, eoc_start_offset, hash_algo)``. Raises
+    Walks the capture segment and every valid extension segment. Rows of
+    any ``ModuleBuildIdManifest`` -- in an extension segment, or in the
+    capture segment of a pre-1.1 enriched file whose manifest precedes a
+    replaced EoC -- contribute their ``base_addr`` to ``enriched_bases``.
+
+    Returns ``(modules, regions, hash_algo, enriched_bases)``. Raises
     :class:`FileNotFoundError` / :class:`ValueError` on missing or
-    malformed files.
+    malformed files, or when the slice has no ``EndOfCapture`` block.
     """
     modules: list[ModuleEntry] = []
     regions: list[MemoryRegion] = []
-    eoc_start: int | None = None
+    enriched_bases: set[int] = set()
+    eoc_seen = False
 
     with open(slice_path, "rb") as f:
         if is_encrypted(f):
             # iterate_blocks can decrypt, but enrichment cannot use that:
-            # _write_enriched splices the original bytes at the EndOfCapture
-            # offset, and an encrypted slice has no byte offset that maps to
-            # a plaintext block boundary. Appending would also invalidate the
-            # container's authentication tag, which nothing here can re-seal.
+            # an extension segment must lie inside the AEAD stream (spec
+            # Section 4.6), and appending to a sealed container would
+            # invalidate its authentication tag, which nothing here can
+            # re-seal.
             raise ValueError(
                 f"slice at {slice_path} is encrypted; enrichment would have to "
                 f"re-seal the container, which is not supported. Re-acquire "
                 f"without encryption to enrich, or enrich before encrypting"
             )
         hash_algo = read_hash_algo(f)
-        for block in iterate_blocks(f):
+        for block in iterate_blocks(f, extensions=True):
             if block.block_type == BlockType.ModuleEntry:
                 modules.append(_parse_module_entry_minimal(block.payload))
             elif block.block_type == BlockType.MemoryRegion:
                 regions.append(_parse_memory_region_for_enrich(block.payload))
+            elif block.block_type == BlockType.ModuleBuildIdManifest:
+                manifest = parse_module_build_id_manifest(block.payload)
+                enriched_bases.update(row.base_addr for row in manifest.rows)
             elif block.block_type == BlockType.EndOfCapture:
-                eoc_start = block.start_offset
+                eoc_seen = True
 
-    if eoc_start is None:
+    if not eoc_seen:
         raise ValueError(
             f"slice at {slice_path} has no EndOfCapture block; "
             f"cannot determine where to append the manifest"
         )
 
-    return modules, regions, eoc_start, hash_algo
+    return modules, regions, hash_algo, enriched_bases
 
 
 def _build_manifest_rows(modules: list[ModuleEntry]) -> list[ModuleBuildIdRow]:
@@ -281,52 +316,176 @@ def _build_manifest_rows(modules: list[ModuleEntry]) -> list[ModuleBuildIdRow]:
     return rows
 
 
-def _render_manifest_tail(manifest: ModuleBuildIdManifest) -> bytes:
-    """Serialize a manifest block + fresh EoC using a throwaway writer.
+def _seed_chain(slice_path: Path) -> tuple[IntegrityChain, int, int]:
+    """Hash a slice's header, capture segment and valid extension segments.
 
-    Returns the bytes AFTER the fresh file header, i.e. exactly the
-    manifest block followed by the EoC block. Strips the 64-byte
-    file-header preamble from the throwaway writer's output so the
-    caller can append the result to the copied input preamble.
+    Feeds the HeaderSize-byte file header, then each block's on-disk
+    bytes in order (one block in memory at a time) through the
+    ``EndOfCapture``, then every extension segment that is terminated,
+    counts its blocks exactly and carries a matching ``SegmentHash``
+    (spec Section 4.6). Returns ``(chain, block_index, append_offset)``
+    where ``block_index`` is the number of blocks fed and
+    ``append_offset`` the end of the last valid segment -- the only place
+    a new segment may go.
 
-    Known limitation: the returned block bytes carry a fresh
-    integrity chain seeded from the throwaway header, not from the
-    hash of the caller's preamble. See module docstring.
+    Raises :class:`ValueError` when the slice has no ``EndOfCapture``, or
+    when bytes follow the last valid segment: a producer must not build
+    on unverified trailing data.
     """
-    scratch = io.BytesIO()
-    scratch_header = FileHeader()
-    scratch_writer = MSLWriter(scratch, scratch_header, CompAlgo.NONE)
-    scratch_writer.write_module_build_id_manifest(manifest)
-    scratch_writer.finalize()
+    with open(slice_path, "rb") as f:
+        header_size, hash_algo, _flags = read_file_header_info(f)
+        chain = IntegrityChain(hash_algo=hash_algo)
+        chain.feed_header(f.read(header_size))
+        block_index, eoc_end = _feed_capture_segment(f, chain)
+        if eoc_end is None:
+            raise ValueError(f"slice at {slice_path} has no EndOfCapture block")
+        block_index, append_offset = _feed_valid_segments(f, eoc_end, chain, block_index)
+        f.seek(0, 2)
+        trailing = f.tell() - append_offset
+    if trailing:
+        raise ValueError(
+            f"slice at {slice_path} has {trailing} unverified trailing byte(s) "
+            f"after offset {append_offset}; refusing to append to it"
+        )
+    return chain, block_index, append_offset
 
-    scratch_bytes = scratch.getvalue()
-    # Skip the 64-byte file header that the throwaway writer emitted.
-    return scratch_bytes[HEADER_SIZE:]
+
+def _feed_capture_segment(f, chain: IntegrityChain) -> tuple[int, int | None]:
+    """Feed every capture-segment block including the EoC into ``chain``.
+
+    Returns ``(blocks_fed, eoc_end_offset)``; the offset is ``None`` when
+    the stream ends before an ``EndOfCapture``.
+    """
+    block_index = 0
+    for raw in _iter_raw_blocks(f):
+        chain.feed_block_parts(raw.header_bytes, raw.on_disk_payload)
+        block_index += 1
+        if raw.block_type == BlockType.EndOfCapture:
+            return block_index, raw.end_offset
+    return block_index, None
+
+
+def _feed_valid_segments(
+    f, start: int, chain: IntegrityChain, block_index: int,
+) -> tuple[int, int]:
+    """Feed every verifiable extension segment after ``start`` into ``chain``.
+
+    Stops at the first unterminated, miscounted or hash-mismatching
+    segment, leaving it (and everything after it) as trailing data.
+    Returns ``(block_index, append_offset)``.
+    """
+    spans, append_offset = scan_extension_segments(f, start)
+    for span in spans:
+        if not span.terminated or not _feed_segment(f, span, chain):
+            return block_index, span.start
+        block_index += span.block_count
+        append_offset = span.end
+    return block_index, append_offset
+
+
+def _feed_segment(f, span: SegmentSpan, chain: IntegrityChain) -> bool:
+    """Feed one terminated span; ``False`` when its terminator disagrees.
+
+    The ``SegmentHash`` is taken before the terminator is fed, matching
+    :meth:`MSLWriter.finalize_extension`.
+    """
+    chain.start_segment()
+    f.seek(span.start)
+    ok = False
+    try:
+        for raw in _iter_raw_blocks(f, end=span.end):
+            if raw.block_type == BlockType.EndOfExtension:
+                payload = (
+                    _decompress_block_payload(raw) if raw.flags & COMPRESSED
+                    else raw.on_disk_payload
+                )
+                terminator = parse_end_of_extension(payload)
+                ok = (
+                    terminator.segment_hash == chain.segment_digest()
+                    and terminator.block_count == span.block_count
+                )
+            chain.feed_block_parts(raw.header_bytes, raw.on_disk_payload)
+    except (ValueError, NotImplementedError):
+        ok = False
+    finally:
+        chain.end_segment()
+    return ok
+
+
+def _render_manifest_tail(
+    manifest: ModuleBuildIdManifest,
+    chain: IntegrityChain,
+    block_index: int,
+) -> bytes:
+    """Serialize a manifest block + new EoC continuing an existing chain.
+
+    ``chain`` must be seeded with the original slice's header and every
+    block before its EoC (see :func:`_seed_chain`); ``block_index`` is
+    that block count. The writer's header carries the chain's
+    ``hash_algo`` so it matches the original slice. Returns exactly the manifest block followed by
+    the EoC block -- no file header is emitted -- so the caller appends
+    the result to the copied preamble and the chain stays continuous.
+    """
+    tail = io.BytesIO()
+    writer = MSLWriter.resume(
+        tail, FileHeader(hash_algo=chain.hash_algo), chain, block_index,
+    )
+    writer.write_module_build_id_manifest(manifest)
+    writer.finalize()
+    return tail.getvalue()
+
+
+def _render_extension_tail(
+    manifest: ModuleBuildIdManifest,
+    chain: IntegrityChain,
+    block_index: int,
+) -> bytes:
+    """Serialize one extension segment holding the manifest (spec Section 4.6).
+
+    ``chain`` must be seeded with the slice's header, its capture segment
+    including the EoC and every valid existing segment (see
+    :func:`_seed_chain`); ``block_index`` is that block count. Returns
+    exactly the manifest block followed by its ``EndOfExtension`` block
+    -- no file header, no EoC -- so the caller appends the result after
+    the last valid segment and the chain stays continuous.
+    """
+    tail = io.BytesIO()
+    writer = MSLWriter.extend(
+        tail, FileHeader(hash_algo=chain.hash_algo), chain, block_index,
+    )
+    writer.begin_extension()
+    writer.write_module_build_id_manifest(manifest)
+    writer.finalize_extension(producer=PRODUCER)
+    return tail.getvalue()
 
 
 def _write_enriched(
     slice_path: Path,
     output_path: Path,
-    eoc_start: int,
     manifest: ModuleBuildIdManifest,
 ) -> None:
     """Write the enriched slice to ``output_path``.
 
-    Copies bytes ``[0, eoc_start)`` verbatim from ``slice_path``, then
-    appends the manifest block and a fresh EoC computed by a throwaway
-    writer.
+    Copies bytes ``[0, append_offset)`` verbatim from ``slice_path`` --
+    header, capture segment with its original EoC, and every valid
+    extension segment -- then appends a new extension segment holding
+    the manifest, whose PrevHash chain continues the original.
+
+    Raises :class:`ValueError` when the slice cannot be appended to (no
+    EoC, or unverified trailing bytes).
     """
-    tail = _render_manifest_tail(manifest)
+    chain, block_index, append_offset = _seed_chain(slice_path)
+    tail = _render_extension_tail(manifest, chain, block_index)
 
     with open(slice_path, "rb") as src, open(output_path, "wb") as dst:
-        remaining = eoc_start
+        remaining = append_offset
         while remaining > 0:
             chunk = src.read(min(remaining, 1 << 20))
             if not chunk:
                 raise IOError(
                     f"unexpected EOF while copying {slice_path} "
-                    f"(expected {eoc_start} bytes, "
-                    f"got {eoc_start - remaining})"
+                    f"(expected {append_offset} bytes, "
+                    f"got {append_offset - remaining})"
                 )
             dst.write(chunk)
             remaining -= len(chunk)
@@ -372,21 +531,22 @@ def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
         output = slice_path.with_suffix(slice_path.suffix + ".enriched")
 
     try:
-        modules, regions, eoc_start, hash_algo = _load_slice(slice_path)
+        modules, regions, hash_algo, enriched_bases = _load_slice(slice_path)
     except ValueError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
 
-    # Skip modules that already have a populated native_blob.
-    unpopulated = [m for m in modules if not m.native_blob]
+    # Skip modules that already have a populated native_blob, and those
+    # an existing manifest already covers.
+    unpopulated = [
+        m for m in modules
+        if not m.native_blob and m.base_addr not in enriched_bases
+    ]
     if not unpopulated:
         click.echo(
             "nothing to enrich: all modules already have populated build-ids"
         )
-        if in_place:
-            # Don't touch the original; discard the would-be tmp path.
-            return
-        shutil.copyfile(slice_path, output)
+        # Nothing is written: the original is complete as it stands.
         return
 
     populate_from_regions(
@@ -410,7 +570,11 @@ def main(slice_path: Path, output: Path | None, in_place: bool) -> None:
         return
 
     manifest = ModuleBuildIdManifest(rows=rows)
-    _write_enriched(slice_path, output, eoc_start, manifest)
+    try:
+        _write_enriched(slice_path, output, manifest)
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
 
     if in_place:
         os.replace(output, slice_path)

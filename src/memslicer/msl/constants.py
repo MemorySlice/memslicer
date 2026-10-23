@@ -67,7 +67,7 @@ FLAG_REDACTED: int = 0x0008        # bit 3
 # ---------------------------------------------------------------------------
 # Format version
 # ---------------------------------------------------------------------------
-VERSION: tuple[int, int] = (1, 0)
+VERSION: tuple[int, int] = (1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +142,24 @@ class BlockType(IntEnum):
     PhysicalMemoryMap = 0x0059
     ModuleBuildIdManifest = 0x005A
     RegionOmissionManifest = 0x005B
+    # Terminator of an extension segment (spec Section 4.6).
+    EndOfExtension = 0x0FFE
     EndOfCapture = 0x0FFF
     VASMap = 0x1001
     PointerGraph = 0x1003
+
+
+# ---------------------------------------------------------------------------
+# Extension segments (spec Section 4.6)
+# ---------------------------------------------------------------------------
+# Evidence block types that MUST NOT appear inside an extension segment: the
+# capture segment is the evidence, a segment appended later may only carry
+# derived views (manifests, key hints, structural blocks).
+EXTENSION_FORBIDDEN_TYPES: frozenset[int] = frozenset(
+    {0x0001, 0x0002, 0x0030, 0x0040, 0x0FFF}
+    | set(range(0x0010, 0x0016))
+    | set(range(0x0050, 0x0059))
+)
 
 
 class CompAlgo(IntEnum):
@@ -176,6 +191,43 @@ class OmissionReason(IntEnum):
 
     MODULE_EXCLUDE = 1
     SCOPE = 2
+
+
+class VasNameSource(IntEnum):
+    """How a VAS Map entry's MappedPath was obtained (spec Section 5.8)."""
+
+    UNSPECIFIED = 0      # consumer infers: capture segment of a live file -> LIVE
+    LIVE = 1             # enumerated from the running target
+    SOURCE_METADATA = 2  # taken from an imported source format's metadata
+    SYNTHESIZED = 3      # derived by a tool, not reported by the target
+
+
+class ThreadState(IntEnum):
+    """Scheduler state of a thread (Thread Context block, spec Table 19a)."""
+
+    UNKNOWN = 0
+    RUNNING = 1
+    SLEEPING = 2
+    STOPPED = 3
+    WAITING = 4
+    UNINTERRUPTIBLE = 5
+    HALTED = 6
+    ZOMBIE = 7
+
+
+# Thread Context ``Flags`` bits (spec Table 19a).
+TC_FLAG_CURRENT: int = 0x0001    # thread that triggered the capture
+TC_FLAG_CRASHED: int = 0x0002    # thread that faulted
+TC_FLAG_SUSPENDED: int = 0x0004  # registers read from a stopped thread
+TC_FLAG_PARTIAL: int = 0x0008    # register set is incomplete
+
+# Thread register ``Flags`` role bits (spec Table 19b).
+REG_ROLE_PC: int = 0x0001     # program counter
+REG_ROLE_SP: int = 0x0002     # stack pointer
+REG_ROLE_FP: int = 0x0004     # frame pointer
+REG_ROLE_FLAGS: int = 0x0008  # status / flags register
+REG_ROLE_TLS: int = 0x0010    # thread pointer / TLS base
+REG_ROLE_LR: int = 0x0020     # link register
 
 
 class RegionType(IntEnum):
