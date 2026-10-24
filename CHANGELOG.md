@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file.
 
 
+
+## [0.5.0] - 2026-10-23
+
+### Changes
+
+- serveral fixes (investigator mode; acquisiton notion for Thread Context blocks; changes regarding the new specification)
+- start making and improving memslicer to acquire only certain memory regions which are most likely relevant
+- Merge branch 'main' of github.com:MemorySlice/memslicer
+- fixed issue for the investigator mode
+
 ## [0.4.0] - 2026-09-14
 
 ### Changes
