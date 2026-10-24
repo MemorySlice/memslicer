@@ -61,9 +61,42 @@ All notable changes to this project will be documented in this file.
   LLDB; `--no-registers` disables them; the summary gains a `Threads` line.
 - New `MSLWriter.extend`, `MSLWriter.begin_extension`,
   `MSLWriter.finalize_extension` and `MSLWriter.write_thread_context`.
+- MSL 1.1.1 `CipherLen` (header `0x78`, formerly `Reserved3`): encrypted
+  slices written to a seekable file record the primary ciphertext length,
+  patched once after the tag (pipes keep 0). `EncryptionParams.cipher_len`,
+  `aad_from_header`, `zero_cipher_len` and `primary_ciphertext_span`.
+- `decrypt_container` returns the plaintext plus the primary tag and the
+  offset of any bytes after it (`post_tag_offset`).
+- `hkdf_blake3` and `derive_segment_key` (spec Section 10.8 segment subkeys),
+  pinned to MemDiver's implementation by test vectors.
+- Sealed extension segments (spec 1.1.1, Section 10.8, Table 27a): new
+  `memslicer.msl.sealed` with `SealHeader` (magic stored as the bytes
+  `"MSLS"`), `seal_segment` (write primitive) and `open_sealed_segments`
+  (read/verify), plus `MSLWriter.for_sealed_segment` to build the
+  zero-PrevHash plaintext segment. `decrypt_container` now verifies the
+  sealed segments after the primary tag (`sealed_segments`, `sealed_end`,
+  `trailing_bytes`, `last_tag`, `cek`); `iterate_blocks` yields their blocks
+  after the in-stream extension segments (`BlockRecord.seal_index`).
+  `memslicer verify` reports the verified sealed segments
+  (`VerifyReport.sealed_segments`, `sealed_trailing_bytes`, `sealed=N` in
+  the summary) and warns only about bytes after the last of them.
+- `memslicer-enrich` enriches encrypted slices (`--passphrase`, prompted
+  with hidden input when omitted): the build-id manifest is appended as a
+  sealed extension segment (spec 1.1.1, Section 10.8) in one write after the
+  last verified sealed segment; the primary ciphertext and tag are untouched
+  and `--in-place` appends to the original directly. Enrichers see the
+  blocks of earlier sealed segments too. Slices without `CipherLen`
+  (pre-1.1.1 or written to a non-seekable stream), with trailing data after
+  the last verified sealed segment, or with a wrong passphrase are refused
+  and left unchanged. New `iterate_container_blocks` iterates an already
+  decrypted container without deriving the key again.
 
 ### Changes
 
+- The AEAD AAD is the header with `CipherLen` zeroed (spec 1.1.1, Section
+  10.2) and the EoC FileHash hashes `CipherLen` as zero. Readers locate the
+  tag via `CipherLen` (EOF-16 when 0) and reject an out-of-bounds value;
+  files with `CipherLen=0` (all earlier memslicer slices) read unchanged.
 - A header BlockCount that disagrees with the blocks on disk is now a
   `memslicer verify` error, not a warning.
 - `memslicer-enrich` exits without writing when there is nothing to enrich.

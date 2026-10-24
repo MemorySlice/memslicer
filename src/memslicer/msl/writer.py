@@ -151,6 +151,20 @@ def _read_omission_row(payload: bytes, offset: int) -> tuple[RegionOmissionRow, 
     return row, offset
 
 
+def _stream_position(output: BinaryIO) -> int | None:
+    """Return the current offset of a seekable *output*, else ``None``.
+
+    Pipes and other non-seekable streams report ``None`` so the writer
+    knows it cannot patch the header later.
+    """
+    try:
+        if not output.seekable():
+            return None
+        return output.tell()
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
 def _enum_or_int(enum_cls, value: int):
     """Return ``enum_cls(value)``, or the bare int for an unknown value."""
     try:
@@ -488,6 +502,7 @@ class MSLWriter:
         _resume_chain: IntegrityChain | None = None,
         _resume_block_index: int = 0,
         _resume_after_eoc: bool = False,
+        _zero_prev_hash: bool = False,
     ) -> None:
         self._output = output
         self._header = header
@@ -495,6 +510,9 @@ class MSLWriter:
         self._chain = _resume_chain or IntegrityChain(hash_algo=header.hash_algo)
         self._block_index: int = _resume_block_index
         self._encrypted = bool(encryption_key)
+        # PrevHash is zero in encrypted containers (spec Section 4.4), and
+        # also in a sealed segment's plaintext (spec Section 10.8).
+        self._zero_prev_hash: bool = self._encrypted or _zero_prev_hash
         self._encryption_params = None
         self._encryptor = None
         # Segment bookkeeping (spec Section 4.6): once the EoC is written
@@ -503,6 +521,9 @@ class MSLWriter:
         self._in_extension: bool = False
         self._segment_blocks: int = 0
         self._sealed: bool = False
+        # Where the header starts in a seekable output (None otherwise);
+        # the CipherLen patch needs it (spec Section 10.7).
+        self._header_offset: int | None = None
 
         # Pre-compute compression flags (constant per writer instance)
         if comp_algo != CompAlgo.NONE:
@@ -512,7 +533,7 @@ class MSLWriter:
 
         if self._encrypted:
             from memslicer.msl.encryption import (
-                EncryptionParams, StreamingEncryptor,
+                EncryptionParams, StreamingEncryptor, aad_from_header,
                 pack_encryption_extension,  # noqa: F811 — used in _write_header
             )
             if encryption_params is None:
@@ -531,7 +552,7 @@ class MSLWriter:
             self._encryptor = StreamingEncryptor(
                 key=self._encryption_key,
                 nonce=self._encryption_params.nonce,
-                aad=self._header_bytes,
+                aad=aad_from_header(self._header_bytes),
             )
 
     @classmethod
@@ -597,6 +618,33 @@ class MSLWriter:
             _resume_after_eoc=True,
         )
 
+    @classmethod
+    def for_sealed_segment(
+        cls,
+        output: BinaryIO,
+        header: FileHeader,
+        comp_algo: CompAlgo = CompAlgo.NONE,
+    ) -> "MSLWriter":
+        """Return a writer that builds the plaintext of one sealed segment.
+
+        A sealed extension segment (spec Section 10.8) encrypts exactly one
+        extension segment whose ``PrevHash`` fields are all zero. Write it
+        with :meth:`begin_extension`, the permitted blocks and
+        :meth:`finalize_extension`; ``output`` (e.g. a ``BytesIO``) then
+        holds the bytes to pass to :func:`memslicer.msl.sealed.seal_segment`.
+        No file header is written.
+
+        Args:
+            output: Stream that receives the plaintext segment.
+            header: Header of the target file (supplies ``hash_algo``).
+            comp_algo: Compression for the segment's blocks.
+        """
+        return cls(
+            output, header, comp_algo,
+            _resume_chain=IntegrityChain(hash_algo=header.hash_algo),
+            _resume_after_eoc=True, _zero_prev_hash=True,
+        )
+
     # ------------------------------------------------------------------
     # File header
     # ------------------------------------------------------------------
@@ -635,8 +683,12 @@ class MSLWriter:
             header_bytes = base_header
 
         self._header_bytes = header_bytes  # saved for AAD
+        self._header_offset = _stream_position(self._output)
         self._output.write(header_bytes)
-        self._chain.feed_header(header_bytes)
+        # FileHash covers CipherLen as zero (spec Section 10.7), even when
+        # the caller supplied a non-zero value up front.
+        from memslicer.msl.encryption import zero_cipher_len
+        self._chain.feed_header(zero_cipher_len(header_bytes))
 
     # ------------------------------------------------------------------
     # Process Identity (Block 0)
@@ -730,7 +782,7 @@ class MSLWriter:
 
         # Spec Section 4.4: PrevHash MUST be zero when Encrypted is set
         prev_hash = (
-            b"\x00" * 32 if self._encrypted
+            b"\x00" * 32 if self._zero_prev_hash
             else self._chain.prev_hash
         )
 
@@ -1823,10 +1875,43 @@ class MSLWriter:
         if self._sealed:
             raise ValueError("container already sealed")
         ciphertext, tag = self._encryptor.finalize()
+        self._check_preset_cipher_len(len(ciphertext))
         self._output.write(ciphertext)
         self._output.write(tag)
         self._sealed = True
+        self._patch_cipher_len(len(ciphertext))
         self._output.flush()
+
+    def _check_preset_cipher_len(self, cipher_len: int) -> None:
+        """Refuse to seal when a caller-supplied ``CipherLen`` is wrong.
+
+        A non-zero value written up front (spec Section 10.7 allows it)
+        must equal the real ciphertext length, or readers would look for
+        the tag in the wrong place.
+        """
+        preset = self._encryption_params.cipher_len
+        if preset and preset != cipher_len:
+            raise ValueError(
+                f"EncryptionParams.cipher_len {preset} != actual ciphertext "
+                f"length {cipher_len}"
+            )
+
+    def _patch_cipher_len(self, cipher_len: int) -> None:
+        """Record ``CipherLen`` at header offset 0x78 once the tag is written.
+
+        Spec Section 10.7: the sealing producer patches the field once,
+        and only on seekable output. A non-seekable stream (a pipe) keeps
+        0, which readers handle by taking the tag from the end of the file.
+        The stream is left positioned at its end.
+        """
+        from memslicer.msl.encryption import CIPHER_LEN_OFFSET
+
+        if self._encryption_params.cipher_len or self._header_offset is None:
+            return
+        end = self._output.tell()
+        self._output.seek(self._header_offset + CIPHER_LEN_OFFSET)
+        self._output.write(struct.pack("<Q", cipher_len))
+        self._output.seek(end)
 
     # ------------------------------------------------------------------
     # Extension segments (spec Section 4.6)

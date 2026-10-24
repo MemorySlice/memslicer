@@ -17,22 +17,30 @@ of the file into trailing data.
 
 For an encrypted slice the AEAD tag is the integrity mechanism: every
 PrevHash MUST be zero, and the FileHash is checked over the decrypted
-plaintext stream; extension segments live inside that stream.
+plaintext stream; extension segments live inside that stream. The
+FileHash covers the header with ``CipherLen`` (0x78–0x7F) as zero (spec
+1.1.1, Section 10.7). Bytes after the primary AEAD tag (possible only when
+``CipherLen`` is non-zero) are parsed as sealed extension segments (spec
+Section 10.8): each verified one is listed in ``sealed_segments``, and
+whatever follows the last of them is trailing data (a warning).
 """
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
+from io import BytesIO
 from typing import BinaryIO
 
 from memslicer.msl.constants import COMPRESSED, FLAG_ENCRYPTED, BlockType, HashAlgo
+from memslicer.msl.encryption import zero_cipher_len
 from memslicer.msl.integrity import IntegrityChain
 from memslicer.msl.iterator import (
+    DecryptedContainer,
     RawBlock,
     SegmentSpan,
     _decompress_block_payload,
     _iter_raw_blocks,
-    decrypt_stream,
+    decrypt_container,
     read_file_header_info,
     scan_extension_segments,
 )
@@ -88,7 +96,14 @@ class VerifyReport:
     declares (0 = unknown, legacy 40-byte payload) and ``block_count_ok``
     whether every non-zero declaration matched (``None`` without an EoC).
     ``trailing_bytes`` counts the bytes after the last verified segment
-    (or after the EoC). A slice is valid when no errors were recorded;
+    (or after the EoC). For an encrypted slice ``cipher_len`` is the
+    header ``CipherLen``, ``post_tag_offset`` the file offset just after
+    the primary AEAD tag (``None`` if not decrypted) and ``post_tag_bytes``
+    the count of bytes from there to EOF. ``sealed_segments`` reports the
+    verified sealed extension segments after the tag (spec Section 10.8;
+    ``start_offset`` is the file offset of each ``SealHeader``) and
+    ``sealed_trailing_bytes`` the bytes after the last of them, which are
+    trailing data. A slice is valid when no errors were recorded;
     warnings (legacy layouts, missing EoC, trailing data) do not
     invalidate it.
     """
@@ -104,6 +119,11 @@ class VerifyReport:
     block_count_ok: bool | None = None
     segments: list[SegmentReport] = field(default_factory=list)
     trailing_bytes: int = 0
+    cipher_len: int = 0
+    post_tag_offset: int | None = None
+    post_tag_bytes: int = 0
+    sealed_segments: list[SegmentReport] = field(default_factory=list)
+    sealed_trailing_bytes: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -159,7 +179,7 @@ def verify_slice(f: BinaryIO, passphrase: str | None = None) -> VerifyReport:
     if stream is None:
         return report
     chain = IntegrityChain(hash_algo)
-    chain.feed_header(header_bytes)
+    chain.feed_header(zero_cipher_len(header_bytes))
     _walk_blocks(stream, chain, report)
     return report
 
@@ -174,10 +194,32 @@ def _open_block_stream(
     if passphrase is None:
         raise ValueError("slice is encrypted; a passphrase is required to verify it")
     try:
-        return decrypt_stream(f, header_size, passphrase)
+        container = decrypt_container(f, header_size, passphrase)
     except ValueError as exc:
         report.errors.append(str(exc))
         return None
+    _note_post_tag_bytes(container, report)
+    return BytesIO(container.plaintext)
+
+
+def _note_post_tag_bytes(container: DecryptedContainer, report: VerifyReport) -> None:
+    """Record the sealed segments after the primary tag and any trailing data.
+
+    :func:`decrypt_container` has already verified the sealed extension
+    segments (spec Section 10.8); everything after the last verified one
+    is trailing data and only warned about.
+    """
+    report.cipher_len = container.cipher_len
+    report.post_tag_offset = container.post_tag_offset
+    report.post_tag_bytes = container.post_tag_bytes
+    report.sealed_segments = [sealed.report for sealed in container.sealed_segments]
+    report.sealed_trailing_bytes = container.trailing_bytes
+    if report.sealed_trailing_bytes:
+        report.warnings.append(
+            f"{report.sealed_trailing_bytes} byte(s) after the primary AEAD tag "
+            f"and {len(report.sealed_segments)} sealed segment(s), at "
+            f"0x{container.sealed_end:X}, not verified (treated as trailing data)"
+        )
 
 
 def _walk_blocks(stream: BinaryIO, chain: IntegrityChain, report: VerifyReport) -> None:

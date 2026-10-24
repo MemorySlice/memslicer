@@ -481,12 +481,13 @@ class TestEncryptedExtension:
     def _decrypt(self, data: bytes, params) -> bytes:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-        from memslicer.msl.encryption import AES_GCM_TAG_LEN
+        from memslicer.msl.encryption import AES_GCM_TAG_LEN, aad_from_header
 
-        header_bytes = data[:ENCRYPTED_HEADER_SIZE]
+        # AAD = header with CipherLen (0x78) zeroed (spec 1.1.1, Section 10.2)
+        aad = aad_from_header(data[:ENCRYPTED_HEADER_SIZE])
         body = data[ENCRYPTED_HEADER_SIZE:]
         assert len(body) > AES_GCM_TAG_LEN
-        return AESGCM(self.KEY).decrypt(params.nonce, body, header_bytes)
+        return AESGCM(self.KEY).decrypt(params.nonce, body, aad)
 
     def test_segment_inside_container(self):
         buf, writer, params = self._enc_writer()

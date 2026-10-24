@@ -33,7 +33,8 @@ Intentionally out of scope:
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from io import BytesIO
 from typing import BinaryIO, Iterator
 
 from memslicer.msl.compression import decompress_tolerating_padding
@@ -64,7 +65,11 @@ class BlockRecord:
     ``end_offset`` is the offset immediately after the block's last
     on-disk byte (so ``end_offset - start_offset == length``).
     ``segment`` is 0 for a capture-segment block and *n* for a block of
-    the *n*-th extension segment (spec Section 4.6).
+    the *n*-th extension segment (spec Section 4.6). Sealed extension
+    segments (spec Section 10.8) continue that numbering after the
+    segments inside the AEAD stream; their blocks also carry
+    ``seal_index`` = the sealed ``SegIndex`` (0 for every other block),
+    and their offsets are positions in that segment's decrypted plaintext.
     """
 
     block_type: int
@@ -78,6 +83,7 @@ class BlockRecord:
     start_offset: int
     end_offset: int
     segment: int = 0
+    seal_index: int = 0
 
 
 @dataclass
@@ -193,14 +199,129 @@ AEAD_TAG_SIZE = 16
 """Length of the AES-GCM authentication tag appended after the ciphertext."""
 
 
-def decrypt_stream(f: BinaryIO, header_size: int, passphrase: str) -> BinaryIO:
-    """Return the plaintext block stream of an encrypted slice.
+@dataclass
+class DecryptedContainer:
+    """Result of :func:`decrypt_container`: the verified primary AEAD stream.
+
+    ``plaintext`` is the decrypted block stream (Block 0 onwards).
+    ``cipher_len`` is the header ``CipherLen`` (0 = not recorded, tag at
+    EOF). ``post_tag_offset`` is the file offset just after the primary
+    tag; ``file_size - post_tag_offset`` bytes follow it, which can only
+    happen when ``cipher_len`` is non-zero. Those bytes are parsed as
+    sealed extension segments (spec Section 10.8): ``sealed_segments``
+    holds the ones whose tag and plaintext verified, in order, and
+    ``sealed_end`` the file offset where trailing data begins.
+    ``header``, ``kem_ciphertext`` and ``tag`` are kept because the sealed
+    segments' AAD chains to them; ``cek`` is kept so an appender can seal
+    the next segment (see :attr:`last_tag`).
+    """
+
+    plaintext: bytes
+    header: bytes
+    kem_ciphertext: bytes
+    tag: bytes
+    cipher_len: int
+    post_tag_offset: int
+    file_size: int
+    cek: bytes = field(default=b"", repr=False)
+    sealed_segments: list = field(default_factory=list)  # list[SealedSegment]
+    sealed_end: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sealed_end is None:
+            self.sealed_end = self.post_tag_offset
+
+    @property
+    def post_tag_bytes(self) -> int:
+        """Number of bytes after the primary tag (0 for ``CipherLen`` = 0)."""
+        return self.file_size - self.post_tag_offset
+
+    @property
+    def trailing_bytes(self) -> int:
+        """Bytes after the last verified sealed segment (or the primary tag)."""
+        return self.file_size - self.sealed_end
+
+    @property
+    def last_tag(self) -> bytes:
+        """Tag the next sealed segment chains to (``prev_tag``)."""
+        if self.sealed_segments:
+            return self.sealed_segments[-1].tag
+        return self.tag
+
+
+def decrypt_container(f: BinaryIO, header_size: int, passphrase: str) -> DecryptedContainer:
+    """Locate, authenticate and decrypt the primary AEAD stream of a slice.
 
     The whole container is read and authenticated in one pass: AES-GCM
     offers no verdict on a fragment, so there is no way to stream blocks
     out while the tag is still unverified. A reader that yielded blocks
     before the tag checked out would be handing callers data it could not
     yet vouch for -- the wrong trade for a forensic format.
+
+    The tag is located per spec Section 10.2: at EOF-16 when the header
+    ``CipherLen`` is 0, otherwise right after ``CipherLen`` bytes of
+    ciphertext. The AAD is the header with ``CipherLen`` zeroed plus any
+    KEM ciphertext.
+
+    Raises:
+        ValueError: If the container is truncated, ``CipherLen`` is out of
+            bounds, or the tag does not verify -- a wrong passphrase and a
+            tampered file are the same answer here, by design of the AEAD.
+    """
+    from memslicer.msl.encryption import (
+        StreamingDecryptor, aad_from_header, derive_key,
+        primary_ciphertext_span, unpack_encryption_extension,
+    )
+
+    f.seek(0)
+    raw = f.read()
+    if len(raw) < header_size:
+        raise ValueError(f"truncated encrypted slice: {len(raw)} bytes")
+    header = raw[:header_size]
+    params = unpack_encryption_extension(header[HEADER_SIZE:header_size])
+    ct_start, ct_end = primary_ciphertext_span(
+        len(raw), header_size, params.kem_ct_len, params.cipher_len,
+    )
+    kem_ciphertext = raw[header_size:ct_start]
+    tag = raw[ct_end:ct_end + AEAD_TAG_SIZE]
+    cek = derive_key(passphrase, params)
+    decryptor = StreamingDecryptor(
+        key=cek, nonce=params.nonce, aad=aad_from_header(header, kem_ciphertext),
+    )
+    decryptor.update(raw[ct_start:ct_end])
+    try:
+        plaintext = decryptor.finalize(tag)
+    except Exception as exc:  # cryptography raises InvalidTag
+        raise ValueError(
+            "could not decrypt slice: wrong passphrase, or the file has been "
+            "modified since capture (the authentication tag does not verify)"
+        ) from exc
+    container = DecryptedContainer(
+        plaintext=plaintext, header=header, kem_ciphertext=kem_ciphertext,
+        tag=tag, cipher_len=params.cipher_len,
+        post_tag_offset=ct_end + AEAD_TAG_SIZE, file_size=len(raw), cek=cek,
+    )
+    _open_sealed(container, memoryview(raw))
+    return container
+
+
+def _open_sealed(container: DecryptedContainer, raw: memoryview) -> None:
+    """Fill ``container.sealed_segments`` from the bytes after the primary tag."""
+    from memslicer.msl.sealed import open_sealed_segments
+
+    if not container.post_tag_bytes:
+        return
+    container.sealed_segments, container.sealed_end = open_sealed_segments(
+        container.cek, container.header, container.kem_ciphertext,
+        container.tag, raw, container.post_tag_offset,
+    )
+
+
+def decrypt_stream(f: BinaryIO, header_size: int, passphrase: str) -> BinaryIO:
+    """Return the plaintext block stream of an encrypted slice.
+
+    Thin wrapper over :func:`decrypt_container`; bytes after the primary
+    tag (sealed segments, trailing data) are not part of the stream.
 
     Args:
         f: Open MSL file, positioned anywhere.
@@ -211,40 +332,9 @@ def decrypt_stream(f: BinaryIO, header_size: int, passphrase: str) -> BinaryIO:
         A binary stream over the decrypted blocks, positioned at 0.
 
     Raises:
-        ValueError: If the container is truncated, or if the tag does not
-            verify -- a wrong passphrase and a tampered file are the same
-            answer here, by design of the AEAD.
+        ValueError: See :func:`decrypt_container`.
     """
-    from io import BytesIO
-
-    from memslicer.msl.encryption import (
-        StreamingDecryptor, derive_key, unpack_encryption_extension,
-    )
-
-    f.seek(0)
-    raw = f.read()
-    if len(raw) < header_size + AEAD_TAG_SIZE:
-        raise ValueError(
-            f"truncated encrypted slice: {len(raw)} bytes, need at least "
-            f"{header_size + AEAD_TAG_SIZE}"
-        )
-    header = raw[:header_size]
-    ciphertext = raw[header_size:-AEAD_TAG_SIZE]
-    tag = raw[-AEAD_TAG_SIZE:]
-
-    params = unpack_encryption_extension(header[HEADER_SIZE:header_size])
-    decryptor = StreamingDecryptor(
-        key=derive_key(passphrase, params), nonce=params.nonce, aad=header,
-    )
-    decryptor.update(ciphertext)
-    try:
-        plaintext = decryptor.finalize(tag)
-    except Exception as exc:  # cryptography raises InvalidTag
-        raise ValueError(
-            "could not decrypt slice: wrong passphrase, or the file has been "
-            "modified since capture (the authentication tag does not verify)"
-        ) from exc
-    return BytesIO(plaintext)
+    return BytesIO(decrypt_container(f, header_size, passphrase).plaintext)
 
 
 _decrypt_stream = decrypt_stream
@@ -284,7 +374,10 @@ def iterate_blocks(
     the number of blocks framed is yielded; the first run that is
     unterminated or miscounted ends iteration, and nothing after it is
     read. ``SegmentHash`` and PrevHash continuity are NOT checked here
-    (see :mod:`memslicer.msl.verify`).
+    (see :mod:`memslicer.msl.verify`). For an encrypted slice the blocks of
+    every verified sealed extension segment (spec Section 10.8) follow,
+    numbered on from the last in-stream segment and marked with
+    ``seal_index``; they are fully verified before they are yielded.
 
     Args:
         f: Open MSL file.
@@ -307,10 +400,31 @@ def iterate_blocks(
                 "encrypted slices cannot be read without a passphrase; "
                 "pass one to read this file"
             )
-        f = decrypt_stream(f, header_size, passphrase)
-        header_size = 0  # the decrypted stream starts at the first block
-    f.seek(header_size)
+        container = decrypt_container(f, header_size, passphrase)
+        yield from iterate_container_blocks(container, extensions=extensions)
+        return
+    yield from _iterate_stream_blocks(f, header_size, None, extensions)
 
+
+def iterate_container_blocks(
+    container: DecryptedContainer, *, extensions: bool = True,
+) -> Iterator[BlockRecord]:
+    """Yield the blocks of an already decrypted container.
+
+    Same records as :func:`iterate_blocks` yields for the encrypted file
+    the container came from -- capture segment, in-stream extension
+    segments, then every verified sealed segment -- without deriving the
+    key or decrypting a second time.
+    """
+    stream = BytesIO(container.plaintext)
+    yield from _iterate_stream_blocks(stream, 0, container, extensions)
+
+
+def _iterate_stream_blocks(
+    f: BinaryIO, start: int, container: DecryptedContainer | None, extensions: bool,
+) -> Iterator[BlockRecord]:
+    """Yield blocks from ``start`` of a plaintext stream (see :func:`iterate_blocks`)."""
+    f.seek(start)
     eoc_end: int | None = None
     for raw in _iter_raw_blocks(f):
         yield _to_record(raw)
@@ -319,7 +433,28 @@ def iterate_blocks(
             break
 
     if extensions and eoc_end is not None:
-        yield from _iterate_extension_segments(f, eoc_end)
+        last_segment = 0
+        for record in _iterate_extension_segments(f, eoc_end):
+            last_segment = record.segment
+            yield record
+        if container is not None:
+            yield from _iterate_sealed_segments(container, last_segment)
+
+
+def _iterate_sealed_segments(
+    container: DecryptedContainer, last_segment: int,
+) -> Iterator[BlockRecord]:
+    """Yield the blocks of every verified sealed segment, in order.
+
+    Segment numbers continue after ``last_segment`` (the last in-stream
+    extension segment); offsets are relative to each segment's plaintext.
+    """
+    for number, sealed in enumerate(container.sealed_segments, start=last_segment + 1):
+        for raw in _iter_raw_blocks(BytesIO(sealed.plaintext)):
+            raw.segment = number
+            record = _to_record(raw)
+            record.seal_index = sealed.index
+            yield record
 
 
 def _iterate_extension_segments(f: BinaryIO, start: int) -> Iterator[BlockRecord]:

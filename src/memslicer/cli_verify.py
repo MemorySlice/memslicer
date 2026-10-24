@@ -11,9 +11,14 @@ from memslicer.msl.verify import SegmentReport, VerifyReport, verify_slice
 
 
 def _summary_line(report: VerifyReport) -> str:
-    """Describe algorithm, encryption and the three block counts in one line."""
+    """Describe algorithm, encryption and the three block counts in one line.
+
+    Encrypted slices also show how many sealed segments verified.
+    """
+    sealed = f" sealed={len(report.sealed_segments)}" if report.encrypted else ""
     return (
-        f"hash={report.hash_algo.name} encrypted={'yes' if report.encrypted else 'no'} "
+        f"hash={report.hash_algo.name} encrypted={'yes' if report.encrypted else 'no'}"
+        f"{sealed} "
         f"blocks={report.block_count} (header BlockCount={report.header_block_count}, "
         f"EoC BlockCount={report.eoc_block_count})"
     )

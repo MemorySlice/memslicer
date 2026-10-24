@@ -27,7 +27,7 @@ from memslicer.msl.constants import (
     BlockType,
 )
 from memslicer.msl.encryption import (
-    StreamingDecryptor, derive_key, unpack_encryption_extension,
+    StreamingDecryptor, aad_from_header, derive_key, unpack_encryption_extension,
 )
 
 from test_engine import MockBridge, MockCollector
@@ -78,7 +78,8 @@ def _plaintext_blocks(path: Path) -> list[str]:
     header = raw[:ENCRYPTED_HEADER_SIZE]
     params = unpack_encryption_extension(header[HEADER_SIZE:])
     decryptor = StreamingDecryptor(
-        key=derive_key(PASSPHRASE, params), nonce=params.nonce, aad=header,
+        key=derive_key(PASSPHRASE, params), nonce=params.nonce,
+        aad=aad_from_header(header),
     )
     decryptor.update(raw[ENCRYPTED_HEADER_SIZE:-16])
     return _block_types(decryptor.finalize(raw[-16:]), 0)
@@ -217,7 +218,7 @@ class TestEncryptedReadBack:
     def test_enrich_refuses_encrypted_with_a_reason(self, tmp_path):
         from memslicer.cli_enrich import _load_slice
         path = self._slice(tmp_path, investigation=False, encrypted=True)
-        with pytest.raises(ValueError, match="re-seal the container"):
+        with pytest.raises(ValueError, match="passphrase is required"):
             _load_slice(path)
 
 

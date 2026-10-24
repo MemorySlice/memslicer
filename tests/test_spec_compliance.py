@@ -471,7 +471,9 @@ class TestEncryptedMSLWriter:
 
         Since blocks are encrypted, we decrypt and then check the PrevHash fields.
         """
-        from memslicer.msl.encryption import EncryptionParams, AES_GCM_TAG_LEN
+        from memslicer.msl.encryption import (
+            EncryptionParams, AES_GCM_TAG_LEN, aad_from_header,
+        )
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
         params = EncryptionParams()
@@ -487,7 +489,9 @@ class TestEncryptedMSLWriter:
 
         # Decrypt
         aesgcm = AESGCM(enc_key)
-        plaintext = aesgcm.decrypt(params.nonce, ciphertext + tag, header_bytes)
+        plaintext = aesgcm.decrypt(
+            params.nonce, ciphertext + tag, aad_from_header(header_bytes),
+        )
 
         # Walk blocks in the plaintext and verify PrevHash is all zeros
         offset = 0

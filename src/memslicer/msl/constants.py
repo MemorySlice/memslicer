@@ -7,6 +7,12 @@ from enum import IntEnum
 # ---------------------------------------------------------------------------
 FILE_MAGIC: bytes = b"MEMSLICE"   # 8 bytes
 BLOCK_MAGIC: bytes = b"MSLC"     # 4 bytes
+# Sealed extension segment header magic (spec Section 10.8, Table 27a).
+# The spec writes it as 0x4D534C53 ("MSLS"), the same convention as
+# BLOCK_MAGIC (0x4D534C43, "MSLC"): the hex value is the ASCII bytes read
+# in file order, so the on-disk bytes are 4D 53 4C 53 = b"MSLS" (NOT a
+# little-endian u32 pack of 0x4D534C53, which would write "SLSM").
+SEAL_MAGIC: bytes = b"MSLS"      # 4 bytes
 
 # ---------------------------------------------------------------------------
 # Sizes
@@ -14,6 +20,7 @@ BLOCK_MAGIC: bytes = b"MSLC"     # 4 bytes
 HEADER_SIZE: int = 64
 ENCRYPTED_HEADER_SIZE: int = 128
 BLOCK_HEADER_SIZE: int = 80
+SEAL_HEADER_SIZE: int = 64        # sealed segment header (spec Table 27a)
 HASH_SIZE: int = 32
 
 # ---------------------------------------------------------------------------

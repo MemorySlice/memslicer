@@ -1,7 +1,7 @@
 # MemSlicer
 
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/version-0.5.0-green)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.5.1-green)](pyproject.toml)
 
 A memory acquisition tool that captures process memory snapshots into the MSL (Memory Slice) binary format. Supports multiple debugger backends (Frida, GDB, LLDB) and targets across Windows, Linux, macOS, Android, and iOS. Designed for forensic analysis, reverse engineering, and security research.
 
@@ -422,8 +422,17 @@ the original EndOfCapture -- is copied verbatim and the build-id manifest goes
 into a new extension segment (spec §4.6) appended after it, closed by an
 `EndOfExtension` block (0x0FFE). The original EoC FileHash stays valid and
 `memslicer verify` lists the segment. Running it again on an enriched slice
-prints `nothing to enrich` and writes nothing. Encrypted slices are not
-supported.
+prints `nothing to enrich` and writes nothing.
+
+Encrypted slices are enriched with `--passphrase P` (prompted for when
+omitted): the manifest goes into a *sealed* extension segment (spec §10.8),
+encrypted under its own segment key and chained to the previous AEAD tag, and
+appended after the last sealed segment in a single write -- the primary
+ciphertext and tag are never rewritten, and `--in-place` appends to the
+original directly. `memslicer verify` then reports `sealed=N`. Only slices
+written with `CipherLen` (memslicer >= 1.1.1 to a seekable file) can take
+sealed segments; older ones, and slices with unverified trailing bytes, are
+refused unchanged.
 
 ---
 

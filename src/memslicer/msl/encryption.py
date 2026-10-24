@@ -4,7 +4,12 @@ File layout when encrypted:
     1. File Header (128 B, cleartext) – used as AAD for AEAD
     2. KEM ciphertext (0 or variable, cleartext) – when KeyEncap != 0x00
     3. Encrypted block stream – AEAD ciphertext of Block 0 … EoC
-    4. AEAD authentication tag (16 B) – appended at end
+    4. AEAD authentication tag (16 B) – follows the ciphertext
+    5. Sealed extension segments / trailing data (optional) – only when
+       the header ``CipherLen`` (0x78) is non-zero (spec 1.1.1, §10.2, §10.8)
+
+The AAD is the file header with ``CipherLen`` (0x78–0x7F) zeroed, followed
+by any KEM ciphertext, so the length can be patched in after sealing.
 
 Initial implementation scope:
     - Cipher:   AES-256-GCM  (code 0x01, 12 B nonce, 16 B tag)
@@ -14,6 +19,7 @@ Initial implementation scope:
 
 from __future__ import annotations
 
+import hmac
 import os
 import struct
 from dataclasses import dataclass, field
@@ -33,6 +39,11 @@ AES_256_KEY_LEN: int = 32     # bytes
 KDF_SALT_LEN: int = 16        # bytes
 NONCE_FIELD_LEN: int = 24     # on-disk field width (12 B used, 12 B zero)
 EXTENSION_HEADER_LEN: int = 64  # encryption extension header size
+CIPHER_LEN_OFFSET: int = 0x78   # CipherLen field in the 128 B file header
+CIPHER_LEN_SIZE: int = 8        # u64 little-endian
+HKDF_BLAKE3_HASH_LEN: int = 32  # BLAKE3 digest size used by HKDF
+SEGMENT_KEY_INFO: bytes = b"MSL-SEG-v1"  # HKDF info prefix (spec §10.8)
+MAX_SEGMENT_INDEX: int = 0xFFFF          # SegIndex is a u16
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +60,7 @@ class EncryptionParams:
     kdf_memory: int = 65536     # Argon2 memory cost (KiB)
     kdf_lanes: int = 4          # Argon2 parallelism
     kem_ct_len: int = 0         # 0 when KeyEncap == 0x00
+    cipher_len: int = 0         # CipherLen (0x78); 0 = not recorded
     nonce: bytes = field(default_factory=lambda: os.urandom(AES_GCM_NONCE_LEN))
     kdf_salt: bytes = field(default_factory=lambda: os.urandom(KDF_SALT_LEN))
 
@@ -107,7 +119,7 @@ def pack_encryption_extension(params: EncryptionParams) -> bytes:
         KEMCtLen    (2 B)  little-endian uint16
         Nonce       (24 B) – 12 B AES-GCM nonce + 12 B zero padding
         KDFSalt     (16 B)
-        Reserved3   (8 B)
+        CipherLen   (8 B)  little-endian uint64 (spec 1.1.1; 0 = not recorded)
         ─────────────────
         Total = 64 B
     """
@@ -128,7 +140,7 @@ def pack_encryption_extension(params: EncryptionParams) -> bytes:
     )
     data += nonce_padded     # 24 B
     data += params.kdf_salt  # 16 B
-    data += b"\x00" * 8     # 8 B Reserved3
+    data += struct.pack("<Q", params.cipher_len)  # 8 B CipherLen
 
     assert len(data) == EXTENSION_HEADER_LEN, (
         f"Encryption extension is {len(data)} bytes, expected {EXTENSION_HEADER_LEN}"
@@ -152,6 +164,7 @@ def unpack_encryption_extension(raw: bytes) -> EncryptionParams:
 
     nonce_padded = raw[16:40]  # 24 B nonce field
     kdf_salt = raw[40:56]      # 16 B salt
+    (cipher_len,) = struct.unpack_from("<Q", raw, 56)  # 8 B CipherLen
 
     # Extract only the meaningful 12 B from the padded nonce field
     nonce = nonce_padded[:AES_GCM_NONCE_LEN]
@@ -166,7 +179,105 @@ def unpack_encryption_extension(raw: bytes) -> EncryptionParams:
         kem_ct_len=kem_ct_len,
         nonce=nonce,
         kdf_salt=kdf_salt,
+        cipher_len=cipher_len,
     )
+
+
+# ---------------------------------------------------------------------------
+# CipherLen, AAD and tag location (spec 1.1.1, Sections 10.2 and 10.7)
+# ---------------------------------------------------------------------------
+def zero_cipher_len(header: bytes) -> bytes:
+    """Return *header* with the ``CipherLen`` bytes (0x78–0x7F) set to zero.
+
+    This is the form both the AAD and the EoC ``FileHash`` cover. A header
+    too short to hold ``CipherLen`` (the 64 B unencrypted one) is returned
+    unchanged.
+    """
+    end = CIPHER_LEN_OFFSET + CIPHER_LEN_SIZE
+    if len(header) < end:
+        return bytes(header)
+    return bytes(header[:CIPHER_LEN_OFFSET]) + b"\x00" * CIPHER_LEN_SIZE + bytes(header[end:])
+
+
+def aad_from_header(header: bytes, kem_ciphertext: bytes = b"") -> bytes:
+    """Build the primary AEAD associated data (spec Section 10.2).
+
+    The AAD is the file header with ``CipherLen`` zeroed, followed by any
+    KEM ciphertext. For ``CipherLen`` = 0 it equals the 1.1.0 AAD.
+    """
+    return zero_cipher_len(header) + bytes(kem_ciphertext)
+
+
+def primary_ciphertext_span(
+    file_size: int, header_size: int, kem_ct_len: int, cipher_len: int,
+) -> tuple[int, int]:
+    """Return ``(start, end)`` of the primary ciphertext; the tag follows ``end``.
+
+    ``CipherLen`` = 0 means the tag is the final 16 bytes of the file;
+    otherwise the ciphertext is exactly ``cipher_len`` bytes after the
+    header and KEM ciphertext (spec Section 10.2, "Locating the tag").
+
+    Raises:
+        ValueError: if the file is too short, or ``cipher_len`` points
+            past the space left for the tag.
+    """
+    start = header_size + kem_ct_len
+    available = file_size - start - AES_GCM_TAG_LEN
+    if available < 0:
+        raise ValueError(
+            f"truncated encrypted slice: {file_size} bytes, need at least "
+            f"{start + AES_GCM_TAG_LEN}"
+        )
+    if cipher_len == 0:
+        return start, start + available
+    if cipher_len > available:
+        raise ValueError(
+            f"CipherLen {cipher_len} at header offset 0x{CIPHER_LEN_OFFSET:X} "
+            f"exceeds the {available} byte(s) available before the tag; "
+            f"the file is truncated or the header is corrupt"
+        )
+    return start, start + cipher_len
+
+
+# ---------------------------------------------------------------------------
+# HKDF-BLAKE3 (spec Sections 10.4 and 10.8)
+# ---------------------------------------------------------------------------
+def hkdf_blake3(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 HKDF with HMAC-BLAKE3 (block size 64, digest 32).
+
+    Mirrors MemDiver's ``msl.crypto.hkdf_blake3`` byte for byte: an empty
+    *salt* is replaced by 32 zero bytes, as RFC 5869 prescribes.
+
+    Raises:
+        ValueError: if *length* is not in 1 .. 255 * 32.
+    """
+    import blake3
+
+    if not 0 < length <= 255 * HKDF_BLAKE3_HASH_LEN:
+        raise ValueError(f"HKDF output length must be 1..{255 * HKDF_BLAKE3_HASH_LEN}, got {length}")
+    if not salt:
+        salt = b"\x00" * HKDF_BLAKE3_HASH_LEN
+    prk = hmac.new(salt, ikm, blake3.blake3).digest()  # extract
+    okm, block, counter = b"", b"", 1
+    while len(okm) < length:  # expand
+        block = hmac.new(prk, block + info + bytes([counter]), blake3.blake3).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
+
+
+def derive_segment_key(cek: bytes, dump_uuid: bytes, index: int) -> bytes:
+    """Derive ``SegKey_i`` for sealed extension segment *index* (spec Section 10.8).
+
+    ``SegKey_i = HKDF-BLAKE3(IKM=CEK, salt=DumpUUID, info="MSL-SEG-v1" || LE16(i))``.
+
+    Raises:
+        ValueError: if *index* is outside 1 .. 65535.
+    """
+    if not 1 <= index <= MAX_SEGMENT_INDEX:
+        raise ValueError(f"sealed segment index must be 1..{MAX_SEGMENT_INDEX}, got {index}")
+    info = SEGMENT_KEY_INFO + index.to_bytes(2, "little")
+    return hkdf_blake3(cek, salt=dump_uuid, info=info, length=AES_256_KEY_LEN)
 
 
 def _validate_key_nonce(key: bytes, nonce: bytes) -> None:
@@ -184,12 +295,12 @@ class StreamingEncryptor:
     """Streaming AEAD encryptor for MSL block stream.
 
     Collects all plaintext blocks in memory, then encrypts the entire
-    stream with AES-256-GCM at :meth:`finalize` time.  The 128-byte
-    cleartext file header is passed as AAD.
+    stream with AES-256-GCM at :meth:`finalize` time.  The caller passes
+    the AAD, i.e. :func:`aad_from_header` of the 128-byte cleartext header.
 
     Usage::
 
-        enc = StreamingEncryptor(key, nonce, aad=header_bytes)
+        enc = StreamingEncryptor(key, nonce, aad=aad_from_header(header_bytes))
         enc.update(block_bytes)
         enc.update(block_bytes)
         ciphertext, tag = enc.finalize()
@@ -243,7 +354,7 @@ class StreamingDecryptor:
 
     Usage::
 
-        dec = StreamingDecryptor(key, nonce, aad=header_bytes)
+        dec = StreamingDecryptor(key, nonce, aad=aad_from_header(header_bytes))
         dec.update(ciphertext_chunk)
         plaintext = dec.finalize(tag)
     """

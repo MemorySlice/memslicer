@@ -524,3 +524,241 @@ class TestWriterResume:
         report = verify_slice(io.BytesIO(prefix + tail_bytes))
         assert report.valid, report.errors
         assert report.file_hash_ok is True
+
+
+# ---------------------------------------------------------------------------
+# Encrypted slices: sealed extension segments (spec Section 10.8)
+# ---------------------------------------------------------------------------
+
+_PASSPHRASE = "correct horse"
+
+
+class _NonSeekable(io.RawIOBase):
+    """Write-only stream that, like a pipe, cannot seek (keeps CipherLen 0)."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def write(self, b) -> int:
+        self.data += bytes(b)
+        return len(b)
+
+
+def _encryption_params():
+    from memslicer.msl.encryption import EncryptionParams
+    return EncryptionParams(kdf_time=1, kdf_memory=8, kdf_lanes=1)
+
+
+def _write_encrypted(output, modules_with_pages) -> None:
+    """Write an encrypted capture holding a region + module per pair."""
+    from memslicer.msl.constants import FLAG_ENCRYPTED
+    from memslicer.msl.encryption import derive_key
+    params = _encryption_params()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        writer = MSLWriter(
+            output, FileHeader(pid=4242, flags=FLAG_ENCRYPTED),
+            encryption_key=derive_key(_PASSPHRASE, params),
+            encryption_params=params,
+        )
+        for mod, page in modules_with_pages:
+            writer.write_memory_region(MemoryRegion(
+                base_addr=mod.base_addr, region_size=4096, page_size=4096,
+                region_type=RegionType.Image, page_states=[PageState.CAPTURED],
+                page_data_chunks=[page],
+            ))
+        writer.write_module_list([m for m, _ in modules_with_pages])
+        writer.finalize()
+
+
+def _encrypted_slice_file(path: Path, modules_with_pages, seekable: bool = True) -> bytes:
+    """Write an encrypted slice to *path*; non-seekable leaves CipherLen 0."""
+    if seekable:
+        with open(path, "wb") as f:
+            _write_encrypted(f, modules_with_pages)
+    else:
+        stream = _NonSeekable()
+        _write_encrypted(stream, modules_with_pages)
+        path.write_bytes(bytes(stream.data))
+    return path.read_bytes()
+
+
+def _seal_manifest(path: Path, manifest: ModuleBuildIdManifest, producer: str) -> None:
+    """Append *manifest* as the next sealed segment, independent of the CLI."""
+    from memslicer.msl.constants import ENCRYPTED_HEADER_SIZE
+    from memslicer.msl.iterator import decrypt_container
+    from memslicer.msl.sealed import seal_segment
+    with open(path, "rb") as f:
+        c = decrypt_container(f, ENCRYPTED_HEADER_SIZE, _PASSPHRASE)
+    buf = io.BytesIO()
+    writer = MSLWriter.for_sealed_segment(buf, FileHeader(hash_algo=HashAlgo(c.header[0x3D])))
+    writer.begin_extension()
+    writer.write_module_build_id_manifest(manifest)
+    writer.finalize_extension(producer)
+    unit = seal_segment(c.cek, c.header, c.kem_ciphertext, c.last_tag,
+                        len(c.sealed_segments) + 1, buf.getvalue())
+    with open(path, "ab") as f:
+        f.write(unit)
+
+
+def _enrich_encrypted(args, passphrase: str = _PASSPHRASE):
+    return CliRunner().invoke(enrich_main, [*args, "--passphrase", passphrase])
+
+
+def _verify_encrypted(path: Path) -> VerifyReport:
+    with open(path, "rb") as f:
+        return verify_slice(f, _PASSPHRASE)
+
+
+def _encrypted_manifests(path: Path) -> list[tuple[int, ModuleBuildIdManifest]]:
+    """``(seal_index, manifest)`` for every ModuleBuildIdManifest block."""
+    with open(path, "rb") as f:
+        records = list(iterate_blocks(f, _PASSPHRASE))
+    return [
+        (b.seal_index, parse_module_build_id_manifest(b.payload))
+        for b in records if b.block_type == BlockType.ModuleBuildIdManifest
+    ]
+
+
+def _combined_output(result) -> str:
+    return result.output + (result.stderr_bytes or b"").decode()
+
+
+class TestEnrichEncrypted:
+    def _slice(self, tmp_path, *pairs, seekable=True):
+        path = tmp_path / "enc.msl"
+        original = _encrypted_slice_file(path, list(pairs), seekable)
+        return path, original
+
+    def test_appends_a_sealed_segment(self, tmp_path):
+        build_id = b"\x71" * 20
+        mod = ModuleEntry(base_addr=0x710000, module_size=4096, path="/bin/e1")
+        path, original = self._slice(tmp_path, (mod, _elf_page(build_id)))
+        output = tmp_path / "enc.enriched"
+
+        result = _enrich_encrypted([str(path), "-o", str(output)])
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert path.read_bytes() == original
+        enriched = output.read_bytes()
+        assert enriched[:len(original)] == original
+        report = _verify_encrypted(output)
+        assert report.valid, report.errors
+        assert len(report.sealed_segments) == 1
+        assert report.sealed_segments[0].producer == PRODUCER
+        assert report.sealed_trailing_bytes == 0
+        manifests = _encrypted_manifests(output)
+        assert [index for index, _ in manifests] == [1]
+        assert manifests[0][1].rows[0].build_id == build_id
+        assert manifests[0][1].rows[0].base_addr == mod.base_addr
+
+    def test_in_place_appends_to_the_original(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x720000, module_size=4096, path="/bin/e2")
+        path, original = self._slice(tmp_path, (mod, _elf_page(b"\x72" * 20)))
+
+        result = _enrich_encrypted([str(path), "--in-place"])
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert path.read_bytes()[:len(original)] == original
+        assert not path.with_suffix(".msl.tmp").exists()
+        report = _verify_encrypted(path)
+        assert report.valid and len(report.sealed_segments) == 1
+
+    def test_second_enrichment_sees_the_first(self, tmp_path):
+        """A is covered by sealed segment 1; only B lands in sealed segment 2,
+        and a further run finds nothing left to enrich."""
+        mod_a = ModuleEntry(base_addr=0x730000, module_size=4096, path="/bin/ea")
+        mod_b = ModuleEntry(base_addr=0x740000, module_size=4096, path="/bin/eb")
+        build_id_b = b"\x74" * 20
+        path, _ = self._slice(
+            tmp_path, (mod_a, _elf_page(b"\x73" * 20)), (mod_b, _elf_page(build_id_b)),
+        )
+        _seal_manifest(path, _manifest_for(mod_a, b"\x73" * 20), "other/1")
+
+        first = _enrich_encrypted([str(path), "--in-place"])
+        assert first.exit_code == 0, _combined_output(first)
+        after_first = path.read_bytes()
+        second = _enrich_encrypted([str(path), "--in-place"])
+
+        assert second.exit_code == 0, _combined_output(second)
+        assert "nothing to enrich" in second.output
+        assert path.read_bytes() == after_first
+        report = _verify_encrypted(path)
+        assert report.valid, report.errors
+        assert [s.producer for s in report.sealed_segments] == ["other/1", PRODUCER]
+        manifests = _encrypted_manifests(path)
+        assert [index for index, _ in manifests] == [1, 2]
+        assert [r.base_addr for r in manifests[1][1].rows] == [mod_b.base_addr]
+        assert manifests[1][1].rows[0].build_id == build_id_b
+
+    def test_wrong_passphrase_is_refused(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x750000, module_size=4096, path="/bin/e5")
+        path, original = self._slice(tmp_path, (mod, _elf_page(b"\x75" * 20)))
+
+        result = _enrich_encrypted([str(path), "--in-place"], passphrase="wrong")
+
+        assert result.exit_code != 0
+        assert "could not decrypt" in _combined_output(result)
+        assert path.read_bytes() == original
+
+    def test_cipher_len_zero_is_refused(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x760000, module_size=4096, path="/bin/e6")
+        path, original = self._slice(tmp_path, (mod, _elf_page(b"\x76" * 20)), seekable=False)
+        output = tmp_path / "enc.enriched"
+
+        in_place = _enrich_encrypted([str(path), "--in-place"])
+        to_output = _enrich_encrypted([str(path), "-o", str(output)])
+
+        for result in (in_place, to_output):
+            assert result.exit_code == 1
+            assert "sealed without CipherLen" in _combined_output(result)
+        assert path.read_bytes() == original
+        assert not output.exists()
+
+    def test_trailing_data_is_refused(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x770000, module_size=4096, path="/bin/e7")
+        path, _ = self._slice(tmp_path, (mod, _elf_page(b"\x77" * 20)))
+        with open(path, "ab") as f:
+            f.write(b"\x00" * 64)
+        original = path.read_bytes()
+        output = tmp_path / "enc.enriched"
+
+        in_place = _enrich_encrypted([str(path), "--in-place"])
+        to_output = _enrich_encrypted([str(path), "-o", str(output)])
+
+        for result in (in_place, to_output):
+            assert result.exit_code == 1
+            assert "trailing" in _combined_output(result)
+        assert path.read_bytes() == original
+        assert not output.exists()
+
+    def test_passphrase_is_prompted_when_missing(self, tmp_path):
+        mod = ModuleEntry(base_addr=0x780000, module_size=4096, path="/bin/e8")
+        path, _ = self._slice(tmp_path, (mod, _elf_page(b"\x78" * 20)))
+
+        result = CliRunner().invoke(
+            enrich_main, [str(path), "--in-place"], input=f"{_PASSPHRASE}\n",
+        )
+
+        assert result.exit_code == 0, _combined_output(result)
+        assert "Passphrase" in result.output
+        assert _PASSPHRASE not in result.output
+        assert len(_verify_encrypted(path).sealed_segments) == 1
+
+
+def test_append_refuses_a_file_that_changed_size(tmp_path):
+    """The single append only happens when the file still ends at sealed_end."""
+    from memslicer.cli_enrich import _append_sealed_segment
+    target = tmp_path / "f.bin"
+    target.write_bytes(b"x" * 10)
+    with pytest.raises(ValueError, match="changed since it was read"):
+        _append_sealed_segment(target, 9, b"unit")
+    assert target.read_bytes() == b"x" * 10
+    _append_sealed_segment(target, 10, b"unit")
+    assert target.read_bytes() == b"x" * 10 + b"unit"
