@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.5.2] - 2026-10-25
+
+### Changes
+
+- fixes in the tests
+- Merge branch 'main' of github.com:MemorySlice/memslicer
+- minor improvements and alignments to the latest version of .msl specification
+- serveral fixes (investigator mode; acquisiton notion for Thread Context blocks; changes regarding the new specification)
+- start making and improving memslicer to acquire only certain memory regions which are most likely relevant
+- Merge branch 'main' of github.com:MemorySlice/memslicer
+- fixed issue for the investigator mode
+
 ## [0.5.0] - 2026-10-23
 
 ### Changes
