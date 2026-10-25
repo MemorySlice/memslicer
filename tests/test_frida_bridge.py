@@ -607,7 +607,10 @@ def _connect_with_two_scripts(bridge, device=None, investigation_script=None):
     bridge_script = session.create_script.return_value
     investigation_script = investigation_script or MagicMock()
     session.create_script.side_effect = [bridge_script, investigation_script]
-    with patch.dict(sys.modules, {"frida": _prepare_mock_frida_module()}):
+    # Stub the preflight: on Linux it would check the fake PID in /proc.
+    with patch.dict(sys.modules, {"frida": _prepare_mock_frida_module()}), \
+         patch("memslicer.acquirer.frida_bridge.enforce_attach_preflight",
+               return_value=_preflight_result()):
         bridge.connect()
     return bridge_script, investigation_script
 
