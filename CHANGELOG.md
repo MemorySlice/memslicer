@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 
 
+## [Unreleased]
+
+### Bug Fixes
+
+- GDB backend: `show architecture` output in the form
+  `The target architecture is set automatically (currently i386)` (newer and
+  Windows GDB builds, unquoted architecture name) is now parsed. Previously
+  platform detection raised `Cannot parse GDB architecture output` and the
+  gdb backend was unusable there.
+- CI: the publish workflow only publishes on a real version bump. When
+  `pyproject.toml` changed without touching the `version` line, the previous
+  version was read as empty and every such push to `main` attempted a PyPI
+  publish.
 
 
 ## [0.5.2] - 2026-10-25
