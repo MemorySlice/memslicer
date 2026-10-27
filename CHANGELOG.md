@@ -3,6 +3,28 @@
 All notable changes to this project will be documented in this file.
 
 
+## [Unreleased]
+
+### Added
+
+- Frida captures on Windows x86/x64 record each thread's TEB (via
+  `NtQueryInformationThread`) as `gs_base` (x64) / `fs_base` (x86) in the
+  Thread Context block; a `CpuContext` carries no segment base.
+- LLDB Thread Context blocks include vector and x87 registers at full width
+  (spec Table 19b widths 16/32/64) instead of skipping registers wider than
+  8 bytes.
+
+### Changes
+
+- Thread Context register names are the canonical mnemonics of spec Table
+  19g (producer rule 42): ARM64 `fp`/`lr`/`cpsr`/`tpidr` are written as
+  `x29`/`x30`/`pstate`/`tpidr_el0`, ARM32 `r13`-`r15` as `sp`/`lr`/`pc` and
+  x86_64 `eflags` as `rflags`.
+- The TLS register role is set only on the register the target OS uses as
+  thread pointer (Table 19g: `fs_base` on Linux/Android/FreeBSD x86_64,
+  `gs_base` on Windows/macOS x64, `tpidrro_el0` on Apple ARM64, `x18` on
+  Windows ARM64, ...), not on every segment base.
+
 
 
 ## [0.5.2] - 2026-10-25
