@@ -19,6 +19,7 @@ from memslicer.acquirer.bridge import (
     RegisterValue,
     ThreadInfo,
     fault_addr_from_text,
+    register_role,
     register_width_bytes,
 )
 from memslicer.acquirer.errors import AttachError
@@ -220,9 +221,13 @@ def _protection_string(region: Any) -> str:
 # LLDBBridge
 # ---------------------------------------------------------------------------
 
-# Widest register that belongs in a Thread Context block (spec Section 5.7);
-# anything wider is vector or extended state.
+# Widest register LLDB can hand over as an unsigned integer. Wider ones
+# (vector and x87/extended state) are read as raw bytes instead.
 _MAX_INT_REGISTER_BYTES = 8
+
+# Table 19b stores the value width in a u8; anything wider (e.g. a 2048-bit
+# SVE ``z`` register) cannot be represented and is left out.
+_MAX_REGISTER_BYTES = 0xFF
 
 
 def _thread_id(thread: Any) -> int:
@@ -685,12 +690,14 @@ class LLDBBridge:
     def _frame_registers(
         self, frame: Any, arch: ArchType,
     ) -> tuple[list[RegisterValue], bool]:
-        """Integer registers of *frame* and whether any could not be read.
+        """Registers of *frame* and whether any could not be read.
 
-        Registers wider than :data:`_MAX_INT_REGISTER_BYTES` (vector and
-        extended state) are not part of the Thread Context block and are
-        skipped silently; a register LLDB fails to read marks the thread
-        partial.
+        Integer registers are read as unsigned values; registers wider than
+        :data:`_MAX_INT_REGISTER_BYTES` (vector and extended state, Table
+        19b widths 16/32/64) as their raw target-order bytes, at full width.
+        Registers wider than :data:`_MAX_REGISTER_BYTES` do not fit the
+        format and are skipped silently; a register LLDB fails to read marks
+        the thread partial.
         """
         registers: list[RegisterValue] = []
         partial = False
@@ -700,14 +707,31 @@ class LLDBBridge:
                 if not isinstance(name, str) or not name:
                     continue
                 size = _register_size(reg, arch)
-                if size > _MAX_INT_REGISTER_BYTES:
+                if size > _MAX_REGISTER_BYTES:
                     continue
-                value = self._register_value(reg)
-                if value is None:
+                register = self._read_register(reg, name, size, arch)
+                if register is None:
                     partial = True
                     continue
-                registers.append(RegisterValue.from_int(name, value, size, arch))
+                registers.append(register)
         return registers, partial
+
+    def _read_register(
+        self, reg: Any, name: str, size: int, arch: ArchType,
+    ) -> RegisterValue | None:
+        """Register *reg* as a :class:`RegisterValue`, ``None`` when unreadable."""
+        if size > _MAX_INT_REGISTER_BYTES:
+            raw = self._register_bytes(reg, size)
+            if raw is None:
+                return None
+            return RegisterValue(
+                name=name.lower(), width=size, value=raw,
+                role=register_role(name, arch),
+            )
+        value = self._register_value(reg)
+        if value is None:
+            return None
+        return RegisterValue.from_int(name, value, size, arch)
 
     def _register_value(self, reg: Any) -> int | None:
         """Unsigned value of register *reg*, ``None`` when LLDB cannot read it."""
@@ -720,6 +744,22 @@ class LLDBBridge:
         if error.Fail() or isinstance(value, bool) or not isinstance(value, int):
             return None
         return value
+
+    def _register_bytes(self, reg: Any, size: int) -> bytes | None:
+        """Raw *size* bytes of register *reg*, ``None`` when LLDB cannot read them.
+
+        ``GetValueAsUnsigned`` stops at 64 bits, so wide registers come from
+        the value's SBData in the target's byte (lane) order.
+        """
+        error = self._lldb.SBError()
+        try:
+            raw = reg.GetData().ReadRawData(error, 0, size)
+        except Exception as exc:
+            self._log.debug("LLDB could not read register bytes: %s", exc)
+            return None
+        if error.Fail() or not isinstance(raw, (bytes, bytearray)) or len(raw) != size:
+            return None
+        return bytes(raw)
 
     def read_memory_ex(self, address: int, size: int) -> ReadResult:
         """Read *size* bytes at *address*, reporting the fault on failure.

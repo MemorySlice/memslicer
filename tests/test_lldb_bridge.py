@@ -1854,16 +1854,59 @@ class TestLLDBBridgeEnumerateThreads:
         assert regs["cs"].width == 2
         assert threads[1].stack_pointer == 0x7ffe0000
 
-    def test_registers_wider_than_eight_bytes_are_skipped(self):
+    @staticmethod
+    def _wide_thread(raw_by_name):
+        """A thread with the x86_64 GPRs plus wide registers whose SBData
+        yields *raw_by_name* (``None`` = unreadable)."""
+        sizes = {n: (0, 16 if raw is None else len(raw)) for n, raw in raw_by_name.items()}
+        thread = _thread_with_registers(1, "", dict(_X86_64_REGS, **sizes))
+        (reg_set,) = thread.GetFrameAtIndex.return_value.GetRegisters.return_value
+        for reg in reg_set:
+            if reg.GetName() in raw_by_name:
+                reg.GetData.return_value.ReadRawData.return_value = raw_by_name[reg.GetName()]
+        return thread
+
+    def test_vector_registers_are_captured_at_full_width(self):
         bridge, lldb, _dbg, _target, process = _create_and_connect()
         _registers_readable(lldb)
-        regs = dict(_X86_64_REGS, xmm0=(0x1234, 16))
+        xmm0 = bytes(range(16))
+        ymm0 = bytes(range(32, 64))
         process.GetNumThreads.return_value = 1
-        process.GetThreadAtIndex.return_value = _thread_with_registers(1, "", regs)
+        process.GetThreadAtIndex.return_value = self._wide_thread(
+            {"xmm0": xmm0, "ymm0": ymm0},
+        )
+
+        (info,) = bridge.enumerate_threads()
+
+        regs = self._by_name(info)
+        assert regs["xmm0"].width == 16 and regs["xmm0"].value == xmm0
+        assert regs["ymm0"].width == 32 and regs["ymm0"].value == ymm0
+        assert regs["xmm0"].role == 0
+        assert info.partial is False
+
+    def test_unreadable_vector_register_marks_partial(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = self._wide_thread({"xmm0": None})
 
         (info,) = bridge.enumerate_threads()
 
         assert "xmm0" not in self._by_name(info)
+        assert "rip" in self._by_name(info)
+        assert info.partial is True
+
+    def test_register_wider_than_table_19b_width_is_skipped(self):
+        bridge, lldb, _dbg, _target, process = _create_and_connect()
+        _registers_readable(lldb)
+        process.GetNumThreads.return_value = 1
+        process.GetThreadAtIndex.return_value = self._wide_thread(
+            {"z0": bytes(256)},
+        )
+
+        (info,) = bridge.enumerate_threads()
+
+        assert "z0" not in self._by_name(info)
         assert info.partial is False
 
     def test_unreadable_register_is_left_out_and_marks_partial(self):
