@@ -181,6 +181,13 @@ class TestParseGdbArchitecture:
             ('The target architecture is set to "auto" (currently "i386:x86-64").', ArchType.x86_64),
             ('The target architecture is set to "aarch64".', ArchType.ARM64),
             ('The target architecture is set to "arm".', ArchType.ARM32),
+            # Newer/Windows GDB phrasing: "automatically" + unquoted arch.
+            ('The target architecture is set automatically (currently i386)', ArchType.x86),
+            ('The target architecture is set automatically (currently i386:x86-64)', ArchType.x86_64),
+            # The arch line buried in interleaved async MI records (real capture).
+            ('=thread-created,id="2",group-id="i1"\n*stopped\n(gdb) \n'
+             '~"The target architecture is set automatically (currently i386)\\n"\n^done',
+             ArchType.x86),
         ],
     )
     def test_platform_detect(self, text: str, expected: ArchType):

@@ -103,8 +103,15 @@ _GDB_ARCH_MAP = {
     "arm": ArchType.ARM32,
 }
 
+# GDB phrases "show architecture" differently across versions, e.g.
+#   The target architecture is set to "auto" (currently "i386")
+#   The target architecture is set automatically (currently i386)   <- newer/Windows
+#   The target architecture is set to "i386"
+# Accept "set to \"auto\"" or "set automatically", with optional quotes around
+# the arch name. `.search()` tolerates async MI records around the line.
 _GDB_ARCH_RE = re.compile(
-    r'The target architecture is set to "auto" \(currently "([^"]+)"\)'
+    r'The target architecture is set (?:to "auto"|automatically) '
+    r'\(currently "?([^")]+?)"?\)'
     r'|'
     r'The target architecture is set to "([^"]+)"'
 )
