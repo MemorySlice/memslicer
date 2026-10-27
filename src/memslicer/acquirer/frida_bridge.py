@@ -284,6 +284,43 @@ function _hexContext(context) {
     return out;
 }
 
+// A CpuContext carries no segment base, so on Windows x86/x64 the thread
+// pointer of Table 19g (the TEB: gs_base on x64, fs_base on ia32) would be
+// lost. Returns a tid -> '0x...' TEB resolver built on
+// NtQueryInformationThread(ThreadBasicInformation), or null elsewhere or
+// when an export is missing.
+function _makeTebResolver() {
+    if (Process.platform !== 'windows') return null;
+    if (Process.arch !== 'x64' && Process.arch !== 'ia32') return null;
+    var pOpen = _findGlobalExport('OpenThread');
+    var pQuery = _findGlobalExport('NtQueryInformationThread');
+    var pClose = _findGlobalExport('CloseHandle');
+    if (pOpen === null || pQuery === null || pClose === null) return null;
+    var openThread = new NativeFunction(pOpen, 'pointer', ['uint32', 'int', 'uint32']);
+    var queryThread = new NativeFunction(
+        pQuery, 'int', ['pointer', 'int', 'pointer', 'uint32', 'pointer']);
+    var closeHandle = new NativeFunction(pClose, 'int', ['pointer']);
+    var THREAD_QUERY_INFORMATION = 0x0040;
+    var THREAD_BASIC_INFORMATION = 0;
+    // THREAD_BASIC_INFORMATION: NTSTATUS ExitStatus, then PVOID TebBaseAddress
+    // at offset pointerSize (alignment padding on x64).
+    var size = (Process.pointerSize === 8) ? 48 : 28;
+    return function(tid) {
+        var handle = openThread(THREAD_QUERY_INFORMATION, 0, tid);
+        if (handle.isNull()) return null;
+        try {
+            var buf = Memory.alloc(size);
+            if (queryThread(handle, THREAD_BASIC_INFORMATION, buf, size, NULL) !== 0) {
+                return null;
+            }
+            var teb = buf.add(Process.pointerSize).readPointer();
+            return teb.isNull() ? null : teb.toString();
+        } finally {
+            closeHandle(handle);
+        }
+    };
+}
+
 rpc.exports = {
     enumerateRanges: function(prot) {
         return Process.enumerateRanges(prot);
@@ -384,12 +421,22 @@ rpc.exports = {
         // running while it is read, so the values are not a snapshot.
         try {
             if (typeof Process.enumerateThreads !== 'function') return [];
+            var teb = null;
+            try { teb = _makeTebResolver(); } catch (e) {}
+            var tebRegister = (Process.arch === 'x64') ? 'gs_base' : 'fs_base';
             return Process.enumerateThreads().map(function(t) {
+                var context = _hexContext(t.context || {});
+                if (teb !== null && context[tebRegister] === undefined) {
+                    try {
+                        var base = teb(t.id);
+                        if (base !== null) context[tebRegister] = base;
+                    } catch (e) {}
+                }
                 return {
                     id: t.id,
                     name: (typeof t.name === 'string') ? t.name : '',
                     state: (typeof t.state === 'string') ? t.state : '',
-                    context: _hexContext(t.context || {})
+                    context: context
                 };
             });
         } catch (e) {
