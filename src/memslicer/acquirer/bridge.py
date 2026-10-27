@@ -127,6 +127,61 @@ def register_role(name: str, arch: ArchType | None = None) -> int:
     return table.get(key, _GENERIC_ROLES.get(key, 0))
 
 
+# Debugger-native aliases that spec Table 19g forbids on disk, mapped to the
+# canonical mnemonic per architecture (producer rule 42). GDB prints the
+# x86_64 flags as ``eflags``; Frida and LLDB name the ARM64 frame/link
+# registers ``fp``/``lr``.
+_CANONICAL_NAMES: dict[ArchType, dict[str, str]] = {
+    ArchType.x86_64: {"eflags": "rflags"},
+    ArchType.ARM64: {
+        "fp": "x29", "lr": "x30", "cpsr": "pstate", "tpidr": "tpidr_el0",
+    },
+    ArchType.ARM32: {"r13": "sp", "r14": "lr", "r15": "pc"},
+}
+
+
+def canonical_register_name(name: str, arch: ArchType | None) -> str:
+    """Lowercase *name*, replacing the aliases Table 19g forbids on *arch*."""
+    key = name.lower()
+    if arch is None:
+        return key
+    return _CANONICAL_NAMES.get(arch, {}).get(key, key)
+
+
+# The register each OS uses as thread pointer (spec Table 19g). Only this one
+# carries the TLS role: ``fs_base`` and ``gs_base`` are both TLS candidates on
+# x86_64, but Linux uses ``fs_base`` and Windows/macOS ``gs_base``.
+_X86_64_UNIX_TP = "fs_base"
+_ARM64_UNIX_TP = "tpidr_el0"
+_THREAD_POINTERS: dict[tuple[ArchType, OSType], str] = {
+    (ArchType.x86_64, OSType.Linux): _X86_64_UNIX_TP,
+    (ArchType.x86_64, OSType.Android): _X86_64_UNIX_TP,
+    (ArchType.x86_64, OSType.FreeBSD): _X86_64_UNIX_TP,
+    (ArchType.x86_64, OSType.Windows): "gs_base",
+    (ArchType.x86_64, OSType.macOS): "gs_base",
+    (ArchType.x86, OSType.Windows): "fs_base",
+    (ArchType.x86, OSType.Linux): "gs_base",
+    (ArchType.x86, OSType.Android): "gs_base",
+    (ArchType.ARM64, OSType.Linux): _ARM64_UNIX_TP,
+    (ArchType.ARM64, OSType.Android): _ARM64_UNIX_TP,
+    (ArchType.ARM64, OSType.FreeBSD): _ARM64_UNIX_TP,
+    (ArchType.ARM64, OSType.macOS): "tpidrro_el0",
+    (ArchType.ARM64, OSType.iOS): "tpidrro_el0",
+    (ArchType.ARM64, OSType.Windows): "x18",
+    (ArchType.ARM32, OSType.Linux): "tpidruro",
+    (ArchType.ARM32, OSType.Android): "tpidruro",
+}
+
+
+def thread_pointer_register(arch: ArchType, os: OSType) -> str | None:
+    """Canonical name of the register *os* uses as thread pointer on *arch*.
+
+    ``None`` when Table 19g does not pin it down for the pair; callers then
+    keep the architecture-level TLS roles of :func:`register_role`.
+    """
+    return _THREAD_POINTERS.get((arch, os))
+
+
 # Integer register width in bytes per architecture (GPRs); 8 otherwise.
 _REG_WIDTH: dict[ArchType, int] = {
     ArchType.x86: 4, ArchType.ARM32: 4, ArchType.MIPS32: 4,

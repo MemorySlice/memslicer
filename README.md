@@ -601,6 +601,16 @@ off. On Android, Frida enumerates threads of ordinary apps but none for privileg
 system apps (`priv_app`, `platform_app`), so such captures carry no
 Thread Context blocks and the log notes it once.
 
+Register names are the canonical mnemonics of spec Table 19g whatever the
+backend calls them (ARM64 `fp`/`lr`/`cpsr` are written as `x29`/`x30`/`pstate`,
+x86_64 `eflags` as `rflags`), and the TLS role is set only on the register the
+target OS uses as thread pointer (`fs_base` on Linux x86_64, `gs_base` on
+Windows x64, `tpidr_el0` on Linux ARM64, ...). A Frida `CpuContext` carries no
+segment base, so on Windows x86/x64 the agent reads each thread's TEB with
+`NtQueryInformationThread` and records it as `gs_base` (x64) / `fs_base` (x86).
+LLDB also records vector and x87 registers (`xmm*`, `ymm*`, `stmm*`, ...) at
+their full width.
+
 ### memslicer verify
 
 ```

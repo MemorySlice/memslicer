@@ -14,8 +14,9 @@ from pathlib import Path
 import pytest
 
 from memslicer.acquirer.bridge import (
-    RegisterValue, ThreadInfo, ThreadRegistersCapable, register_role,
-    register_width_bytes, stack_pointers_of,
+    RegisterValue, ThreadInfo, ThreadRegistersCapable, canonical_register_name,
+    register_role, register_width_bytes, stack_pointers_of,
+    thread_pointer_register,
 )
 from memslicer.acquirer.engine import AcquisitionEngine, _build_thread_contexts
 from memslicer.acquirer.region_filter import RegionFilter
@@ -157,6 +158,40 @@ class TestRegisterWidth:
         assert register_width_bytes(arch) == width
 
 
+class TestCanonicalRegisterName:
+    @pytest.mark.parametrize("name, arch, canonical", [
+        ("fp", A64, "x29"), ("LR", A64, "x30"), ("cpsr", A64, "pstate"),
+        ("tpidr", A64, "tpidr_el0"), ("eflags", X64, "rflags"),
+        ("r13", ArchType.ARM32, "sp"), ("r14", ArchType.ARM32, "lr"),
+        ("r15", ArchType.ARM32, "pc"),
+    ])
+    def test_table_19g_aliases_are_renamed(self, name, arch, canonical):
+        assert canonical_register_name(name, arch) == canonical
+
+    @pytest.mark.parametrize("name, arch", [
+        ("eflags", ArchType.x86), ("lr", ArchType.ARM32), ("pc", A64),
+        ("nzcv", A64), ("RIP", X64), ("fp", None),
+    ])
+    def test_canonical_names_only_lowercased(self, name, arch):
+        assert canonical_register_name(name, arch) == name.lower()
+
+
+class TestThreadPointerRegister:
+    @pytest.mark.parametrize("arch, os, name", [
+        (X64, OSType.Linux, "fs_base"), (X64, OSType.Android, "fs_base"),
+        (X64, OSType.Windows, "gs_base"), (X64, OSType.macOS, "gs_base"),
+        (ArchType.x86, OSType.Windows, "fs_base"),
+        (A64, OSType.Linux, "tpidr_el0"), (A64, OSType.iOS, "tpidrro_el0"),
+        (A64, OSType.macOS, "tpidrro_el0"), (A64, OSType.Windows, "x18"),
+        (ArchType.ARM32, OSType.Android, "tpidruro"),
+    ])
+    def test_table_19g_thread_pointer(self, arch, os, name):
+        assert thread_pointer_register(arch, os) == name
+
+    def test_unknown_pair_is_none(self):
+        assert thread_pointer_register(X64, OSType.Unknown) is None
+
+
 class TestRegisterValue:
     def test_from_int_lowercases_masks_and_encodes_little_endian(self):
         rv = RegisterValue.from_int("RSP", 0x1_0000_0000_7fff_0000, 8, X64)
@@ -266,6 +301,72 @@ class TestBuildThreadContexts:
         ]
         assert tc.state is ThreadState.RUNNING and tc.arch == 0
 
+    def test_aliases_are_written_under_their_canonical_names(self):
+        t = ThreadInfo(tid=7, registers=[
+            RegisterValue.from_int("pc", 0x1000, 8, A64),
+            RegisterValue.from_int("sp", 0x2000, 8, A64),
+            RegisterValue.from_int("fp", 0x3000, 8, A64),
+            RegisterValue.from_int("lr", 0x4000, 8, A64),
+            RegisterValue.from_int("cpsr", 0x6000_0000, 8, A64),
+        ])
+        [tc] = _build_thread_contexts([t], A64)
+        assert [(r.name, r.flags) for r in tc.registers] == [
+            ("pc", REG_ROLE_PC), ("sp", REG_ROLE_SP), ("x29", REG_ROLE_FP),
+            ("x30", REG_ROLE_LR), ("pstate", REG_ROLE_FLAGS),
+        ]
+
+    def test_alias_colliding_with_its_canonical_name_is_dropped(self):
+        t = _x64_thread(1)
+        t.registers += [
+            RegisterValue.from_int("rflags", 0x246, 8, X64),
+            RegisterValue.from_int("eflags", 0x202, 8, X64),
+        ]
+        [tc] = _build_thread_contexts([t], X64)
+        flags = [r for r in tc.registers if r.flags & REG_ROLE_FLAGS]
+        assert [(r.name, r.value) for r in flags] == [
+            ("rflags", (0x246).to_bytes(8, "little")),
+        ]
+
+    @pytest.mark.parametrize("os, tls", [
+        (OSType.Linux, "fs_base"), (OSType.Windows, "gs_base"),
+    ])
+    def test_tls_role_only_on_the_os_thread_pointer(self, os, tls):
+        t = _x64_thread(1)
+        t.registers += [
+            RegisterValue.from_int("fs_base", 0x7f00, 8, X64),
+            RegisterValue.from_int("gs_base", 0x7e00, 8, X64),
+        ]
+        [tc] = _build_thread_contexts([t], X64, os=os)
+        assert [r.name for r in tc.registers if r.flags & REG_ROLE_TLS] == [tls]
+
+    def test_tls_role_added_to_os_thread_pointer_without_arch_role(self):
+        t = ThreadInfo(tid=1, registers=[
+            RegisterValue.from_int("pc", 0x1000, 8, A64),
+            RegisterValue.from_int("sp", 0x2000, 8, A64),
+            RegisterValue.from_int("x18", 0x3000, 8, A64),
+            RegisterValue.from_int("tpidr_el0", 0x4000, 8, A64),
+        ])
+        [tc] = _build_thread_contexts([t], A64, os=OSType.Windows)
+        assert [r.name for r in tc.registers if r.flags & REG_ROLE_TLS] == ["x18"]
+
+    def test_without_os_both_segment_bases_keep_the_tls_role(self):
+        t = _x64_thread(1)
+        t.registers += [
+            RegisterValue.from_int("fs_base", 0x7f00, 8, X64),
+            RegisterValue.from_int("gs_base", 0x7e00, 8, X64),
+        ]
+        [tc] = _build_thread_contexts([t], X64)
+        assert [r.name for r in tc.registers if r.flags & REG_ROLE_TLS] == [
+            "fs_base", "gs_base",
+        ]
+
+    def test_vector_register_is_kept_at_full_width(self):
+        t = _x64_thread(1)
+        t.registers.append(RegisterValue("xmm0", 16, bytes(range(16))))
+        [tc] = _build_thread_contexts([t], X64)
+        xmm0 = next(r for r in tc.registers if r.name == "xmm0")
+        assert (xmm0.width, xmm0.flags, xmm0.value) == (16, 0, bytes(range(16)))
+
 
 # ---------------------------------------------------------------------------
 # Engine integration
@@ -367,3 +468,18 @@ class TestEngineThreadContexts:
         bridge = _bridge([_x64_thread(1234)])
         AcquisitionEngine(bridge).survey_regions()
         assert bridge.thread_calls == 0
+
+    def test_engine_writes_canonical_names_and_the_os_thread_pointer(self, tmp_path):
+        t = _x64_thread(1234)
+        t.registers += [
+            RegisterValue.from_int("eflags", 0x246, 8, X64),
+            RegisterValue.from_int("fs_base", 0x7f00, 8, X64),
+            RegisterValue.from_int("gs_base", 0, 8, X64),
+        ]
+        _result, blocks = _acquire(_bridge([t]), tmp_path)  # Linux target
+
+        [tc] = [parse_thread_context(b.payload)
+                for b in blocks if b.block_type == BlockType.ThreadContext]
+        roles = {r.name: r.flags for r in tc.registers}
+        assert "eflags" not in roles and roles["rflags"] == REG_ROLE_FLAGS
+        assert roles["fs_base"] == REG_ROLE_TLS and roles["gs_base"] == 0

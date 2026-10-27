@@ -1413,6 +1413,33 @@ class TestFridaBridgeEnumerateThreads:
         assert "typeof Process.enumerateThreads" in _FRIDA_SCRIPT
         assert "_hexContext(t.context || {})" in _FRIDA_SCRIPT
 
+    def test_agent_resolves_windows_teb_as_segment_base(self):
+        """A CpuContext has no segment base; on Windows the agent reads the
+        TEB with NtQueryInformationThread and reports it as gs_base (x64) /
+        fs_base (ia32) unless the context already carries one."""
+        from memslicer.acquirer.frida_bridge import _FRIDA_SCRIPT
+
+        assert "function _makeTebResolver()" in _FRIDA_SCRIPT
+        assert "_findGlobalExport('NtQueryInformationThread')" in _FRIDA_SCRIPT
+        assert "(Process.arch === 'x64') ? 'gs_base' : 'fs_base'" in _FRIDA_SCRIPT
+        assert "context[tebRegister] === undefined" in _FRIDA_SCRIPT
+
+    def test_segment_base_from_the_agent_is_a_tls_register(self):
+        from memslicer.msl.constants import REG_ROLE_TLS
+
+        bridge = _make_bridge(target=1234)
+        _device, api = _setup_device_and_api(bridge)
+        api.enumerate_threads.return_value = [
+            {"id": 7, "name": "", "state": "waiting",
+             "context": dict(self.X86_64_CONTEXT, gs_base="0x7ff7fffdb000")},
+        ]
+
+        regs = self._by_name(bridge.enumerate_threads()[0])
+
+        assert regs["gs_base"].as_int == 0x7ff7fffdb000
+        assert regs["gs_base"].width == 8
+        assert regs["gs_base"].role == REG_ROLE_TLS
+
     def test_bridge_is_thread_registers_capable(self):
         from memslicer.acquirer.bridge import ThreadRegistersCapable
 
