@@ -16,7 +16,8 @@ from memslicer.acquirer.base import (
 )
 from memslicer.acquirer.bridge import (
     DebuggerBridge, MemoryRange, ModuleInfo, PlatformInfo, ReadResult,
-    ThreadInfo, register_role, stack_pointers_of,
+    ThreadInfo, canonical_register_name, register_role, stack_pointers_of,
+    thread_pointer_register,
 )
 from memslicer.acquirer.build_id_post import populate_from_bridge
 from memslicer.acquirer.identity import AttributionConfig, resolve_target_identity
@@ -34,7 +35,7 @@ from memslicer.msl.constants import (
     CompAlgo, HashAlgo, OSType, PageState, RegionType, CapBit,
     Endianness, VERSION, HASH_SIZE, FLAG_INVESTIGATION, FLAG_ENCRYPTED,
     OmissionReason, VasNameSource, ArchType,
-    REG_ROLE_PC, REG_ROLE_SP, TC_FLAG_CURRENT, TC_FLAG_PARTIAL,
+    REG_ROLE_PC, REG_ROLE_SP, REG_ROLE_TLS, TC_FLAG_CURRENT, TC_FLAG_PARTIAL,
     TC_FLAG_SUSPENDED,
 )
 from memslicer.msl.types import (
@@ -402,16 +403,32 @@ _NO_THREAD_CONTEXTS_NOTE = (
 )
 
 
-def _thread_registers(t: ThreadInfo, arch: ArchType) -> list[ThreadRegister]:
-    """Table 19b entries of *t*: lowercase names, roles filled in by *arch*
-    when the bridge left them 0."""
-    return [
-        ThreadRegister(
-            name=rv.name.lower(), width=rv.width,
-            flags=rv.role or register_role(rv.name, arch), value=rv.value,
-        )
-        for rv in t.registers
-    ]
+def _thread_registers(
+    t: ThreadInfo, arch: ArchType, os: OSType | None = None,
+) -> list[ThreadRegister]:
+    """Table 19b entries of *t*.
+
+    Names are the lowercase canonical mnemonics of Table 19g (aliases such
+    as ARM64 ``fp``/``lr`` or x86_64 ``eflags`` renamed; on a collision the
+    first entry wins), and roles are filled in by *arch* when the bridge left
+    them 0. With *os* known, the TLS role is kept only on the register the OS
+    uses as thread pointer (:func:`thread_pointer_register`).
+    """
+    tp = thread_pointer_register(arch, os) if os is not None else None
+    registers: list[ThreadRegister] = []
+    seen: set[str] = set()
+    for rv in t.registers:
+        name = canonical_register_name(rv.name, arch)
+        if name in seen:
+            continue
+        seen.add(name)
+        flags = rv.role or register_role(name, arch)
+        if tp is not None:
+            flags = flags | REG_ROLE_TLS if name == tp else flags & ~REG_ROLE_TLS
+        registers.append(ThreadRegister(
+            name=name, width=rv.width, flags=flags, value=rv.value,
+        ))
+    return registers
 
 
 def _has_roles(registers: list[ThreadRegister], *roles: int) -> bool:
@@ -440,6 +457,7 @@ def _current_thread_index(contexts: list[ThreadContext], pid: int) -> int:
 
 def _build_thread_contexts(
     threads: list[ThreadInfo], arch: ArchType, *, pid: int = 0,
+    os: OSType | None = None,
 ) -> list[ThreadContext]:
     """Turn bridge :class:`ThreadInfo` records into Thread Context blocks.
 
@@ -449,11 +467,12 @@ def _build_thread_contexts(
     ``Partial`` come from the bridge; exactly one block carries ``Current``
     (:func:`_current_thread_index`). ``arch`` is written as 0 -- every
     thread executes in the header ``ArchType`` *arch*, which only serves to
-    fill in register roles a bridge left unset.
+    canonicalise register names and fill in roles a bridge left unset;
+    *os* picks the thread-pointer register (:func:`_thread_registers`).
     """
     contexts: list[ThreadContext] = []
     for t in threads:
-        registers = _thread_registers(t, arch)
+        registers = _thread_registers(t, arch, os)
         if not _has_roles(registers, REG_ROLE_PC, REG_ROLE_SP):
             logging.getLogger("memslicer").debug(
                 "thread %d dropped: no program counter or stack pointer", t.tid,
@@ -806,7 +825,9 @@ class AcquisitionEngine(BaseAcquirer):
             # the classifier, so the bridge is not asked twice. This runs
             # before the header because its CapBitmap advertises the blocks.
             threads = self._enumerate_threads()
-            thread_contexts = _build_thread_contexts(threads, arch_type, pid=pid)
+            thread_contexts = _build_thread_contexts(
+                threads, arch_type, pid=pid, os=os_type,
+            )
 
             # The classifier needs the module list and the executable path,
             # so it is built now and reused for every range decision.
