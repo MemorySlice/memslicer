@@ -1555,3 +1555,14 @@ def test_threads_summary_line_hidden_without_contexts(mock_factory):
 
     assert result.exit_code == 0
     assert "Threads :" not in result.output
+
+
+@patch("memslicer.cli._create_acquirer")
+def test_threads_summary_line_reports_dropped_threads(mock_factory):
+    """Threads left out for a missing PC/SP show up even when none survived."""
+    mock_factory.return_value = _make_mock_acquirer(thread_contexts=0, threads_dropped=3)
+
+    result = CliRunner().invoke(cli, ["1234", "-o", "test.msl"])
+
+    assert result.exit_code == 0
+    assert "  Threads : 0 (3 dropped: no PC/SP)" in result.output

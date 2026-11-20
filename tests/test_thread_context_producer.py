@@ -245,9 +245,34 @@ class TestBuildThreadContexts:
         only_pc = ThreadInfo(tid=1, registers=[RegisterValue.from_int("rip", 1, 8, X64)])
         only_sp = ThreadInfo(tid=2, registers=[RegisterValue.from_int("rsp", 1, 8, X64)])
         empty = ThreadInfo(tid=3)
-        with caplog.at_level(logging.DEBUG, logger="memslicer"):
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
             assert _build_thread_contexts([only_pc, only_sp, empty], X64) == []
-        assert "dropped" in caplog.text
+        [record] = caplog.records
+        assert record.levelno == logging.WARNING
+        assert "none of the 3 enumerated threads" in record.getMessage()
+        assert "tid 1 (no sp), tid 2 (no pc), tid 3 (no pc+sp)" in record.getMessage()
+
+    def test_partial_drop_warns_once_with_counts(self, caplog):
+        no_sp = ThreadInfo(tid=9, registers=[RegisterValue.from_int("rip", 1, 8, X64)])
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            [tc] = _build_thread_contexts([_x64_thread(8), no_sp], X64)
+        assert tc.thread_id == 8
+        [record] = caplog.records
+        assert "1 of 2 threads dropped" in record.getMessage()
+        assert record.getMessage().endswith("tid 9 (no sp)")
+
+    def test_dropped_tid_list_is_capped(self, caplog):
+        empties = [ThreadInfo(tid=tid) for tid in range(10)]
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            _build_thread_contexts([*empties, _x64_thread(99)], X64)
+        message = caplog.records[0].getMessage()
+        assert "tid 7 (no pc+sp)" in message and "tid 8" not in message
+        assert message.endswith("+2 more")
+
+    def test_no_warning_when_every_thread_is_kept(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="memslicer"):
+            _build_thread_contexts([_x64_thread(1), _x64_thread(2)], X64)
+        assert caplog.records == []
 
     def test_empty_input(self):
         assert _build_thread_contexts([], X64, pid=1) == []
@@ -284,6 +309,13 @@ class TestEngineThreadContexts:
         first_region = types.index(BlockType.MemoryRegion)
         assert first_region == 4
         assert result.thread_contexts == 2
+
+    def test_result_counts_dropped_threads(self, tmp_path):
+        no_sp = ThreadInfo(tid=5679, registers=[RegisterValue.from_int("rip", 1, 8, X64)])
+        result, blocks = _acquire(_bridge([no_sp, _x64_thread(1234)]), tmp_path)
+        assert _types(blocks).count(BlockType.ThreadContext) == 1
+        assert result.thread_contexts == 1
+        assert result.threads_dropped == 1
 
     def test_blocks_parse_with_current_on_the_main_thread_and_pi_parent(self, tmp_path):
         threads = [_x64_thread(5679, name="worker", suspended=True),

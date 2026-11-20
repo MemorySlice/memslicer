@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [Unreleased]
+
+### Changes
+
+- Threads dropped from the capture for lacking a program counter or stack
+  pointer (spec Section 5.7) are reported in one WARNING with their thread
+  ids and the missing register, instead of a DEBUG line per thread; when no
+  thread survives the message says the capture has no Thread Context
+  blocks. The summary shows them as `Threads : N (M dropped: no PC/SP)`
+  and `AcquireResult.threads_dropped` counts them.
+
 
 
 ## [0.5.2] - 2026-10-25
