@@ -599,7 +599,10 @@ Every thread's register file is written as a Thread Context block (0x0011,
 spec §5.7) on the Frida, GDB and LLDB backends; `--no-registers` turns this
 off. On Android, Frida enumerates threads of ordinary apps but none for privileged
 system apps (`priv_app`, `platform_app`), so such captures carry no
-Thread Context blocks and the log notes it once.
+Thread Context blocks and the log notes it once. A thread whose register file
+lacks a program counter or stack pointer cannot be written (spec §5.7); such
+threads are left out and listed in a single warning (thread ids and the
+missing register), with a separate message when no thread survives.
 
 ### memslicer verify
 
@@ -681,8 +684,10 @@ Progress: [##################################################] 100.00% Complete
 figure — but they are always named rather than silently dropped. `[vdso]` is
 genuinely readable and is captured normally.
 
-`Threads:` counts the Thread Context blocks written. The line is absent when
-there are none (`--no-registers`, or a privileged Android system app).
+`Threads:` counts the Thread Context blocks written, followed by
+`(N dropped: no PC/SP)` when threads were left out for lacking a program
+counter or stack pointer. The line is absent when no thread was enumerated
+(`--no-registers`, or a privileged Android system app).
 
 With `--scope`, `--exclude-module` or `--resident-only` the summary gains lines
 that are omitted from a plain full capture:

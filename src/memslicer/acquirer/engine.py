@@ -438,26 +438,72 @@ def _current_thread_index(contexts: list[ThreadContext], pid: int) -> int:
     return 0
 
 
+_DROPPED_TIDS_SHOWN = 8
+
+
+def _missing_roles(registers: list[ThreadRegister]) -> str:
+    """``"pc"``, ``"sp"`` or ``"pc+sp"``: what a dropped thread lacks."""
+    return "+".join(
+        name for name, role in (("pc", REG_ROLE_PC), ("sp", REG_ROLE_SP))
+        if not _has_roles(registers, role)
+    )
+
+
+def _warn_dropped_threads(dropped: list[tuple[int, str]], total: int) -> None:
+    """Report, once per capture, the threads left out for a missing PC or SP.
+
+    Spec Section 5.7 forbids a Thread Context block without both, so these
+    threads are absent from the slice. Logged at WARNING so the operator
+    learns it during the capture, not when a consumer finds no register
+    state; the case where every thread went gets its own message because
+    then the slice has no register state at all.
+
+    Args:
+        dropped: ``(tid, missing roles)`` per dropped thread, bridge order.
+        total: Number of threads the bridge enumerated.
+    """
+    if not dropped:
+        return
+    shown = ", ".join(
+        f"tid {tid} (no {missing})" for tid, missing in dropped[:_DROPPED_TIDS_SHOWN]
+    )
+    if len(dropped) > _DROPPED_TIDS_SHOWN:
+        shown += f", +{len(dropped) - _DROPPED_TIDS_SHOWN} more"
+    log = logging.getLogger("memslicer")
+    if len(dropped) == total:
+        log.warning(
+            "none of the %d enumerated threads has both a program counter and a "
+            "stack pointer; the capture carries no Thread Context blocks: %s",
+            total, shown,
+        )
+    else:
+        log.warning(
+            "%d of %d threads dropped without a program counter or stack "
+            "pointer; their register state is not in the capture: %s",
+            len(dropped), total, shown,
+        )
+
+
 def _build_thread_contexts(
     threads: list[ThreadInfo], arch: ArchType, *, pid: int = 0,
 ) -> list[ThreadContext]:
     """Turn bridge :class:`ThreadInfo` records into Thread Context blocks.
 
     One block per thread, in bridge order. A thread whose register file
-    lacks a program counter or stack pointer is dropped: spec Section 5.7
-    lets a producer emit a block only with both. ``Suspended`` and
+    lacks a program counter or stack pointer is dropped (spec Section 5.7
+    lets a producer emit a block only with both) and reported once at
+    WARNING (:func:`_warn_dropped_threads`). ``Suspended`` and
     ``Partial`` come from the bridge; exactly one block carries ``Current``
     (:func:`_current_thread_index`). ``arch`` is written as 0 -- every
     thread executes in the header ``ArchType`` *arch*, which only serves to
     fill in register roles a bridge left unset.
     """
     contexts: list[ThreadContext] = []
+    dropped: list[tuple[int, str]] = []
     for t in threads:
         registers = _thread_registers(t, arch)
         if not _has_roles(registers, REG_ROLE_PC, REG_ROLE_SP):
-            logging.getLogger("memslicer").debug(
-                "thread %d dropped: no program counter or stack pointer", t.tid,
-            )
+            dropped.append((t.tid, _missing_roles(registers)))
             continue
         contexts.append(ThreadContext(
             thread_id=t.tid, flags=_thread_flags(t), state=t.state,
@@ -465,6 +511,7 @@ def _build_thread_contexts(
         ))
     if contexts:
         contexts[_current_thread_index(contexts, pid)].flags |= TC_FLAG_CURRENT
+    _warn_dropped_threads(dropped, len(threads))
     return contexts
 
 
@@ -790,6 +837,7 @@ class AcquisitionEngine(BaseAcquirer):
         bytes_nonresident = 0
         residency_method = "none"
         thread_contexts_written = 0
+        threads_dropped = 0
 
         try:
             session = self._open_session()
@@ -1144,6 +1192,7 @@ class AcquisitionEngine(BaseAcquirer):
                     # and before the first Memory Region, so a consumer knows
                     # the threads before it classifies regions (spec Section
                     # 5.7). They reference Process Identity as parent.
+                    threads_dropped = len(threads) - len(thread_contexts)
                     for tc in thread_contexts:
                         writer.write_thread_context(tc, parent_uuid=proc_id_uuid)
                         thread_contexts_written += 1
@@ -1289,6 +1338,7 @@ class AcquisitionEngine(BaseAcquirer):
             bytes_nonresident=bytes_nonresident,
             residency_method=residency_method,
             thread_contexts=thread_contexts_written,
+            threads_dropped=threads_dropped,
         )
 
     def survey_regions(self) -> RegionSurvey:

@@ -68,6 +68,9 @@ class AcquireResult:
     # Memory Region; 0 when the backend could not enumerate threads with
     # registers or ``--no-registers`` was given.
     thread_contexts: int = 0
+    # Enumerated threads left out because their register file lacks a
+    # program counter or stack pointer (spec Section 5.7 requires both).
+    threads_dropped: int = 0
 
 
 class BaseAcquirer(ABC):

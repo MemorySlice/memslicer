@@ -779,8 +779,11 @@ def acquire(target, backend, output_path, comp, usb, device_id, remote_addr, os_
             click.echo(f"  Bytes   : {result.bytes_captured:,}")
         _echo_unreadable_ranges(result)
         click.echo(f"  Modules : {result.modules_captured}")
-        if result.thread_contexts > 0:
-            click.echo(f"  Threads : {result.thread_contexts}")
+        if result.thread_contexts > 0 or result.threads_dropped > 0:
+            threads_line = f"  Threads : {result.thread_contexts}"
+            if result.threads_dropped:
+                threads_line += f" ({result.threads_dropped} dropped: no PC/SP)"
+            click.echo(threads_line)
         if result.rwx_regions > 0:
             click.echo(f"  RWX     : {result.rwx_regions} (forensic attention recommended)")
         click.echo(f"  Duration: {result.duration_secs:.2f}s")
